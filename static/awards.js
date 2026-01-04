@@ -154,9 +154,38 @@ async function loadAwards() {
     }
 }
 
+// Save current form state
+function saveFormState() {
+    const formState = {};
+    document.querySelectorAll('.member-select').forEach(select => {
+        const award = select.dataset.award;
+        const rank = select.dataset.rank;
+        const key = `${award}|${rank}`;
+        formState[key] = select.value;
+    });
+    return formState;
+}
+
+// Restore form state
+function restoreFormState(formState) {
+    if (!formState) return;
+    
+    document.querySelectorAll('.member-select').forEach(select => {
+        const award = select.dataset.award;
+        const rank = select.dataset.rank;
+        const key = `${award}|${rank}`;
+        if (formState[key]) {
+            select.value = formState[key];
+        }
+    });
+}
+
 // Render awards form
-function renderAwardsForm() {
+function renderAwardsForm(preserveFormState = false) {
     const grid = document.getElementById('awards-grid');
+    
+    // Save current form state before re-rendering (only if preserving)
+    const formState = preserveFormState ? saveFormState() : null;
     
     let html = '';
     
@@ -207,13 +236,18 @@ function renderAwardsForm() {
     
     grid.innerHTML = html;
     
+    // Restore form state after rendering (only if preserving)
+    if (preserveFormState) {
+        restoreFormState(formState);
+    }
+    
     // Setup toggle buttons
     document.querySelectorAll('.toggle-award-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             e.preventDefault();
             const award = e.target.dataset.award;
             activeAwardTypes.delete(award);
-            renderAwardsForm();
+            renderAwardsForm(true); // Preserve form state when hiding
         });
     });
     
@@ -223,7 +257,7 @@ function renderAwardsForm() {
             e.preventDefault();
             const award = e.target.dataset.award;
             activeAwardTypes.add(award);
-            renderAwardsForm();
+            renderAwardsForm(true); // Preserve form state when showing
         });
     });
     
@@ -286,9 +320,30 @@ function filterSelectOptions(selectElement, searchTerm) {
 // Save awards
 async function saveAwards() {
     const weekDate = formatDate(currentWeekDate);
+    
+    // Check if there are hidden awards with saved data
+    const hiddenAwardsWithData = [];
+    const inactiveTypes = AWARD_TYPES.filter(type => !activeAwardTypes.has(type));
+    inactiveTypes.forEach(awardType => {
+        if (currentAwards[awardType]) {
+            const ranks = Object.keys(currentAwards[awardType]);
+            if (ranks.length > 0) {
+                hiddenAwardsWithData.push(awardType);
+            }
+        }
+    });
+    
+    // Warn user if saving will delete hidden awards
+    if (hiddenAwardsWithData.length > 0) {
+        const message = `Warning: ${hiddenAwardsWithData.length} hidden award(s) have saved data that will be deleted:\n\n${hiddenAwardsWithData.join(', ')}\n\nOnly visible awards will be saved. Continue?`;
+        if (!confirm(message)) {
+            return;
+        }
+    }
+    
     const awards = [];
     
-    // Collect all awards from form
+    // Collect awards from visible form only
     const selects = document.querySelectorAll('.member-select');
     selects.forEach(select => {
         const memberId = parseInt(select.value);
@@ -472,7 +527,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Show all
                 activeAwardTypes = new Set(AWARD_TYPES);
             }
-            renderAwardsForm();
+            renderAwardsForm(true); // Preserve form state when toggling all
             updateToggleButton();
         });
     }
