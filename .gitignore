@@ -46,6 +46,9 @@ logs/
 tmp/
 temp/
 
+# Marshal Guard output
+mg_output/
+
 # Playwright
 playwright-tests/auth.json
 playwright-tests/test-results/
