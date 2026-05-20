@@ -20,9 +20,10 @@ import (
 )
 
 var (
-	rankRe   = regexp.MustCompile(`^([2-9]|[1-9][0-9]|100)$`)
-	nameRe   = regexp.MustCompile(`^\[[A-Za-z0-9]{1,4}\]\s*([A-Za-z0-9 ]+)$`)
-	damageRe = regexp.MustCompile(`^Total Damage:\s\d+(?:\.\d{1,2})?[GM]$`)
+	rankRe     = regexp.MustCompile(`^([2-9]|[1-9][0-9]|100)$`)
+	nameRe     = regexp.MustCompile(`^\[[A-Za-z0-9]{1,4}\]\s*([A-Za-z0-9 ]+)$`)
+	damageRe   = regexp.MustCompile(`^Total Damage:\s\d+(?:\.\d{1,2})?[GM]$`)
+	datetimeRe = regexp.MustCompile(`^\d{4}-\d{1,2}-\d{1,2}\s+\d{2}:\d{2}:\d{2}$`)
 )
 
 // memberRow holds the OCR results for one matched member card in the screenshot.
@@ -31,6 +32,7 @@ type memberRow struct {
 	rank    string
 	name    string
 	nameRaw string
+	nameSeg string
 	damage  string
 }
 
@@ -114,6 +116,10 @@ func processImage(imagePath, outputDir string) error {
 	cropped := image.NewRGBA(image.Rect(0, 0, cropW, cropH))
 	draw.Draw(cropped, cropped.Bounds(), img, image.Pt(dialogX0, dialogY0), draw.Src)
 
+	// Keep a clean copy for OCR — annotations are drawn only on 'annotated'.
+	annotated := image.NewRGBA(image.Rect(0, 0, cropW, cropH))
+	draw.Draw(annotated, annotated.Bounds(), cropped, image.Point{}, draw.Src)
+
 	// Step 3: Detect colored sections within the cropped dialog image
 	fmt.Printf("Detecting colored regions...\n")
 	rectangles := findColoredRegions(cropped, cropW, cropH)
@@ -128,8 +134,8 @@ func processImage(imagePath, outputDir string) error {
 	// all rows in this image have been OCR'd.
 	var members []memberRow
 
-	// Step 4: Draw outer dialog annotation — orange border at the crop boundary
-	drawRectangle(cropped, 0, 0, cropW, cropH, color.RGBA{255, 165, 0, 255})
+	// Step 4: Draw outer dialog annotation — orange border on annotated copy only
+	drawRectangle(annotated, 0, 0, cropW, cropH, color.RGBA{255, 165, 0, 255})
 
 	// Step 5: Draw inner section annotations + sub-segments
 	colors := []color.RGBA{
@@ -142,11 +148,11 @@ func processImage(imagePath, outputDir string) error {
 	}
 	for i, rect := range rectangles {
 		c := colors[i%len(colors)]
-		drawRectangle(cropped, rect.x0, rect.y0, rect.x1, rect.y1, c)
-		vertSegs := drawVerticalSegments(cropped, rect, c)
+		drawRectangle(annotated, rect.x0, rect.y0, rect.x1, rect.y1, c)
+		vertSegs := drawVerticalSegments(annotated, rect, c)
 		hSegs := make([][]Rectangle, len(vertSegs))
 		for si, seg := range vertSegs {
-			hSegs[si] = drawHorizontalSegments(cropped, seg, c)
+			hSegs[si] = drawHorizontalSegments(annotated, seg, c)
 		}
 
 		// Match the member-row pattern:
@@ -185,8 +191,24 @@ func processImage(imagePath, outputDir string) error {
 				rank:    rank,
 				name:    name,
 				nameRaw: nameRaw,
+				nameSeg: filepath.Join(rectDir, "seg3_2nd.png"),
 				damage:  damage,
 			})
+		}
+
+		// Datetime rectangle: 1 vertical segment, 3 horizontal bands — middle [1] is the text.
+		if len(vertSegs) == 1 && len(hSegs[0]) == 3 {
+			rectDir := filepath.Join(cropDir, fmt.Sprintf("rect%02d", i))
+			if err := os.MkdirAll(rectDir, 0o755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", rectDir, err)
+			}
+			segPath := filepath.Join(rectDir, "datetime.png")
+			if err := processMatchedSegment(cropped, hSegs[0][1], segPath, 0); err != nil {
+				return err
+			}
+			dt := ocrSegment(segPath, gosseract.PSM_SINGLE_LINE,
+				"0123456789:- ", datetimeRe, nil)
+			fmt.Printf("  datetime: %s\n", dt)
 		}
 	}
 
@@ -195,14 +217,16 @@ func processImage(imagePath, outputDir string) error {
 	reconstructSequence(members)
 	for _, m := range members {
 		fmt.Printf("    rank:   %s\n", m.rank)
-		fmt.Printf("    name:   %s  (raw: %q)\n", m.name, m.nameRaw)
+		fmt.Printf("    name:   %s\n", m.name)
+		fmt.Printf("    name raw:   %q\n", m.nameRaw)
+		fmt.Printf("    name seg:   %s\n", m.nameSeg)
 		fmt.Printf("    damage: %s\n", m.damage)
 	}
 
-	// Save cropped annotated image
+	// Save annotated image
 	outputPath := filepath.Join(outputDir, nameNoExt+"_annotated.png")
 
-	if err := saveImage(cropped, outputPath); err != nil {
+	if err := saveImage(annotated, outputPath); err != nil {
 		return err
 	}
 
@@ -880,7 +904,17 @@ func processMatchedSegment(img *image.RGBA, rect Rectangle, outPath string, bina
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			stretched := (int(pixels[y*w+x]) - int(minV)) * 255 / span
-			if binarizeMode == 2 {
+			if binarizeMode == 0 {
+				// Boost contrast by amplifying deviation from midpoint (no hard cut).
+				// Factor 2.5 pushes dark text darker and light background lighter.
+				enhanced := (stretched-128)*5/2 + 128
+				if enhanced < 0 {
+					enhanced = 0
+				} else if enhanced > 255 {
+					enhanced = 255
+				}
+				stretched = enhanced
+			} else if binarizeMode == 2 {
 				// Invert then hard-threshold: white text (→ 0 after invert) stays
 				// black; dark background (→ bright after invert) becomes white.
 				inv := 255 - stretched
