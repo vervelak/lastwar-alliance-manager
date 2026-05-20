@@ -67,8 +67,8 @@
                     <div id="mg-drop-zone" class="drop-zone">
                         <div id="mg-drop-content">
                             <div class="drop-icon">📁</div>
-                            <p class="drop-text">Tap to upload or drag & drop</p>
-                            <p class="drop-subtext">MG mail screenshots (up to 10 images)</p>
+                            <p class="drop-text">Tap to upload or drag &amp; drop</p>
+                            <p class="drop-subtext">MG mail screenshots (up to 20 images, multiple events OK)</p>
                         </div>
                         <div id="mg-preview-container" class="preview-container">
                             <div class="preview-header">
@@ -101,32 +101,18 @@
         </div>
     </div>
 
-    <!-- OCR Preview Modal -->
-    <div id="ocr-preview-modal" class="modal" style="display:none;">
-        <div class="modal-content" style="max-width:700px;">
+    <!-- V2 OCR Preview Modal (multi-event, per-row editing) -->
+    <div id="mg-v2-modal" class="modal" style="display:none;">
+        <div class="modal-content" style="max-width:800px;">
             <span class="close" role="button" tabindex="0" aria-label="Close dialog">&times;</span>
-            <h3>📋 OCR Preview — Review & Confirm</h3>
-            <div id="ocr-overwrite-warning" class="info-banner info-banner--warning" style="display:none;">
-                <div class="info-content">
-                    <div class="info-icon">⚠️</div>
-                    <div class="info-text">An event already exists for this date. Confirming will overwrite it.</div>
-                </div>
-            </div>
-            <div class="form-group">
-                <label for="ocr-event-date">Event Date</label>
-                <input type="date" id="ocr-event-date">
-            </div>
-            <div class="form-group">
-                <label>Total Alliance Damage: <span id="ocr-total-damage"></span></label>
-            </div>
-            <div id="ocr-participants-table" class="rk-table-wrapper"></div>
-            <div class="form-group">
-                <label for="ocr-notes">Notes (optional)</label>
-                <textarea id="ocr-notes" rows="2"></textarea>
-            </div>
-            <div class="modal-footer">
-                <button type="button" id="ocr-cancel-btn" class="secondary-btn">Cancel</button>
-                <button type="button" id="ocr-confirm-btn" class="primary-btn">✔ Confirm & Import</button>
+            <h3>📋 OCR Preview — Review &amp; Import</h3>
+            <p class="text-muted" style="margin-top:0;font-size:0.9em;">
+                Edit any cell before importing. Highlighted rows need attention.
+            </p>
+            <div id="mg-v2-events"></div>
+            <div class="modal-footer" style="margin-top:1rem;">
+                <button type="button" id="mg-v2-cancel-btn" class="secondary-btn">Cancel</button>
+                <button type="button" id="mg-v2-import-all-btn" class="primary-btn">✔ Import All Events</button>
             </div>
         </div>
     </div>

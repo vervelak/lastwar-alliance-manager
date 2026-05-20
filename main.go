@@ -24,6 +24,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -8884,6 +8885,176 @@ type MGMemberStats struct {
 	BestDamage  int64   `json:"best_damage"`
 }
 
+// V2 OCR preview types (mg_segment pipeline)
+
+type MGV2PreviewRow struct {
+	Rank       int    `json:"rank"`
+	Name       string `json:"name"`
+	NameOK     bool   `json:"name_ok"`
+	DamageStr  string `json:"damage_str"` // e.g. "27.35G"
+	Damage     int64  `json:"damage"`
+	DamageOK   bool   `json:"damage_ok"`
+	RankFixed  bool   `json:"rank_fixed"`
+	MemberID   *int   `json:"member_id,omitempty"`
+	MemberName string `json:"member_name,omitempty"`
+}
+
+type MGV2PreviewEvent struct {
+	EventDate       string           `json:"event_date"`
+	TopPlayerName   string           `json:"top_player_name"`
+	TopPlayerDmgStr string           `json:"top_player_damage_str"`
+	TopPlayerDmg    int64            `json:"top_player_damage"`
+	Rows            []MGV2PreviewRow `json:"rows"`
+	ExistingEventID *int             `json:"existing_event_id,omitempty"`
+}
+
+// POST /api/marshal-guard/process-mg-v2 — OCR using the mg_segment pipeline.
+// Accepts multiple screenshots, groups by event date, returns one preview
+// object per distinct date so the UI can review/edit before importing.
+func processMGV2(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(30 << 20); err != nil {
+		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	files := r.MultipartForm.File["images[]"]
+	if len(files) == 0 {
+		files = r.MultipartForm.File["image"]
+	}
+	if len(files) == 0 {
+		http.Error(w, "No images provided", http.StatusBadRequest)
+		return
+	}
+	if len(files) > 20 {
+		http.Error(w, "Maximum 20 images allowed", http.StatusBadRequest)
+		return
+	}
+
+	// Process each image and collect results keyed by event date.
+	type eventAccum struct {
+		topName   string
+		topDmgStr string
+		topDmgInt int64
+		members   map[int]*mgMemberOCR // rank → best OCR result
+	}
+	byDate := map[string]*eventAccum{}
+	dateOrder := []string{}
+
+	for _, fh := range files {
+		f, err := fh.Open()
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			continue
+		}
+
+		imgResult, err := mgProcessImage(data)
+		if err != nil {
+			log.Printf("processMGV2: %v", err)
+			continue
+		}
+
+		date := imgResult.EventDate
+		if date == "" {
+			date = "unknown"
+		}
+		acc, exists := byDate[date]
+		if !exists {
+			acc = &eventAccum{members: map[int]*mgMemberOCR{}}
+			byDate[date] = acc
+			dateOrder = append(dateOrder, date)
+		}
+		if acc.topName == "" && imgResult.TopPlayerName != "" {
+			acc.topName = imgResult.TopPlayerName
+		}
+		if imgResult.TopPlayerDmgInt > acc.topDmgInt {
+			acc.topDmgStr = imgResult.TopPlayerDmgStr
+			acc.topDmgInt = imgResult.TopPlayerDmgInt
+		}
+		for i := range imgResult.Members {
+			m := &imgResult.Members[i]
+			existing, has := acc.members[m.Rank]
+			if !has || m.DamageInt > existing.DamageInt || (!existing.NameOK && m.NameOK) {
+				cp := *m
+				acc.members[m.Rank] = &cp
+			}
+		}
+	}
+
+	// Load members for matching.
+	allMembers, _ := loadAllMembers()
+
+	// Build preview events.
+	var events []MGV2PreviewEvent
+	for _, date := range dateOrder {
+		acc := byDate[date]
+
+		// Sort ranks.
+		ranks := make([]int, 0, len(acc.members))
+		for rank := range acc.members {
+			ranks = append(ranks, rank)
+		}
+		sort.Ints(ranks)
+
+		var rows []MGV2PreviewRow
+		// Fill gaps between min and max rank.
+		if len(ranks) > 0 {
+			minRank := ranks[0]
+			maxRank := ranks[len(ranks)-1]
+			memberIdx := 0
+			for rank := minRank; rank <= maxRank; rank++ {
+				if memberIdx < len(ranks) && ranks[memberIdx] == rank {
+					m := acc.members[rank]
+					row := MGV2PreviewRow{
+						Rank:      rank,
+						Name:      m.Name,
+						NameOK:    m.NameOK,
+						DamageStr: m.DamageStr,
+						Damage:    m.DamageInt,
+						DamageOK:  m.DamageOK,
+						RankFixed: m.RankFixed,
+					}
+					// Match to member.
+					if allMembers != nil {
+						fake := MGOCRParticipant{NameSnapshot: m.Name}
+						matchMGParticipant(&fake, allMembers)
+						row.MemberID = fake.MemberID
+						row.MemberName = fake.MemberName
+					}
+					rows = append(rows, row)
+					memberIdx++
+				} else {
+					// Gap row — rank not detected in any screenshot.
+					rows = append(rows, MGV2PreviewRow{Rank: rank})
+				}
+			}
+		}
+
+		// Check for existing event.
+		var existingID *int
+		if date != "unknown" {
+			var eid int
+			if err := db.QueryRow(`SELECT id FROM marshal_guard_events WHERE event_date = ?`, date).Scan(&eid); err == nil {
+				existingID = &eid
+			}
+		}
+
+		events = append(events, MGV2PreviewEvent{
+			EventDate:       date,
+			TopPlayerName:   acc.topName,
+			TopPlayerDmgStr: acc.topDmgStr,
+			TopPlayerDmg:    acc.topDmgInt,
+			Rows:            rows,
+			ExistingEventID: existingID,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(events)
+}
+
 // GET /api/marshal-guard — list events with summary
 func listMarshalGuardEvents(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
@@ -9228,32 +9399,41 @@ func processMarshalGuardScreenshots(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Fallback: full-image OCR
-		log.Printf("MG OCR: row-based extraction found only %d, falling back to full-image OCR", len(rowParticipants))
-		client := gosseract.NewClient()
-		client.SetImageFromBytes(imageData)
-		text, err := client.Text()
-		client.Close()
-		if err != nil {
-			log.Printf("MG OCR error: %v", err)
-			continue
+		// Mask-based row extraction: the game mail has a FIXED layout
+		// Use pattern matching to crop each player row's name + damage regions
+		log.Printf("MG OCR: row-based extraction found only %d, using mask-based extraction", len(rowParticipants))
+		maskResult := extractMGByMask(imageData)
+		if maskResult == nil {
+			log.Printf("MG OCR: mask extraction failed, trying raw OCR fallback")
+			clientRaw := gosseract.NewClient()
+			clientRaw.SetImageFromBytes(imageData)
+			textRaw, errRaw := clientRaw.Text()
+			clientRaw.Close()
+			if errRaw != nil {
+				continue
+			}
+			fallback := parseMarshalGuardText(textRaw)
+			maskResult = &fallback
 		}
 
-		result := parseMarshalGuardText(text)
+		result := *maskResult
+		log.Printf("MG OCR mask: found %d participants", len(result.Participants))
+
 		if result.EventDate != "" && eventDate == "" {
 			eventDate = result.EventDate
 		}
 		if result.TotalDamage > totalDamage {
 			totalDamage = result.TotalDamage
 		}
-		// Merge participants by name (same player appears in multiple screenshots)
+		// Merge participants by name using fuzzy matching
+		// (OCR may garble names slightly between screenshots)
 		for _, p := range result.Participants {
 			merged := false
 			for i, existing := range allParticipants {
-				if strings.EqualFold(existing.NameSnapshot, p.NameSnapshot) {
-					// Keep the version with higher damage
+				if strings.EqualFold(existing.NameSnapshot, p.NameSnapshot) ||
+					calculateSimilarity(existing.NameSnapshot, p.NameSnapshot) >= 75 {
 					if p.Damage > existing.Damage {
-						allParticipants[i] = p
+						allParticipants[i].Damage = p.Damage
 					}
 					merged = true
 					break
@@ -9271,20 +9451,23 @@ func processMarshalGuardScreenshots(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reassign ranks sequentially after merge: MVP=1, then 2,3,...
-	// First sort: MVP first, then by original rank order
+	// Sort by damage descending (damage determines rank — higher damage = lower rank number)
 	sort.SliceStable(allParticipants, func(i, j int) bool {
-		if allParticipants[i].RankInEvent == 1 && allParticipants[j].RankInEvent != 1 {
+		// Both have damage: higher damage ranks first
+		if allParticipants[i].Damage > 0 && allParticipants[j].Damage > 0 {
+			return allParticipants[i].Damage > allParticipants[j].Damage
+		}
+		// One has damage, the other doesn't: damage goes first
+		if allParticipants[i].Damage > 0 {
 			return true
 		}
-		if allParticipants[j].RankInEvent == 1 && allParticipants[i].RankInEvent != 1 {
+		if allParticipants[j].Damage > 0 {
 			return false
 		}
-		return false // keep insertion order for non-MVP
+		// Neither has damage: keep original order
+		return false
 	})
 	for i := range allParticipants {
-		if i == 0 && allParticipants[i].RankInEvent == 1 {
-			continue // keep MVP at rank 1
-		}
 		allParticipants[i].RankInEvent = i + 1
 	}
 
@@ -9588,6 +9771,1390 @@ func matchMGParticipant(p *MGOCRParticipant, members []Member) {
 	}
 }
 
+// extractMGByMask uses a fixed proportional layout mask to extract player data from
+// Marshal Guard mail screenshots. The game uses a stable layout across devices:
+//   - MVP section: top ~32% of image
+//   - Player list: 5 rows in the middle band
+//   - Each row: avatar on left, [TAG]Name on top text line, "Total Damage: X.XXG" below
+//
+// Key technique: each row is cropped into TWO separate sub-regions
+//  1. Name region (top half of row)             → OCR with letter whitelist
+//  2. Damage VALUE region (bottom half, right portion → label is cut off!)
+//     → OCR with digit-only whitelist
+//
+// Cutting off the "Total Damage:" label eliminates the leading "1" garble (from
+// the trailing "l" of "Totall") at the source. Whitelisted OCR forbids any
+// letter→digit substitution. The result is dramatically cleaner than block OCR.
+func extractMGByMask(imageData []byte) *MarshalGuardOCRResult {
+	img, _, err := image.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		log.Printf("MG mask: decode error: %v", err)
+		return nil
+	}
+
+	bounds := img.Bounds()
+	imgW := bounds.Dx()
+	imgH := bounds.Dy()
+
+	// All layout positions are proportional (% of image dimensions)
+	// Works for any device resolution since the game mail uses fixed proportions.
+	// Player rows use text-line detection instead of fixed proportions so they
+	// remain accurate even when a status bar or notification shifts the layout.
+	const (
+		// Horizontal: text region (right of avatar and rank badge)
+		nameXStart = 0.30 // right of avatar frame
+		nameXEnd   = 0.78
+		// Damage VALUE crop excludes the "Total Damage:" label:
+		// the label takes the left ~half of the damage line; value sits on the right.
+		dmgXStart = 0.55 // skip "Total Damage:" label
+		dmgXEnd   = 0.82
+
+		// MVP section (top of mail, larger card with combat-power number and damage line)
+		mvpNameYStart = 0.298 // line containing "[RSRP]Gargoland"
+		mvpNameYEnd   = 0.327 // tight: avoid the 93,943,806 line below
+		mvpDmgYStart  = 0.385 // "Total Damage: X.XXG" line under "Attacks: N"
+		mvpDmgYEnd    = 0.420
+		mvpXStart     = 0.43 // right of the avatar AND the shield icon
+		mvpXEnd       = 0.85
+		mvpDmgXStart  = 0.46 // skip "Total Damage:" label on MVP line
+
+		// Date line ("2026-5-12 20:30:05") near the bottom of mail body
+		dateYStart = 0.88
+		dateYEnd   = 0.91
+	)
+
+	pxX := func(p float64) int { return int(float64(imgW) * p) }
+	pxY := func(p float64) int { return int(float64(imgH) * p) }
+
+	result := &MarshalGuardOCRResult{}
+	var participants []MGOCRParticipant
+
+	// Debug overlay setup (no-op unless MG_DEBUG_DIR env var is set)
+	mgDebugInit(img)
+	defer mgDebugSaveOverlay(img)
+
+	// --- MVP ---
+	mvpNameText := ocrCropField(img,
+		pxX(mvpXStart), pxY(mvpNameYStart),
+		pxX(mvpXEnd), pxY(mvpNameYEnd),
+		mgFieldName, "mvp_name")
+	mvpDmgText := ocrCropField(img,
+		pxX(mvpDmgXStart), pxY(mvpDmgYStart),
+		pxX(mvpXEnd), pxY(mvpDmgYEnd),
+		mgFieldDamage, "mvp_dmg")
+	log.Printf("MG mask MVP: name=%q damage=%q", mvpNameText, mvpDmgText)
+
+	mvpParsedName, mvpTag := parseMGMaskName(mvpNameText)
+	mvpDamage := parseMGMaskDamage(mvpDmgText)
+	if mvpParsedName != "" {
+		participants = append(participants, MGOCRParticipant{
+			RankInEvent:  1,
+			NameSnapshot: mvpParsedName,
+			AllianceTag:  mvpTag,
+			Damage:       mvpDamage,
+		})
+		if mvpDamage > result.TotalDamage {
+			result.TotalDamage = mvpDamage
+		}
+	}
+
+	// --- Date ---
+	// Date text is centered in the light content area, so crop only the center
+	// to avoid dark side margins and navigation area that confuse binarization.
+	dateText := ocrCropField(img, pxX(0.15), pxY(dateYStart), pxX(0.85), pxY(dateYEnd), mgFieldDate, "date")
+	dateRe := regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
+	if dm := dateRe.FindStringSubmatch(dateText); dm != nil {
+		y, _ := strconv.Atoi(dm[1])
+		m, _ := strconv.Atoi(dm[2])
+		d, _ := strconv.Atoi(dm[3])
+		result.EventDate = fmt.Sprintf("%04d-%02d-%02d", y, m, d)
+	}
+
+	// --- Player rows ---
+	// Detect text lines in the body strip (below "Damage Ranking" header, above date).
+	// Each player card has exactly 2 lines: name on top, "Total Damage: X" below.
+	// Five cards = ten lines. Detection makes row positioning resolution-invariant
+	// and robust against vertical shifts (notification banners, status bars, etc.).
+	// Detect text lines in the body strip. Start below "Damage Ranking 2-20"
+	// header (at ~44%) and end before date (at ~90%).
+	bodyTop := pxY(0.47)
+	bodyBot := pxY(0.86) // stop before date line and nav bar divider
+	lines := detectMGTextLines(img, pxX(0.30), pxX(0.78), bodyTop, bodyBot)
+
+	// Debug: render detected text lines as yellow boxes in the overlay
+	if mgDebug != nil {
+		for i, ln := range lines {
+			mgDebug.boxes = append(mgDebug.boxes, mgDebugBox{
+				label: fmt.Sprintf("L%d", i),
+				x1:    pxX(0.28), y1: ln[0],
+				x2: pxX(0.80), y2: ln[1],
+				color: color.RGBA{255, 220, 0, 255}, // yellow
+			})
+		}
+	}
+	log.Printf("MG mask: detected %d text lines in body strip", len(lines))
+
+	// Strategy: edge detection reliably finds DAMAGE lines ("Total Damage: X.XXG")
+	// because they have high edge density. Player name lines have lower density and
+	// often don't produce a signal. We pick the 5 strongest/tallest lines as damage
+	// lines, then compute each name position as a fixed offset ABOVE the damage line.
+	//
+	// In the game layout (from visual inspection of the debug overlay):
+	//   name:   ~30px above the damage line
+	//   damage: detected line
+	//   gap:    space to next card
+
+	// Filter: keep lines with height between 20-80px (text lines, not artifacts)
+	var textLines [][2]int
+	for _, ln := range lines {
+		h := ln[1] - ln[0]
+		if h >= 20 && h <= 80 {
+			textLines = append(textLines, ln)
+		}
+	}
+
+	// From the remaining lines, group those that are within 80px of each other
+	// into clusters. For each cluster, pick the LOWER one (higher Y = damage line).
+	var dmgLines [][2]int
+	for i := 0; i < len(textLines); i++ {
+		if i+1 < len(textLines) && textLines[i+1][0]-textLines[i][0] < 80 {
+			dmgLines = append(dmgLines, textLines[i+1])
+			i++ // skip the paired name line
+		} else {
+			dmgLines = append(dmgLines, textLines[i])
+		}
+	}
+	if len(dmgLines) > 5 {
+		dmgLines = dmgLines[len(dmgLines)-5:]
+	}
+	log.Printf("MG mask: using %d damage lines for name-offset extraction", len(dmgLines))
+
+	var playerRows []MGOCRParticipant
+	if len(dmgLines) >= 3 {
+		// Compute name offset: name line sits one line-height above the damage line
+		// top, with a small gap between them (~5-8px in 2048-tall images).
+		lineH := dmgLines[0][1] - dmgLines[0][0]
+
+		// --- Overlap-based boundary detection ---
+		// Crop all name and damage rows at FULL card width, compare pairwise pixel
+		// differences per column to find where the consistent elements (alliance tag
+		// "[RSRP]" and "Total Damage:" label) end and variable content begins.
+		// This automatically adapts to any tag length or font size.
+		const (
+			wideNameXStart = 0.15 // full card width for comparison
+			wideNameXEnd   = 0.78
+		)
+
+		pad := 4
+		var nameRects [][4]int
+		for _, dmgLine := range dmgLines {
+			nameBot := dmgLine[0] - 5
+			nameTop := nameBot - lineH
+			if nameTop < bodyTop {
+				nameTop = bodyTop
+			}
+			if nameBot-nameTop < 20 {
+				continue
+			}
+			nameRects = append(nameRects, [4]int{pxX(wideNameXStart), nameTop - pad, pxX(wideNameXEnd), nameBot + pad})
+		}
+
+		// Find where variable content starts using overlap comparison
+		nameBoundary := mgFindContentStart(img, nameRects)
+		// Damage boundary is less reliable (varies per shot), use fixed proportion
+		// since "Total Damage:" label has consistent width across all cards.
+
+		// Convert boundary offsets to absolute X coordinates
+		nameXActual := pxX(wideNameXStart) + nameBoundary
+		dmgXActual := pxX(dmgXStart) // use fixed proportion for damage
+
+		// Back off from the detected boundary to INCLUDE the alliance tag.
+		// parseMGMaskName will strip it. The tag "[RSRP]" is ~80px wide.
+		// This ensures the full tag+name is captured regardless of detection precision.
+		if nameBoundary > 0 {
+			nameXActual -= 80
+			// Don't go further left than the fixed fallback
+			if nameXActual < pxX(nameXStart) {
+				nameXActual = pxX(nameXStart)
+			}
+		}
+
+		// Fallback to fixed proportions if boundary detection fails
+		if nameBoundary == 0 {
+			nameXActual = pxX(nameXStart)
+		}
+
+		log.Printf("MG mask: nameX=%d (%.2f), dmgX=%d (%.2f), nameBoundary=%d",
+			nameXActual, float64(nameXActual)/float64(imgW),
+			dmgXActual, float64(dmgXActual)/float64(imgW), nameBoundary)
+
+		// Now OCR each row using the detected boundaries
+		rowIdx := 0
+		for _, dmgLine := range dmgLines {
+			nameBot := dmgLine[0] - 5
+			nameTop := nameBot - lineH
+			if nameTop < bodyTop {
+				nameTop = bodyTop
+			}
+			if nameBot-nameTop < 20 {
+				continue
+			}
+
+			nameText := ocrCropField(img,
+				nameXActual, nameTop-pad,
+				pxX(nameXEnd), nameBot+pad,
+				mgFieldName, fmt.Sprintf("row%d_name", rowIdx))
+			dmgText := ocrCropField(img,
+				dmgXActual, dmgLine[0]-pad,
+				pxX(dmgXEnd), dmgLine[1]+pad,
+				mgFieldDamage, fmt.Sprintf("row%d_dmg", rowIdx))
+			log.Printf("MG mask row %d (dmg@y=%d-%d, name@y=%d-%d): name=%q damage=%q",
+				rowIdx, dmgLine[0], dmgLine[1], nameTop, nameBot, nameText, dmgText)
+			name, tag := parseMGMaskName(nameText)
+			damage := parseMGMaskDamage(dmgText)
+			if name == "" {
+				rowIdx++
+				continue
+			}
+			if mvpParsedName != "" && strings.EqualFold(name, mvpParsedName) {
+				rowIdx++
+				continue
+			}
+			playerRows = append(playerRows, MGOCRParticipant{
+				RankInEvent:  len(playerRows) + 2,
+				NameSnapshot: name,
+				AllianceTag:  tag,
+				Damage:       damage,
+			})
+			rowIdx++
+		}
+	}
+
+	// Safety net: enforce descending damage order across player rows
+	// (rare with whitelisted OCR, but handles any remaining garble)
+	if len(playerRows) > 1 {
+		mgEnforceMonotonicity(playerRows)
+	}
+	participants = append(participants, playerRows...)
+
+	result.Participants = participants
+	return result
+}
+
+// mgFieldKind selects per-field OCR config (whitelist + page segmentation mode)
+type mgFieldKind int
+
+const (
+	mgFieldDamage mgFieldKind = iota // digits + . , G M K
+	mgFieldName                      // letters + digits + [ ] _ space
+	mgFieldDate                      // digits + -
+)
+
+// mgFindContentStart overlaps multiple card row crops and finds the X pixel
+// where variable content (player name or damage number) begins. The consistent
+// region (alliance tag "[RSRP]" or "Total Damage:" label) has low pairwise
+// pixel differences across cards; the variable region has high differences.
+// rects: each entry is [x1, y1, x2, y2] defining a crop rectangle on img.
+// Returns X offset relative to crop left edge, or 0 if detection fails.
+func mgFindContentStart(img image.Image, rects [][4]int) int {
+	if len(rects) < 3 {
+		return 0
+	}
+	// Determine common width and height
+	minW := rects[0][2] - rects[0][0]
+	minH := rects[0][3] - rects[0][1]
+	for _, r := range rects[1:] {
+		w := r[2] - r[0]
+		h := r[3] - r[1]
+		if w < minW {
+			minW = w
+		}
+		if h < minH {
+			minH = h
+		}
+	}
+	if minW < 30 || minH < 10 {
+		return 0
+	}
+
+	// For each column x, compare pixel values at EVERY row (step 2-3px) across all pairs.
+	// In the tag/label region, all cards have identical text → same pixels → low diff.
+	// In the name/number region, different text → different pixels → high diff.
+	n := len(rects)
+	yStep := 3
+	if minH < 20 {
+		yStep = 2
+	}
+
+	colDiff := make([]float64, minW)
+	for x := 0; x < minW; x++ {
+		var totalDiff float64
+		pairs := 0
+		for i := 0; i < n-1; i++ {
+			for j := i + 1; j < n; j++ {
+				ri := rects[i]
+				rj := rects[j]
+				for dy := 0; dy < minH; dy += yStep {
+					yi := ri[1] + dy
+					yj := rj[1] + dy
+					xi := ri[0] + x
+					xj := rj[0] + x
+
+					ri8, gi8, bi8, _ := img.At(xi, yi).RGBA()
+					rj8, gj8, bj8, _ := img.At(xj, yj).RGBA()
+
+					minI := uint8(ri8 >> 8)
+					if g := uint8(gi8 >> 8); g < minI {
+						minI = g
+					}
+					if b := uint8(bi8 >> 8); b < minI {
+						minI = b
+					}
+					minJ := uint8(rj8 >> 8)
+					if g := uint8(gj8 >> 8); g < minJ {
+						minJ = g
+					}
+					if b := uint8(bj8 >> 8); b < minJ {
+						minJ = b
+					}
+
+					diff := int(minI) - int(minJ)
+					if diff < 0 {
+						diff = -diff
+					}
+					totalDiff += float64(diff)
+					pairs++
+				}
+			}
+		}
+		if pairs > 0 {
+			colDiff[x] = totalDiff / float64(pairs)
+		}
+	}
+
+	// Smooth with a 10px window
+	smoothed := make([]float64, minW)
+	win := 10
+	for x := 0; x < minW; x++ {
+		start := x - win/2
+		if start < 0 {
+			start = 0
+		}
+		end := x + win/2
+		if end > minW {
+			end = minW
+		}
+		var s float64
+		for i := start; i < end; i++ {
+			s += colDiff[i]
+		}
+		smoothed[x] = s / float64(end-start)
+	}
+
+	// Find the LOW-difference island (consistent tag or label) and return its right edge.
+	// There may be multiple low regions (card backgrounds). We want the RIGHTMOST low
+	// region in the middle portion that's followed by a high-diff region (variable content).
+	maxVal := 0.0
+	for _, v := range smoothed {
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	if maxVal < 3 {
+		log.Printf("MG mask boundary: maxVal=%.1f too low, giving up", maxVal)
+		return 0
+	}
+
+	// Threshold: anything below 35% of max is "low" (consistent)
+	lowThresh := maxVal * 0.35
+
+	// Find all valleys (low regions) and their right edges
+	// Scan left-to-right, track when we enter/exit a low region
+	type valley struct{ left, right int }
+	var valleys []valley
+	inLow := false
+	lowStart := 0
+	for x := 0; x < minW; x++ {
+		if smoothed[x] < lowThresh {
+			if !inLow {
+				lowStart = x
+				inLow = true
+			}
+		} else {
+			if inLow {
+				valleys = append(valleys, valley{lowStart, x})
+				inLow = false
+			}
+		}
+	}
+	if inLow {
+		valleys = append(valleys, valley{lowStart, minW - 1})
+	}
+
+	// Find the RIGHTMOST valley whose right edge is between 20% and 65% of width.
+	// This is the tag/label region, and the name/number starts at its right edge.
+	boundary := 0
+	for i := len(valleys) - 1; i >= 0; i-- {
+		v := valleys[i]
+		rightEdge := v.right
+		// Valley must be at least 15px wide (to be actual text, not noise)
+		if v.right-v.left < 15 {
+			continue
+		}
+		if rightEdge >= minW*20/100 && rightEdge <= minW*65/100 {
+			boundary = rightEdge
+			break
+		}
+	}
+
+	if boundary == 0 {
+		log.Printf("MG mask boundary: no valid valley found, maxVal=%.1f, valleys=%d",
+			maxVal, len(valleys))
+		return 0
+	}
+
+	log.Printf("MG mask boundary: width=%d, contentStart=%d (%.0f%%), maxDiff=%.1f, valleys=%d",
+		minW, boundary, float64(boundary)/float64(minW)*100, maxVal, len(valleys))
+	return boundary
+}
+
+// autoDetectInvert samples the center content area of an RGBA crop.
+// Returns true if the majority of the interior is dark (light text on dark bg).
+// Returns false if the majority is light (dark text on light bg → already correct).
+// Uses a 25% inset sampling grid to avoid border artifacts and decorations.
+func autoDetectInvert(cropped *image.RGBA) bool {
+	bounds := cropped.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+	if w < 8 || h < 8 {
+		return false // default: don't invert (assume dark-on-light)
+	}
+	// Use histogram mode (most frequent luminance bucket) to detect background.
+	// Background pixels always outnumber text pixels in a text crop, so the mode
+	// represents the background color regardless of crop size or text thickness.
+	var hist [256]int
+	stepX := w / 40
+	if stepX < 1 {
+		stepX = 1
+	}
+	stepY := h / 20
+	if stepY < 1 {
+		stepY = 1
+	}
+	for y := 0; y < h; y += stepY {
+		for x := 0; x < w; x += stepX {
+			r, g, b, _ := cropped.At(x, y).RGBA()
+			lum := uint8((299*r + 587*g + 114*b) / 1000 >> 8)
+			hist[lum]++
+		}
+	}
+	// Find mode (bucket with highest count)
+	modeVal := 0
+	modeCount := 0
+	for i, c := range hist {
+		if c > modeCount {
+			modeCount = c
+			modeVal = i
+		}
+	}
+	return modeVal < 128 // dark background → light text → invert needed
+}
+
+// preprocessForOCR converts an RGBA crop into an OCR-ready grayscale image:
+//  1. Convert to grayscale (luminance)
+//  2. Auto-detect text polarity (invert if dark background)
+//  3. Otsu binarize (auto-threshold) — pure black text on pure white
+//  4. Add white border padding (Tesseract docs recommend ≥10px)
+//  5. Upscale so that capital letter height is ~36px (Tesseract sweet spot)
+//
+// All steps use proportional / threshold-based logic so the function works
+// equally well on small or large device screenshots.
+func preprocessForOCR(cropped *image.RGBA) *image.Gray {
+	bounds := cropped.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+	if w <= 0 || h <= 0 {
+		return image.NewGray(image.Rect(0, 0, 1, 1))
+	}
+
+	// Step 1+2: grayscale using min-channel (better for colored text on colored
+	// backgrounds — e.g. red text on pink: min(R,G,B) of text ≈ 0 vs background ≈ 170).
+	// Then optionally invert for light-on-dark cases.
+	invert := autoDetectInvert(cropped)
+	gray := image.NewGray(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			r, g, b, _ := cropped.At(x, y).RGBA()
+			// min-channel: gives lowest component, maximizes contrast for colored text
+			r8, g8, b8 := uint8(r>>8), uint8(g>>8), uint8(b>>8)
+			minCh := r8
+			if g8 < minCh {
+				minCh = g8
+			}
+			if b8 < minCh {
+				minCh = b8
+			}
+			if invert {
+				minCh = 255 - minCh
+			}
+			gray.SetGray(x, y, color.Gray{Y: minCh})
+		}
+	}
+
+	// Step 3: Otsu binarize
+	thr := computeOtsuThreshold(gray)
+	binary := image.NewGray(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if gray.GrayAt(x, y).Y < thr {
+				binary.SetGray(x, y, color.Gray{Y: 0}) // text
+			} else {
+				binary.SetGray(x, y, color.Gray{Y: 255}) // background
+			}
+		}
+	}
+
+	// Step 4: add white border padding (proportional to crop size, min 10px)
+	pad := h / 4
+	if pad < 10 {
+		pad = 10
+	}
+	if pad > 40 {
+		pad = 40
+	}
+	paddedW := w + 2*pad
+	paddedH := h + 2*pad
+	padded := image.NewGray(image.Rect(0, 0, paddedW, paddedH))
+	// Fill with white
+	for i := range padded.Pix {
+		padded.Pix[i] = 255
+	}
+	// Copy binary into center
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			padded.SetGray(x+pad, y+pad, binary.GrayAt(x, y))
+		}
+	}
+
+	// Step 5: upscale so cap-height is ~48px (Tesseract optimum for small chars)
+	// Cap height is roughly 60% of text row height. For a single-line crop,
+	// h ≈ cap-height / 0.6. Target padded height to give cap-height ≈ 48.
+	targetCapHeight := 48
+	estimatedCapHeight := int(float64(h) * 0.6)
+	if estimatedCapHeight < 1 {
+		estimatedCapHeight = 1
+	}
+	scale := targetCapHeight / estimatedCapHeight
+	if scale < 2 {
+		scale = 2
+	}
+	if scale > 6 {
+		scale = 6
+	}
+	scaledW := paddedW * scale
+	scaledH := paddedH * scale
+	scaled := image.NewGray(image.Rect(0, 0, scaledW, scaledH))
+	for y := 0; y < scaledH; y++ {
+		for x := 0; x < scaledW; x++ {
+			scaled.SetGray(x, y, padded.GrayAt(x/scale, y/scale))
+		}
+	}
+	return scaled
+}
+
+// ocrCropField crops a region, applies the full preprocessing pipeline,
+// and runs OCR with field-specific Tesseract config (PSM + character whitelist).
+// fieldKind controls which whitelist and PSM mode is used.
+// mgDebugCtx holds per-extraction debug state. Created when MG_DEBUG_DIR is set.
+type mgDebugContext struct {
+	dir    string
+	prefix string       // e.g. "screenshot3"
+	boxes  []mgDebugBox // collected for the overlay
+}
+
+type mgDebugBox struct {
+	label          string
+	x1, y1, x2, y2 int
+	color          color.RGBA
+}
+
+// mgDebug is set per-call to extractMGByMask. nil = debug disabled.
+var mgDebug *mgDebugContext
+var mgDebugSeq int
+
+func mgDebugInit(img image.Image) {
+	dir := os.Getenv("MG_DEBUG_DIR")
+	if dir == "" {
+		mgDebug = nil
+		return
+	}
+	_ = os.MkdirAll(dir, 0o755)
+	mgDebugSeq++
+	mgDebug = &mgDebugContext{
+		dir:    dir,
+		prefix: fmt.Sprintf("shot%02d", mgDebugSeq),
+	}
+}
+
+func mgDebugSaveCrop(label string, raw *image.RGBA, processed *image.Gray, x1, y1, x2, y2 int, col color.RGBA) {
+	if mgDebug == nil {
+		return
+	}
+	mgDebug.boxes = append(mgDebug.boxes, mgDebugBox{label, x1, y1, x2, y2, col})
+	base := filepath.Join(mgDebug.dir, fmt.Sprintf("%s_%s", mgDebug.prefix, label))
+	if f, err := os.Create(base + "_raw.png"); err == nil {
+		_ = png.Encode(f, raw)
+		_ = f.Close()
+	}
+	if f, err := os.Create(base + "_proc.png"); err == nil {
+		_ = png.Encode(f, processed)
+		_ = f.Close()
+	}
+}
+
+// mgDebugSaveOverlay draws all collected crop boxes onto a copy of the
+// source image and writes it as {prefix}_overlay.png. Helps visually
+// verify whether the proportional crop coordinates land where we think.
+func mgDebugSaveOverlay(src image.Image) {
+	if mgDebug == nil || len(mgDebug.boxes) == 0 {
+		return
+	}
+	b := src.Bounds()
+	out := image.NewRGBA(b)
+	draw.Draw(out, b, src, b.Min, draw.Src)
+	for _, box := range mgDebug.boxes {
+		drawRect(out, box.x1, box.y1, box.x2, box.y2, box.color, 3)
+	}
+	f, err := os.Create(filepath.Join(mgDebug.dir, mgDebug.prefix+"_overlay.png"))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = png.Encode(f, out)
+}
+
+func drawRect(img *image.RGBA, x1, y1, x2, y2 int, col color.RGBA, thickness int) {
+	for t := 0; t < thickness; t++ {
+		for x := x1; x < x2; x++ {
+			img.SetRGBA(x, y1+t, col)
+			img.SetRGBA(x, y2-1-t, col)
+		}
+		for y := y1; y < y2; y++ {
+			img.SetRGBA(x1+t, y, col)
+			img.SetRGBA(x2-1-t, y, col)
+		}
+	}
+}
+
+// detectMGTextLines finds vertical extents of bright text lines in a vertical strip.
+// Algorithm: count high-luminance pixels per row (Y-projection), smooth with a 5-row
+// box filter, threshold at ~3% of strip width, return runs that are at least 8px tall.
+//
+// The game UI uses light text on dark/medium backgrounds, so high-luminance pixels are
+// reliable text markers. Each text line shows up as a clear plateau in the projection;
+// vertical gaps between rows produce near-zero counts.
+//
+// This makes player-row positions resolution-invariant and resilient to vertical
+// shifts (status bar, notifications, different mail header heights).
+func detectMGTextLines(img image.Image, xStart, xEnd, yStart, yEnd int) [][2]int {
+	bounds := img.Bounds()
+	if xStart < bounds.Min.X {
+		xStart = bounds.Min.X
+	}
+	if xEnd > bounds.Max.X {
+		xEnd = bounds.Max.X
+	}
+	if yStart < bounds.Min.Y {
+		yStart = bounds.Min.Y
+	}
+	if yEnd > bounds.Max.Y {
+		yEnd = bounds.Max.Y
+	}
+	stripW := xEnd - xStart
+	stripH := yEnd - yStart
+	if stripW <= 0 || stripH <= 0 {
+		return nil
+	}
+
+	// Per-row count of horizontal-edge pixels.
+	// Text strokes produce sharp brightness transitions; smooth card/page
+	// backgrounds do not. We count pixels where the luminance change over a
+	// 3-pixel horizontal window exceeds 40 (out of 255). This signal cleanly
+	// isolates text lines regardless of the underlying panel/page color.
+	counts := make([]int, stripH)
+	lumAt := func(x, y int) int {
+		r, g, b, _ := img.At(x, y).RGBA()
+		return (299*int(r>>8) + 587*int(g>>8) + 114*int(b>>8)) / 1000
+	}
+	for yi := 0; yi < stripH; yi++ {
+		y := yStart + yi
+		c := 0
+		for x := xStart; x < xEnd-3; x++ {
+			d := lumAt(x+3, y) - lumAt(x, y)
+			if d < 0 {
+				d = -d
+			}
+			if d > 40 {
+				c++
+			}
+		}
+		counts[yi] = c
+	}
+
+	// 3-tap box smoother — bridges 2-3px intra-glyph gaps but not inter-line gaps.
+	sm := make([]int, stripH)
+	for i := 0; i < stripH; i++ {
+		s, n := 0, 0
+		for k := -1; k <= 1; k++ {
+			j := i + k
+			if j >= 0 && j < stripH {
+				s += counts[j]
+				n++
+			}
+		}
+		sm[i] = s / n
+	}
+
+	// Threshold: ~4% of strip width. Need to be low enough to detect both
+	// player name lines (fewer characters, less edge density) AND damage lines
+	// (more text, higher edge density). 4% catches names with ~15+ edge pixels.
+	threshold := stripW / 25
+	if threshold < 4 {
+		threshold = 4
+	}
+
+	var runs [][2]int
+	inRun := false
+	runStart := 0
+	for i := 0; i < stripH; i++ {
+		if sm[i] >= threshold {
+			if !inRun {
+				inRun = true
+				runStart = i
+			}
+		} else if inRun {
+			if i-runStart >= 8 {
+				runs = append(runs, [2]int{yStart + runStart, yStart + i})
+			}
+			inRun = false
+		}
+	}
+	if inRun && stripH-runStart >= 8 {
+		runs = append(runs, [2]int{yStart + runStart, yStart + stripH})
+	}
+
+	// Post-process: if any run is much taller than a typical line (>1.6× the
+	// median height), split it at the local minimum of the smoothed signal.
+	// Two adjacent text lines can merge when the gap between them is small.
+	if len(runs) >= 3 {
+		heights := make([]int, len(runs))
+		for i, r := range runs {
+			heights[i] = r[1] - r[0]
+		}
+		sorted := append([]int(nil), heights...)
+		sort.Ints(sorted)
+		medH := sorted[len(sorted)/2]
+		maxH := medH * 16 / 10 // 1.6×
+
+		var split [][2]int
+		for _, r := range runs {
+			if r[1]-r[0] <= maxH {
+				split = append(split, r)
+				continue
+			}
+			// Find local minimum in sm[] over the middle 60% of the run
+			a := r[0] - yStart + (r[1]-r[0])*2/10
+			b := r[0] - yStart + (r[1]-r[0])*8/10
+			minI := a
+			minV := sm[a]
+			for i := a + 1; i <= b; i++ {
+				if sm[i] < minV {
+					minV = sm[i]
+					minI = i
+				}
+			}
+			cut := yStart + minI
+			if cut-r[0] >= 8 && r[1]-cut >= 8 {
+				split = append(split, [2]int{r[0], cut}, [2]int{cut, r[1]})
+			} else {
+				split = append(split, r)
+			}
+		}
+		runs = split
+	}
+	return runs
+}
+
+func ocrCropField(img image.Image, x1, y1, x2, y2 int, fieldKind mgFieldKind, debugLabel string) string {
+	bounds := img.Bounds()
+	// Clamp
+	if x1 < bounds.Min.X {
+		x1 = bounds.Min.X
+	}
+	if y1 < bounds.Min.Y {
+		y1 = bounds.Min.Y
+	}
+	if x2 > bounds.Max.X {
+		x2 = bounds.Max.X
+	}
+	if y2 > bounds.Max.Y {
+		y2 = bounds.Max.Y
+	}
+	cropW := x2 - x1
+	cropH := y2 - y1
+	if cropW <= 0 || cropH <= 0 {
+		return ""
+	}
+
+	// Crop into RGBA buffer
+	cropped := image.NewRGBA(image.Rect(0, 0, cropW, cropH))
+	draw.Draw(cropped, cropped.Bounds(), img, image.Point{x1, y1}, draw.Src)
+
+	// Preprocess (grayscale → invert → Otsu → pad → upscale)
+	processed := preprocessForOCR(cropped)
+
+	// Debug export (if MG_DEBUG_DIR set)
+	if mgDebug != nil && debugLabel != "" {
+		var col color.RGBA
+		switch fieldKind {
+		case mgFieldName:
+			col = color.RGBA{0, 200, 0, 255} // green
+		case mgFieldDamage:
+			col = color.RGBA{255, 50, 50, 255} // red
+		case mgFieldDate:
+			col = color.RGBA{50, 100, 255, 255} // blue
+		}
+		mgDebugSaveCrop(debugLabel, cropped, processed, x1, y1, x2, y2, col)
+	}
+
+	// Encode for Tesseract
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, processed); err != nil {
+		return ""
+	}
+
+	// Configure Tesseract per field
+	client := gosseract.NewClient()
+	defer client.Close()
+	client.SetImageFromBytes(buf.Bytes())
+
+	switch fieldKind {
+	case mgFieldDamage:
+		// Damage value: digits, decimal punctuation variants, unit letters
+		// Whitelist eliminates letter→digit confusion from label bleed.
+		client.SetVariable("tessedit_char_whitelist", "0123456789.,GMKB")
+		client.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
+	case mgFieldName:
+		// Name + alliance tag: letters, digits, brackets, space, underscore
+		client.SetVariable("tessedit_char_whitelist",
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[]_ ")
+		client.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
+	case mgFieldDate:
+		client.SetVariable("tessedit_char_whitelist", "0123456789-: ")
+		client.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
+	}
+
+	text, err := client.Text()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(text)
+}
+
+// parseMGMaskName extracts player name and alliance tag from a clean OCR line.
+// Input comes from whitelisted OCR (letters + digits + brackets + space + _),
+// so the line is one of:
+//   - "[RSRP]Gargolar"
+//   - "[RSRP] Gargolar"    (space variant)
+//   - "RSRP]Gargolar"      (missing opening bracket)
+//   - "Gargolar"           (no tag)
+//
+// Brackets in the game font occasionally OCR as adjacent letters; we accept
+// "I", "l", "1" as alternates only for the closing bracket where this is common.
+func parseMGMaskName(text string) (name, tag string) {
+	if text == "" {
+		return "", ""
+	}
+	// Strip newlines (PSM_SINGLE_LINE should already give a single line, but be safe)
+	line := strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
+	if line == "" {
+		return "", ""
+	}
+
+	cleanName := func(s string) string {
+		s = strings.TrimSpace(s)
+		// Trim leading/trailing non-alphanumeric garbage
+		s = regexp.MustCompile(`^[^A-Za-z0-9]+`).ReplaceAllString(s, "")
+		s = regexp.MustCompile(`[^A-Za-z0-9_ ]+$`).ReplaceAllString(s, "")
+		// Collapse runs of spaces
+		s = regexp.MustCompile(`\s+`).ReplaceAllString(s, " ")
+		return strings.TrimSpace(s)
+	}
+
+	// Try [TAG]Name pattern
+	if m := regexp.MustCompile(`\[([A-Z0-9]{2,6})[\]lI1]\s*(.+)`).FindStringSubmatch(line); m != nil {
+		n := cleanName(m[2])
+		if len(n) >= 2 {
+			return n, m[1]
+		}
+	}
+	// Try without opening bracket: "TAG]Name"
+	if m := regexp.MustCompile(`([A-Z]{2,6})[\]lI1]\s*(.+)`).FindStringSubmatch(line); m != nil {
+		n := cleanName(m[2])
+		if len(n) >= 2 {
+			return n, m[1]
+		}
+	}
+	// No tag — return the cleaned line if it looks like a name
+	cleaned := cleanName(line)
+	if len(cleaned) >= 3 {
+		return cleaned, ""
+	}
+	return "", ""
+}
+
+// parseMGMaskDamage extracts a damage value from a clean OCR line.
+// Input comes from whitelisted OCR (digits + .,GMKB only), so we expect:
+//   - "1.98G"  (clean)
+//   - "835.58M"
+//   - "1,98G"  (locale comma)
+//   - "1.98"   (unit dropped)
+//
+// No more "Total[Damage:" garble — that label was cropped out before OCR.
+func parseMGMaskDamage(text string) int64 {
+	if text == "" {
+		return 0
+	}
+	// Normalize: comma → dot, drop spaces, drop stray B (sometimes leaks from "Battle")
+	t := strings.ReplaceAll(text, ",", ".")
+	t = strings.ReplaceAll(t, " ", "")
+	t = strings.ReplaceAll(t, "B", "")
+
+	// Primary pattern: X.XX[GMK]
+	if m := regexp.MustCompile(`(\d{1,3})\.(\d{1,2})([GMK])`).FindStringSubmatch(t); m != nil {
+		intPart, _ := strconv.ParseFloat(m[1], 64)
+		fracPart, _ := strconv.ParseFloat("0."+m[2], 64)
+		val := intPart + fracPart
+		return parseDamageValue(fmt.Sprintf("%.2f", val), m[3])
+	}
+	// Whole number with unit: "835M" — but check if decimal was dropped
+	if m := regexp.MustCompile(`(\d+)([GMK])`).FindStringSubmatch(t); m != nil {
+		num, _ := strconv.Atoi(m[1])
+		unit := m[2]
+		// If the number seems too large for the unit, a decimal point was likely missed.
+		// Game values: G=1-99.99, M=1-999.99, K=1-999.99
+		if (unit == "G" && num > 99) || (unit == "M" && num > 999) || (unit == "K" && num > 999) {
+			// Game always shows exactly 2 decimal places (X.XX). Find split with 2-digit frac.
+			numStr := m[1]
+			for intLen := 1; intLen <= len(numStr)-2; intLen++ {
+				if len(numStr)-intLen == 2 { // exactly 2 fraction digits
+					intVal, _ := strconv.Atoi(numStr[:intLen])
+					if (unit == "G" && intVal <= 99) || (unit == "M" && intVal <= 999) || (unit == "K" && intVal <= 999) {
+						val, _ := strconv.ParseFloat(numStr[:intLen]+"."+numStr[intLen:], 64)
+						return parseDamageValue(fmt.Sprintf("%.6f", val), unit)
+					}
+				}
+			}
+			// Fallback: try any valid split
+			for intLen := 1; intLen <= 3 && intLen < len(numStr); intLen++ {
+				intVal, _ := strconv.Atoi(numStr[:intLen])
+				if (unit == "G" && intVal <= 99) || (unit == "M" && intVal <= 999) || (unit == "K" && intVal <= 999) {
+					val, _ := strconv.ParseFloat(numStr[:intLen]+"."+numStr[intLen:], 64)
+					return parseDamageValue(fmt.Sprintf("%.6f", val), unit)
+				}
+			}
+		}
+		return parseDamageValue(m[1], unit)
+	}
+	// Digits only (no decimal, no unit) — try to reconstruct.
+	// "G" often misread as "6" at end, "0" can also be misread G.
+	if m := regexp.MustCompile(`^(\d+)$`).FindStringSubmatch(t); m != nil {
+		numStr := m[1]
+		if len(numStr) >= 3 {
+			lastCh := numStr[len(numStr)-1]
+			var unit string
+			switch lastCh {
+			case '6': // G misread as 6
+				unit = "G"
+			case '0': // G misread as 0
+				unit = "G"
+			}
+			if unit != "" {
+				numStr = numStr[:len(numStr)-1]
+				// Prefer split with 2-digit fraction (game format X.XX)
+				for intLen := 1; intLen <= len(numStr)-2; intLen++ {
+					if len(numStr)-intLen == 2 {
+						intVal, _ := strconv.Atoi(numStr[:intLen])
+						if (unit == "G" && intVal <= 99) || (unit == "M" && intVal <= 999) {
+							val, _ := strconv.ParseFloat(numStr[:intLen]+"."+numStr[intLen:], 64)
+							return parseDamageValue(fmt.Sprintf("%.6f", val), unit)
+						}
+					}
+				}
+				// Fallback: any valid split
+				for intLen := 1; intLen <= 3 && intLen < len(numStr); intLen++ {
+					intVal, _ := strconv.Atoi(numStr[:intLen])
+					if (unit == "G" && intVal <= 99) || (unit == "M" && intVal <= 999) {
+						val, _ := strconv.ParseFloat(numStr[:intLen]+"."+numStr[intLen:], 64)
+						return parseDamageValue(fmt.Sprintf("%.6f", val), unit)
+					}
+				}
+				// If no decimal needed
+				return parseDamageValue(numStr, unit)
+			}
+		}
+	}
+	// Number with decimal but no unit — assume the unit was dropped; infer from magnitude
+	if m := regexp.MustCompile(`(\d{1,3})\.(\d{1,2})`).FindStringSubmatch(t); m != nil {
+		intPart, _ := strconv.ParseFloat(m[1], 64)
+		fracPart, _ := strconv.ParseFloat("0."+m[2], 64)
+		val := intPart + fracPart
+		// Heuristic: G values are typically 1-99, M values are typically 1-999.
+		// If int part ≤ 99, more likely G; otherwise M. (Sanity will check.)
+		unit := "G"
+		if intPart >= 100 {
+			unit = "M"
+		}
+		return parseDamageValue(fmt.Sprintf("%.2f", val), unit)
+	}
+	return 0
+}
+
+// mgEnforceMonotonicity fixes damage values that violate descending rank order.
+// In the game, player rows are always ranked highest-to-lowest damage.
+// A leading "1" garble from OCR (e.g., "11.98G" instead of "1.98G") causes violations.
+// Fix by stripping the leading digit from the integer part of the damage value.
+func mgEnforceMonotonicity(participants []MGOCRParticipant) {
+	for i := 1; i < len(participants); i++ {
+		if participants[i].Damage <= 0 || participants[i-1].Damage <= 0 {
+			continue
+		}
+		if participants[i].Damage > participants[i-1].Damage {
+			// Violation: try stripping leading digit from the value
+			fixed := mgStripLeadingDigit(participants[i].Damage)
+			if fixed > 0 && fixed <= participants[i-1].Damage {
+				log.Printf("MG mask monotonicity: row %d %q damage %d → %d",
+					i, participants[i].NameSnapshot, participants[i].Damage, fixed)
+				participants[i].Damage = fixed
+			}
+		}
+	}
+}
+
+// mgStripLeadingDigit removes the leading digit from a damage value's integer part.
+// E.g., 11.98G → 1.98G (removes leading "1"), 134.97M → 34.97M
+func mgStripLeadingDigit(damage int64) int64 {
+	// Determine unit magnitude
+	var unit float64
+	if damage >= 1000000000 {
+		unit = 1000000000 // G
+	} else if damage >= 1000000 {
+		unit = 1000000 // M
+	} else {
+		return damage / 10
+	}
+
+	// Convert to float in the appropriate unit
+	floatVal := float64(damage) / unit
+	intPart := int(floatVal)
+	fracPart := floatVal - float64(intPart)
+
+	// Strip leading digit
+	intStr := strconv.Itoa(intPart)
+	if len(intStr) <= 1 {
+		return 0 // can't strip from single digit
+	}
+	newInt, _ := strconv.Atoi(intStr[1:])
+	newFloat := float64(newInt) + fracPart
+	return int64(newFloat * unit)
+}
+
+// ocrMGAllVariants applies multiple image preprocessing strategies before OCR
+// and returns ALL resulting texts (not just the best one) so the caller can merge.
+func ocrMGAllVariants(imageData []byte) []string {
+	img, _, err := image.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		return nil
+	}
+
+	bounds := img.Bounds()
+	imgW := bounds.Dx()
+	imgH := bounds.Dy()
+
+	// Minimal crop — skip top 5% (title bar) and bottom 3%
+	cropTop := imgH * 5 / 100
+	cropBottom := imgH * 97 / 100
+	cropW := imgW
+	cropH := cropBottom - cropTop
+
+	cropped := image.NewRGBA(image.Rect(0, 0, cropW, cropH))
+	draw.Draw(cropped, cropped.Bounds(), img, image.Point{bounds.Min.X, cropTop + bounds.Min.Y}, draw.Src)
+
+	// Convert to grayscale
+	gray := image.NewGray(image.Rect(0, 0, cropW, cropH))
+	for y := 0; y < cropH; y++ {
+		for x := 0; x < cropW; x++ {
+			r, g, b, _ := cropped.At(x, y).RGBA()
+			lum := uint8((299*r + 587*g + 114*b) / 1000 >> 8)
+			gray.SetGray(x, y, color.Gray{Y: lum})
+		}
+	}
+
+	// Strategy 1: Simple inversion (no threshold) — let Tesseract binarize
+	inverted := image.NewGray(image.Rect(0, 0, cropW, cropH))
+	for y := 0; y < cropH; y++ {
+		for x := 0; x < cropW; x++ {
+			px := gray.GrayAt(x, y).Y
+			inverted.SetGray(x, y, color.Gray{Y: 255 - px})
+		}
+	}
+
+	// Strategy 2: RED channel isolation + inversion
+	// Game text (gold/white) has high Red; dark blue/purple BG has low Red
+	redChan := image.NewGray(image.Rect(0, 0, cropW, cropH))
+	for y := 0; y < cropH; y++ {
+		for x := 0; x < cropW; x++ {
+			r, _, _, _ := cropped.At(x, y).RGBA()
+			redVal := uint8(r >> 8)
+			// Invert: high red (text) → dark, low red (bg) → light
+			redChan.SetGray(x, y, color.Gray{Y: 255 - redVal})
+		}
+	}
+
+	// Strategy 3: Low threshold on grayscale (captures dim text)
+	lowThreshold := uint8(40)
+	binarizedLow := image.NewGray(image.Rect(0, 0, cropW, cropH))
+	for y := 0; y < cropH; y++ {
+		for x := 0; x < cropW; x++ {
+			px := gray.GrayAt(x, y).Y
+			if px > lowThreshold {
+				binarizedLow.SetGray(x, y, color.Gray{Y: 0}) // text → black
+			} else {
+				binarizedLow.SetGray(x, y, color.Gray{Y: 255}) // bg → white
+			}
+		}
+	}
+
+	// Scale up all variants 3x (bigger = better for small damage text)
+	scaledW := cropW * 3
+	scaledH := cropH * 3
+
+	scaledInv := image.NewGray(image.Rect(0, 0, scaledW, scaledH))
+	scaledRed := image.NewGray(image.Rect(0, 0, scaledW, scaledH))
+	scaledLow := image.NewGray(image.Rect(0, 0, scaledW, scaledH))
+	for y := 0; y < scaledH; y++ {
+		for x := 0; x < scaledW; x++ {
+			scaledInv.SetGray(x, y, inverted.GrayAt(x/3, y/3))
+			scaledRed.SetGray(x, y, redChan.GrayAt(x/3, y/3))
+			scaledLow.SetGray(x, y, binarizedLow.GrayAt(x/3, y/3))
+		}
+	}
+
+	// Run OCR on all variants, collect all texts
+	variants := []image.Image{scaledInv, scaledRed, scaledLow}
+	var allTexts []string
+
+	for i, variant := range variants {
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, variant); err != nil {
+			continue
+		}
+		client := gosseract.NewClient()
+		client.SetImageFromBytes(buf.Bytes())
+		client.SetPageSegMode(gosseract.PSM_SINGLE_BLOCK)
+		text, err := client.Text()
+		client.Close()
+		if err != nil {
+			continue
+		}
+		log.Printf("MG OCR variant %d: %d lines", i, len(strings.Split(text, "\n")))
+		allTexts = append(allTexts, text)
+	}
+
+	// Extra pass: red channel with PSM_SPARSE_TEXT to find scattered damage text
+	{
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, scaledRed); err == nil {
+			client := gosseract.NewClient()
+			client.SetImageFromBytes(buf.Bytes())
+			client.SetPageSegMode(gosseract.PSM_SPARSE_TEXT)
+			text, err := client.Text()
+			client.Close()
+			if err == nil && text != "" {
+				log.Printf("MG OCR variant sparse: %d lines", len(strings.Split(text, "\n")))
+				allTexts = append(allTexts, text)
+			}
+		}
+	}
+
+	return allTexts
+}
+
+// mergeOCRResults merges multiple OCR parse results into one.
+// Uses the result with the most participants as the base, then fills in
+// missing damage from other results using fuzzy name matching.
+func mergeOCRResults(results []MarshalGuardOCRResult) MarshalGuardOCRResult {
+	if len(results) == 0 {
+		return MarshalGuardOCRResult{}
+	}
+
+	// Find the result with the most participants as our base
+	bestIdx := 0
+	bestCount := 0
+	for i, r := range results {
+		if len(r.Participants) > bestCount {
+			bestCount = len(r.Participants)
+			bestIdx = i
+		}
+	}
+
+	merged := results[bestIdx]
+
+	// Get event date and total damage from any result
+	for _, r := range results {
+		if r.EventDate != "" && merged.EventDate == "" {
+			merged.EventDate = r.EventDate
+		}
+		if r.TotalDamage > merged.TotalDamage {
+			merged.TotalDamage = r.TotalDamage
+		}
+	}
+
+	// For each participant with missing damage, try to find it in other results
+	for i, p := range merged.Participants {
+		if p.Damage > 0 {
+			continue
+		}
+		for ri, r := range results {
+			if ri == bestIdx {
+				continue
+			}
+			for _, sp := range r.Participants {
+				if sp.Damage == 0 {
+					continue
+				}
+				sim := calculateSimilarity(p.NameSnapshot, sp.NameSnapshot)
+				if sim >= 70 || strings.EqualFold(p.NameSnapshot, sp.NameSnapshot) {
+					merged.Participants[i].Damage = sp.Damage
+					break
+				}
+			}
+			if merged.Participants[i].Damage > 0 {
+				break
+			}
+		}
+	}
+
+	// Monotonicity enforcement: damage must decrease with rank.
+	// rank 1 (MVP) >= rank 2 >= rank 3 >= ... >= rank N
+	// If a value breaks this, try dividing by 10 repeatedly to fit.
+	// If it can't fit, discard it (set to 0 / N/A).
+	for i := 1; i < len(merged.Participants); i++ {
+		if merged.Participants[i].Damage == 0 {
+			continue
+		}
+		// Find the nearest ranked-above participant with damage
+		aboveDmg := int64(0)
+		for j := i - 1; j >= 0; j-- {
+			if merged.Participants[j].Damage > 0 {
+				aboveDmg = merged.Participants[j].Damage
+				break
+			}
+		}
+		// Find the nearest ranked-below participant with damage
+		belowDmg := int64(0)
+		for j := i + 1; j < len(merged.Participants); j++ {
+			if merged.Participants[j].Damage > 0 {
+				belowDmg = merged.Participants[j].Damage
+				break
+			}
+		}
+
+		dmg := merged.Participants[i].Damage
+
+		// Check: damage should be <= above (if above exists)
+		if aboveDmg > 0 && dmg > aboveDmg {
+			// Try dividing by powers of 10 to fit
+			fixed := dmg
+			for fixed > aboveDmg {
+				fixed /= 10
+			}
+			if fixed >= belowDmg || belowDmg == 0 {
+				log.Printf("MG OCR monotonicity fix: %q rank %d damage %d → %d (above=%d)",
+					merged.Participants[i].NameSnapshot, i+1, dmg, fixed, aboveDmg)
+				merged.Participants[i].Damage = fixed
+			} else {
+				log.Printf("MG OCR monotonicity discard: %q rank %d damage %d (above=%d below=%d)",
+					merged.Participants[i].NameSnapshot, i+1, dmg, aboveDmg, belowDmg)
+				merged.Participants[i].Damage = 0
+			}
+		}
+
+		// Check: damage should be >= below (if below exists)
+		if belowDmg > 0 && merged.Participants[i].Damage > 0 && merged.Participants[i].Damage < belowDmg {
+			// Try multiplying by 10 to fit
+			fixed := merged.Participants[i].Damage
+			for fixed < belowDmg {
+				fixed *= 10
+			}
+			if aboveDmg == 0 || fixed <= aboveDmg {
+				log.Printf("MG OCR monotonicity fix up: %q rank %d damage %d → %d (below=%d)",
+					merged.Participants[i].NameSnapshot, i+1, merged.Participants[i].Damage, fixed, belowDmg)
+				merged.Participants[i].Damage = fixed
+			}
+		}
+	}
+
+	// Re-assign sequential ranks
+	for i := range merged.Participants {
+		merged.Participants[i].RankInEvent = i + 1
+	}
+	return merged
+}
+
+// computeOtsuThreshold calculates the optimal binarization threshold using Otsu's method.
+func computeOtsuThreshold(gray *image.Gray) uint8 {
+	bounds := gray.Bounds()
+	histogram := make([]int, 256)
+	total := 0
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			histogram[gray.GrayAt(x, y).Y]++
+			total++
+		}
+	}
+
+	sum := 0
+	for i := 0; i < 256; i++ {
+		sum += i * histogram[i]
+	}
+
+	sumB := 0
+	wB := 0
+	maxVariance := 0.0
+	threshold := uint8(128)
+
+	for t := 0; t < 256; t++ {
+		wB += histogram[t]
+		if wB == 0 {
+			continue
+		}
+		wF := total - wB
+		if wF == 0 {
+			break
+		}
+		sumB += t * histogram[t]
+		mB := float64(sumB) / float64(wB)
+		mF := float64(sum-sumB) / float64(wF)
+		variance := float64(wB) * float64(wF) * (mB - mF) * (mB - mF)
+		if variance > maxVariance {
+			maxVariance = variance
+			threshold = uint8(t)
+		}
+	}
+	return threshold
+}
+
 // parseMarshalGuardText extracts event data from OCR text of a Marshal Guard screenshot.
 // The Alliance Exercise mail format has:
 //   - [TAG]PlayerName on one line (relatively clean in OCR)
@@ -9626,13 +11193,18 @@ func parseMarshalGuardText(text string) MarshalGuardOCRResult {
 
 	// Flexible damage patterns that handle OCR noise:
 	//   "27:35G" "27.35G" "27!35G" "27,35G" → 27.35G
-	//   "127:35G" → could be 127.35G or 27.35G (leading 1 might be OCR noise)
+	//   "12/08G" → 12.08G (slash as separator)
+	//   "33'97M" → 33.97M (apostrophe as separator)
 	//   "5:24G" "/5:24G" → 5.24G
 	//   "643.05M" "643:05M" → 643.05M
-	// Pattern: digits, OCR-separator (.:!,;|), two digits, optional unit
-	dmgFlexRe := regexp.MustCompile(`(\d{1,4})[.:!,;|](\d{2})\s*([GMKgmk])?`)
+	// Pattern: digits, OCR-separator (.:!,;|/'), two digits, optional unit
+	dmgFlexRe := regexp.MustCompile(`(\d{1,4})[.:!,;|/''](\d{2})\s*([GMKgmk])?`)
 	// Clean pattern: standard X.XXG
 	dmgCleanRe := regexp.MustCompile(`(\d+\.?\d*)\s*([GMKgmk])`)
+	// Bare number on damage line: OCR dropped decimal and/or unit (e.g., "1230" = 1.23G, "198" = 1.98G)
+	dmgBareRe := regexp.MustCompile(`(\d{3,5})`)
+	// OCR-garbled unit: digit(s) followed by char that could be G/M garbled (0, 6, 9, etc.)
+	dmgGarbledUnitRe := regexp.MustCompile(`(\d{2,4})\s*[069O]`)
 
 	// MVP marker
 	mvpRe := regexp.MustCompile(`(?i)\bMV[PE]?\b`)
@@ -9691,11 +11263,27 @@ func parseMarshalGuardText(text string) MarshalGuardOCRResult {
 			isMVP = true
 		}
 
-		// Look for damage value: search this line and next 2 lines
+		// Look for damage value: search lines between this name and the next name.
+		// Non-MVP: stop at the next [TAG]Name line. MVP has extra lines.
 		var damage int64
 		var attacks *int
 		searchStart := i
-		searchEnd := i + 2
+		// Find where the next [TAG]Name starts (our search must stop before it)
+		searchEnd := len(lines) - 1
+		for nextI := i + 1; nextI < len(lines); nextI++ {
+			if tagNameRe.MatchString(lines[nextI]) {
+				searchEnd = nextI - 1
+				break
+			}
+		}
+		// Cap non-MVP to at most 2 lines forward, MVP up to 4
+		maxEnd := i + 2
+		if isMVP {
+			maxEnd = i + 4
+		}
+		if searchEnd > maxEnd {
+			searchEnd = maxEnd
+		}
 		if searchEnd >= len(lines) {
 			searchEnd = len(lines) - 1
 		}
@@ -9713,8 +11301,23 @@ func parseMarshalGuardText(text string) MarshalGuardOCRResult {
 				continue
 			}
 
+			// Only look for damage on lines containing "amage" (from "Damage")
+			// This prevents false matches on attack counts and other numbers
+			amageIdx := strings.Index(strings.ToLower(sline), "amage")
+			if amageIdx < 0 {
+				// Still check for attack count on non-damage lines
+				if am := attackRe.FindStringSubmatch(sline); am != nil {
+					ac, _ := strconv.Atoi(am[1])
+					attacks = &ac
+				}
+				continue
+			}
+
+			// Only search for damage numbers AFTER the "amage" keyword
+			dmgPart := sline[amageIdx:]
+
 			// Try flexible damage pattern (handles OCR noise)
-			if dm := dmgFlexRe.FindStringSubmatch(sline); dm != nil {
+			if dm := dmgFlexRe.FindStringSubmatch(dmgPart); dm != nil {
 				intPart, _ := strconv.ParseFloat(dm[1], 64)
 				fracPart, _ := strconv.ParseFloat("0."+dm[2], 64)
 				val := intPart + fracPart
@@ -9727,23 +11330,72 @@ func parseMarshalGuardText(text string) MarshalGuardOCRResult {
 					damage = d
 					usedDmgLines[si] = true
 				}
-			} else if dm := dmgCleanRe.FindStringSubmatch(sline); dm != nil {
+			} else if dm := dmgCleanRe.FindStringSubmatch(dmgPart); dm != nil {
 				d := parseDamageValue(strings.ReplaceAll(dm[1], ",", ""), strings.ToUpper(dm[2]))
 				if d > damage {
 					damage = d
 					usedDmgLines[si] = true
 				}
-			}
-
-			// Look for attack count
-			if am := attackRe.FindStringSubmatch(sline); am != nil {
-				ac, _ := strconv.Atoi(am[1])
-				attacks = &ac
+			} else if dm := dmgBareRe.FindStringSubmatch(dmgPart); dm != nil {
+				// Bare number without separator/unit: treat as G value
+				// "1230" → 1230G (sanity check will fix to 1.23G)
+				// "198" → 198G (sanity check will fix to 1.98G)
+				val, _ := strconv.ParseInt(dm[1], 10, 64)
+				if val > 0 {
+					d := val * 1000000000 // treat as G
+					if d > damage {
+						damage = d
+						usedDmgLines[si] = true
+					}
+				}
+			} else if dm := dmgGarbledUnitRe.FindStringSubmatch(dmgPart); dm != nil {
+				// "1230" where trailing "0" might be garbled "G"
+				// "1796" where trailing "6" might be garbled "G"
+				val, _ := strconv.ParseInt(dm[1], 10, 64)
+				if val > 0 {
+					d := val * 1000000000 // treat as G
+					if d > damage {
+						damage = d
+						usedDmgLines[si] = true
+					}
+				}
 			}
 		}
 
 		log.Printf("MG OCR found: name=%q tag=%q damage=%d isMVP=%v", name, tag, damage, isMVP)
 		entries = append(entries, entry{name: name, tag: tag, damage: damage, attacks: attacks, isMVP: isMVP})
+	}
+
+	// Sanity check: non-MVP players cannot have more damage than MVP
+	// If a value exceeds MVP, try recovery: OCR often drops decimal points
+	// "198G" is likely "1.98G", "1279G" is likely "1.279G"
+	var mvpDamage int64
+	for _, e := range entries {
+		if e.isMVP && e.damage > mvpDamage {
+			mvpDamage = e.damage
+		}
+	}
+	if mvpDamage > 0 {
+		for i := range entries {
+			if !entries[i].isMVP && entries[i].damage > mvpDamage {
+				// Try dividing by increasing powers of 10 to find a valid value
+				recovered := int64(0)
+				for divisor := int64(10); divisor <= 1000; divisor *= 10 {
+					candidate := entries[i].damage / divisor
+					if candidate > 0 && candidate <= mvpDamage {
+						recovered = candidate
+						break
+					}
+				}
+				if recovered > 0 {
+					log.Printf("MG OCR sanity: %q damage %d exceeds MVP %d, recovered to %d", entries[i].name, entries[i].damage, mvpDamage, recovered)
+					entries[i].damage = recovered
+				} else {
+					log.Printf("MG OCR sanity: %q damage %d exceeds MVP %d, discarding", entries[i].name, entries[i].damage, mvpDamage)
+					entries[i].damage = 0
+				}
+			}
+		}
 	}
 
 	// Assign ranks: MVP=1, rest sequential starting from 2
@@ -9894,6 +11546,7 @@ func main() {
 	router.HandleFunc("/api/marshal-guard", authMiddleware(listMarshalGuardEvents)).Methods("GET")
 	router.HandleFunc("/api/marshal-guard", authMiddleware(rankManagementMiddleware(createMarshalGuardEvent))).Methods("POST")
 	router.HandleFunc("/api/marshal-guard/process-screenshots", authMiddleware(rankManagementMiddleware(processMarshalGuardScreenshots))).Methods("POST")
+	router.HandleFunc("/api/marshal-guard/process-mg-v2", authMiddleware(rankManagementMiddleware(processMGV2))).Methods("POST")
 	router.HandleFunc("/api/marshal-guard/confirm", authMiddleware(rankManagementMiddleware(confirmMarshalGuard))).Methods("POST")
 	router.HandleFunc("/api/marshal-guard/member-stats", authMiddleware(getMarshalGuardMemberStats)).Methods("GET")
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(getMarshalGuardEvent)).Methods("GET")

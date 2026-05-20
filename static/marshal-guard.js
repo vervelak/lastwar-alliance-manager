@@ -253,18 +253,22 @@ async function processScreenshots() {
     if (selectedFiles.length === 0) return;
     const processBtn = document.getElementById('mg-process-btn');
     processBtn.disabled = true;
-    processBtn.textContent = '⏳ Processing...';
+    processBtn.textContent = '⏳ Processing…';
 
     try {
         const formData = new FormData();
         selectedFiles.forEach(f => formData.append('images[]', f));
 
-        const res = await fetch('/api/marshal-guard/process-screenshots', { method: 'POST', body: formData });
+        const res = await fetch('/api/marshal-guard/process-mg-v2', { method: 'POST', body: formData });
         if (!res.ok) { showToast('OCR processing failed', 'error'); return; }
 
-        ocrPreviewData = await res.json();
-        showOCRPreview();
+        const events = await res.json();
+        if (!events || events.length === 0) {
+            showToast('No events detected. Check screenshot format.', 'warning');
+            return;
+        }
         document.getElementById('event-modal').style.display = 'none';
+        showMGV2Preview(events);
     } catch (e) {
         showToast('OCR processing failed: ' + e.message, 'error');
     } finally {
@@ -273,57 +277,183 @@ async function processScreenshots() {
     }
 }
 
-function showOCRPreview() {
-    if (!ocrPreviewData) return;
-    const modal = document.getElementById('ocr-preview-modal');
-    document.getElementById('ocr-event-date').value = ocrPreviewData.event_date || '';
-    document.getElementById('ocr-total-damage').textContent = formatDamage(ocrPreviewData.total_damage);
+// ─── V2 multi-event preview ────────────────────────────────────────────────
 
-    // Overwrite warning
-    const warn = document.getElementById('ocr-overwrite-warning');
-    warn.style.display = ocrPreviewData.existing_event_id ? '' : 'none';
+// Live data store for the preview — mutated by inline edits.
+let mgV2Events = [];
 
-    // Participants table
-    const el = document.getElementById('ocr-participants-table');
-    if (!ocrPreviewData.participants || ocrPreviewData.participants.length === 0) {
-        el.innerHTML = '<p class="empty">No participants detected. Try different screenshots.</p>';
-    } else {
-        let html = `<table class="rk-table"><thead><tr>
-            <th>#</th><th>Name</th><th>Tag</th><th>Damage</th><th>Attacks</th><th>Member Match</th>
-        </tr></thead><tbody>`;
-        for (const p of ocrPreviewData.participants) {
-            const matched = p.member_id ? `✅ ${escapeHtml(p.member_name)}` : '❌';
-            html += `<tr>
-                <td>${p.rank_in_event}</td>
-                <td>${escapeHtml(p.name_snapshot)}</td>
-                <td>${escapeHtml(p.alliance_tag || '')}</td>
-                <td>${formatDamage(p.damage)}</td>
-                <td>${p.attack_count != null ? p.attack_count : '—'}</td>
-                <td>${matched}</td>
-            </tr>`;
-        }
-        html += '</tbody></table>';
-        el.innerHTML = html;
-    }
-
-    modal.style.display = 'flex';
+function showMGV2Preview(events) {
+    mgV2Events = events.map(ev => ({
+        ...ev,
+        notes: '',
+        rows: (ev.rows || []).map(r => ({ ...r })),
+    }));
+    renderMGV2Events();
+    document.getElementById('mg-v2-modal').style.display = 'flex';
 }
 
-async function confirmOCR() {
-    const eventDate = document.getElementById('ocr-event-date').value;
-    if (!eventDate) { showToast('Event date is required', 'warning'); return; }
+function renderMGV2Events() {
+    const container = document.getElementById('mg-v2-events');
+    container.innerHTML = '';
+    mgV2Events.forEach((ev, evIdx) => {
+        const card = document.createElement('div');
+        card.className = 'mg-v2-event-card';
+        card.innerHTML = buildEventCardHTML(ev, evIdx);
+        container.appendChild(card);
+    });
 
-    const body = {
-        event_date: eventDate,
-        total_damage: ocrPreviewData.total_damage,
-        notes: document.getElementById('ocr-notes').value,
-        participants: ocrPreviewData.participants || [],
-    };
-    if (ocrPreviewData.existing_event_id) {
-        body.overwrite_event_id = ocrPreviewData.existing_event_id;
+    // Wire up per-event import buttons.
+    container.querySelectorAll('[data-import-event]').forEach(btn => {
+        btn.addEventListener('click', () => importSingleEvent(parseInt(btn.dataset.importEvent)));
+    });
+}
+
+function buildEventCardHTML(ev, evIdx) {
+    const overwrite = ev.existing_event_id
+        ? `<div class="info-banner info-banner--warning" style="margin-bottom:.5rem;">
+               <div class="info-content"><div class="info-icon">⚠️</div>
+               <div class="info-text">Event already exists for this date — importing will overwrite it.</div>
+               </div></div>`
+        : '';
+
+    const topRow = (ev.top_player_name || ev.top_player_damage_str)
+        ? `<tr class="mg-v2-top-row">
+               <td>🏆</td>
+               <td>${escapeHtml(ev.top_player_name || '—')}</td>
+               <td>${escapeHtml(ev.top_player_damage_str || '—')}</td>
+               <td>–</td>
+               <td class="text-muted" style="font-size:.8em;">top player</td>
+           </tr>`
+        : '';
+
+    let memberRows = '';
+    (ev.rows || []).forEach((row, rIdx) => {
+        const isGap   = !row.name && !row.damage_str;         // rank gap
+        const needsReview = isGap || !row.name_ok || !row.damage_ok;
+        const rowClass = isGap ? 'mg-v2-gap-row' : (needsReview ? 'mg-v2-warn-row' : '');
+
+        const nameCell = `<input class="mg-cell-input" data-ev="${evIdx}" data-row="${rIdx}" data-field="name"
+                                 value="${escapeAttr(row.name || '')}"
+                                 placeholder="[TAG]PlayerName" style="${!row.name_ok ? 'border-color:var(--warning,#f59e0b);' : ''}">`;
+        const dmgCell  = `<input class="mg-cell-input mg-dmg-input" data-ev="${evIdx}" data-row="${rIdx}" data-field="damage_str"
+                                 value="${escapeAttr(row.damage_str || '')}"
+                                 placeholder="e.g. 15.20G" style="${!row.damage_ok ? 'border-color:var(--warning,#f59e0b);' : ''}">`;
+        const status = isGap
+            ? '<span class="badge badge-warn">gap</span>'
+            : (row.rank_fixed
+                ? '<span class="badge badge-info" title="Rank inferred from sequence">fixed</span>'
+                : (needsReview
+                    ? '<span class="badge badge-warn">review</span>'
+                    : '<span class="badge badge-ok">✓</span>'));
+        const member = row.member_id
+            ? `<span class="text-muted" style="font-size:.8em;">✅ ${escapeHtml(row.member_name)}</span>`
+            : '<span class="text-muted" style="font-size:.8em;">—</span>';
+
+        memberRows += `<tr class="${rowClass}">
+            <td>${row.rank}</td>
+            <td>${nameCell}</td>
+            <td>${dmgCell}</td>
+            <td>${status}</td>
+            <td>${member}</td>
+        </tr>`;
+    });
+
+    return `
+        <div class="mg-v2-card-header">
+            <div>
+                <strong>📅 ${escapeHtml(ev.event_date || 'Unknown date')}</strong>
+                <span class="text-muted" style="margin-left:.5rem;font-size:.85em;">${ev.rows.length} player${ev.rows.length !== 1 ? 's' : ''}</span>
+            </div>
+            <button class="primary-btn" style="padding:.3rem .8rem;font-size:.85em;" data-import-event="${evIdx}">
+                ✔ Import this event
+            </button>
+        </div>
+        ${overwrite}
+        <div class="form-group" style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem;">
+            <label style="margin:0;">Date:
+                <input type="date" class="form-control mg-date-input" data-ev="${evIdx}"
+                       value="${escapeAttr(ev.event_date || '')}" style="display:inline-block;width:auto;margin-left:.4rem;">
+            </label>
+            <label style="margin:0;">Notes:
+                <input type="text" class="form-control mg-notes-input" data-ev="${evIdx}"
+                       value="${escapeAttr(ev.notes || '')}" placeholder="optional"
+                       style="display:inline-block;width:18rem;margin-left:.4rem;">
+            </label>
+        </div>
+        <div class="rk-table-wrapper" style="max-height:400px;overflow-y:auto;">
+            <table class="rk-table">
+                <thead><tr><th>#</th><th>Player</th><th>Damage</th><th>Status</th><th>Member</th></tr></thead>
+                <tbody>${topRow}${memberRows}</tbody>
+            </table>
+        </div>`;
+}
+
+// Sync inline edits back into mgV2Events live data.
+document.addEventListener('input', e => {
+    const t = e.target;
+    if (t.classList.contains('mg-cell-input')) {
+        const evIdx  = parseInt(t.dataset.ev);
+        const rowIdx = parseInt(t.dataset.row);
+        const field  = t.dataset.field;
+        if (!isNaN(evIdx) && !isNaN(rowIdx)) {
+            mgV2Events[evIdx].rows[rowIdx][field] = t.value;
+        }
+    }
+    if (t.classList.contains('mg-date-input')) {
+        const evIdx = parseInt(t.dataset.ev);
+        if (!isNaN(evIdx)) mgV2Events[evIdx].event_date = t.value;
+    }
+    if (t.classList.contains('mg-notes-input')) {
+        const evIdx = parseInt(t.dataset.ev);
+        if (!isNaN(evIdx)) mgV2Events[evIdx].notes = t.value;
+    }
+});
+
+async function importSingleEvent(evIdx) {
+    const ev = mgV2Events[evIdx];
+    if (!ev.event_date) { showToast('Event date is required', 'warning'); return; }
+
+    const participants = [];
+    // Top player as rank 1.
+    if (ev.top_player_name || ev.top_player_damage) {
+        const parsed = parseMGName(ev.top_player_name || '');
+        participants.push({
+            rank_in_event: 1,
+            name_snapshot: parsed.name,
+            alliance_tag:  parsed.tag,
+            damage:        ev.top_player_damage || 0,
+            attack_count:  null,
+        });
+    }
+    for (const row of ev.rows) {
+        const name  = (row.name || '').trim();
+        const dmgStr = (row.damage_str || '').trim();
+        if (!name && !dmgStr) continue; // skip empty gap rows
+        const parsed = parseMGName(name);
+        participants.push({
+            rank_in_event: row.rank,
+            name_snapshot: parsed.name,
+            alliance_tag:  parsed.tag,
+            damage:        parseMGDamageStr(dmgStr),
+            attack_count:  null,
+            member_id:     row.member_id || null,
+        });
     }
 
+    const totalDamage = participants.reduce((s, p) => s + (p.damage || 0), 0);
+
+    const body = {
+        event_date:  ev.event_date,
+        total_damage: totalDamage,
+        notes:        ev.notes || '',
+        participants,
+    };
+    if (ev.existing_event_id) body.overwrite_event_id = ev.existing_event_id;
+
     try {
+        const btn = document.querySelector(`[data-import-event="${evIdx}"]`);
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ Importing…'; }
+
         const res = await fetch('/api/marshal-guard/confirm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -332,18 +462,64 @@ async function confirmOCR() {
         const data = await res.json();
         if (res.ok) {
             showToast(data.message || 'Event imported', 'success');
-            document.getElementById('ocr-preview-modal').style.display = 'none';
-            clearFiles();
-            ocrPreviewData = null;
-            loadEvents();
-            loadMemberStats();
+            // Remove imported event card.
+            mgV2Events.splice(evIdx, 1);
+            if (mgV2Events.length === 0) {
+                document.getElementById('mg-v2-modal').style.display = 'none';
+                clearFiles();
+                loadEvents();
+                loadMemberStats();
+            } else {
+                renderMGV2Events();
+            }
         } else {
             showToast(data.message || 'Import failed', 'error');
+            if (btn) { btn.disabled = false; btn.textContent = '✔ Import this event'; }
         }
     } catch (e) {
         showToast('Import failed: ' + e.message, 'error');
     }
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+    const importAllBtn = document.getElementById('mg-v2-import-all-btn');
+    if (importAllBtn) {
+        importAllBtn.addEventListener('click', async () => {
+            // Import sequentially.
+            const indices = mgV2Events.map((_, i) => i);
+            for (let i = indices.length - 1; i >= 0; i--) {
+                await importSingleEvent(0); // always import index 0 since array shrinks
+            }
+        });
+    }
+    document.getElementById('mg-v2-cancel-btn').addEventListener('click', () => {
+        document.getElementById('mg-v2-modal').style.display = 'none';
+    });
+});
+
+// ─── Damage / name parsing helpers ────────────────────────────────────────────
+
+// parseMGName splits "[TAG]PlayerName" → { tag, name }.
+function parseMGName(raw) {
+    const m = raw.match(/^\[([A-Za-z0-9]{1,4})\]\s*(.+)$/);
+    if (m) return { tag: m[1], name: m[2].trim() };
+    return { tag: '', name: raw.trim() };
+}
+
+// parseMGDamageStr converts "27.35G" / "15.20M" / "8G" to an integer.
+function parseMGDamageStr(s) {
+    if (!s) return 0;
+    // Accept "Total Damage: X.XXG" or just "X.XXG"
+    const clean = s.replace(/Total Damage:\s*/i, '').trim();
+    const m = clean.match(/^(\d+)(?:\.(\d{1,2}))?([GM])$/i);
+    if (!m) return 0;
+    const int  = parseInt(m[1], 10);
+    const dec  = m[2] ? m[2].padEnd(2, '0') : '00';
+    const unit = m[3].toUpperCase();
+    const mult = unit === 'G' ? 1_000_000_000 : 1_000_000;
+    return int * mult + parseInt(dec, 10) * (mult / 100);
+}
+
 
 // ---- Manual event creation ----
 function initManualForm() {
@@ -392,12 +568,6 @@ function initModals() {
             if (e.target === modal) modal.style.display = 'none';
         });
     });
-
-    // OCR confirm/cancel
-    document.getElementById('ocr-confirm-btn').addEventListener('click', confirmOCR);
-    document.getElementById('ocr-cancel-btn').addEventListener('click', () => {
-        document.getElementById('ocr-preview-modal').style.display = 'none';
-    });
 }
 
 // ---- Search filter ----
@@ -420,6 +590,11 @@ function formatDamage(val) {
     if (val >= 1e6) return (val / 1e6).toFixed(2) + 'M';
     if (val >= 1e3) return (val / 1e3).toFixed(1) + 'K';
     return val.toString();
+}
+
+function escapeAttr(str) {
+    if (!str) return '';
+    return str.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ---- Init ----
