@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	rankRe   = regexp.MustCompile(`^([2-9]|1[0-9]|2[01])$`)
+	rankRe   = regexp.MustCompile(`^([2-9]|[1-9][0-9]|100)$`)
 	nameRe   = regexp.MustCompile(`^\[[A-Za-z0-9]{1,4}\]\s*([A-Za-z0-9 ]+)$`)
 	damageRe = regexp.MustCompile(`^Total Damage:\s\d+(?:\.\d{1,2})?[GM]$`)
 )
@@ -30,6 +30,7 @@ type memberRow struct {
 	rectIdx int
 	rank    string
 	name    string
+	nameRaw string
 	damage  string
 }
 
@@ -174,14 +175,16 @@ func processImage(imagePath, outputDir string) error {
 			fmt.Printf("  → cropped rect%02d → %s\n", i, rectDir)
 			// OCR each segment and validate
 			rank := readRankDigits(filepath.Join(rectDir, "seg1_mid.png"))
+			nameRaw, _ := runOCR(filepath.Join(rectDir, "seg3_2nd.png"), gosseract.PSM_SINGLE_LINE, "")
 			name := ocrSegment(filepath.Join(rectDir, "seg3_2nd.png"), gosseract.PSM_SINGLE_LINE,
-				"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[] ", nameRe, nil)
+				"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[] ", nameRe, normalizeName)
 			damage := ocrSegment(filepath.Join(rectDir, "seg3_3rd.png"), gosseract.PSM_SINGLE_LINE,
 				"TotalDamge :0123456789.,GM", damageRe, normalizeDamage)
 			members = append(members, memberRow{
 				rectIdx: i,
 				rank:    rank,
 				name:    name,
+				nameRaw: nameRaw,
 				damage:  damage,
 			})
 		}
@@ -192,7 +195,7 @@ func processImage(imagePath, outputDir string) error {
 	reconstructSequence(members)
 	for _, m := range members {
 		fmt.Printf("    rank:   %s\n", m.rank)
-		fmt.Printf("    name:   %s\n", m.name)
+		fmt.Printf("    name:   %s  (raw: %q)\n", m.name, m.nameRaw)
 		fmt.Printf("    damage: %s\n", m.damage)
 	}
 
@@ -480,6 +483,27 @@ func runOCR(imgPath string, psm gosseract.PageSegMode, whitelist string) (string
 func normalizeRank(raw string) string {
 	m := regexp.MustCompile(`\d+`).FindString(raw)
 	return m
+}
+
+// normalizeName repairs common OCR artefacts in alliance-tag + player-name strings.
+// Handles:
+//   - missing leading '[' (OCR drops it)              "RSRP]Name" → "[RSRP]Name"
+//   - '|' read instead of ']' for tag close           "[RSRP|Name" → "[RSRP]Name"
+//   - spurious space or '|' before the closing ']'   "[RSRP ]Name", "[RSRP|]Name" → "[RSRP]Name"
+func normalizeName(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return s
+	}
+	// Add missing leading '['.
+	if s[0] != '[' {
+		s = "[" + s
+	}
+	// Normalise the opening tag: absorb spaces and '|' glyphs (OCR artefacts
+	// of the ']' character) and ensure the tag is closed with exactly one ']'.
+	// Covers "[RSRP|]Name", "[RSRP ]Name", "[RSRP|Name".
+	s = regexp.MustCompile(`\[([A-Za-z0-9]{1,4})[ |]+\]?`).ReplaceAllString(s, "[$1]")
+	return s
 }
 
 // reconstructSequence uses the fact that within one screenshot the visible
@@ -870,9 +894,6 @@ func processMatchedSegment(img *image.RGBA, rect Rectangle, outPath string, bina
 		}
 	}
 
-	if binarizeMode == 0 {
-		return saveImage(out, outPath)
-	}
 	return saveUpscaled(out, w, h, outPath)
 }
 
