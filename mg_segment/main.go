@@ -134,6 +134,9 @@ func processImage(imagePath, outputDir string) error {
 	// all rows in this image have been OCR'd.
 	var members []memberRow
 
+	// Top player (rank 1) fields — filled by rect patterns below.
+	var topName, topDamage string
+
 	// Step 4: Draw outer dialog annotation — orange border on annotated copy only
 	drawRectangle(annotated, 0, 0, cropW, cropH, color.RGBA{255, 165, 0, 255})
 
@@ -153,6 +156,55 @@ func processImage(imagePath, outputDir string) error {
 		hSegs := make([][]Rectangle, len(vertSegs))
 		for si, seg := range vertSegs {
 			hSegs[si] = drawHorizontalSegments(annotated, seg, c)
+		}
+
+		// Top player card: 3 vsegs, hSegs[2] has exactly 1 band, hSegs[1] has 2+ bands.
+		// vseg[2] (the right info panel) holds both name and power in one band.
+		// OCR it with PSM_SINGLE_BLOCK to capture both lines.
+		if len(vertSegs) == 3 && len(hSegs[2]) == 1 && len(hSegs[1]) >= 2 {
+			rectDir := filepath.Join(cropDir, fmt.Sprintf("rect%02d", i))
+			if err := os.MkdirAll(rectDir, 0o755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", rectDir, err)
+			}
+			infoPng := filepath.Join(rectDir, "top_info.png")
+			if err := processMatchedSegment(cropped, hSegs[2][0], infoPng, 0); err != nil {
+				return err
+			}
+			// Read all lines; find first nameRe match for name.
+			// Search from the first literal '[' in each line so that garbage
+			// prefix noise (from the player avatar area) is ignored, and lines
+			// without any '[' are skipped (prevents normalizeName prepending '[').
+			raw, _ := runOCR(infoPng, gosseract.PSM_SINGLE_BLOCK, "")
+			for _, line := range strings.Split(raw, "\n") {
+				line = strings.TrimSpace(line)
+				if topName == "" {
+					if idx := strings.Index(line, "["); idx >= 0 {
+						candidate := strings.TrimSpace(line[idx:])
+						norm := normalizeName(candidate)
+						if nameRe.MatchString(norm) {
+							topName = fmt.Sprintf("OK   %q", norm)
+						}
+					}
+				}
+			}
+			if topName == "" {
+				topName = fmt.Sprintf("FAIL %q", raw)
+			}
+		}
+
+		// Top player damage row: 3 vsegs, hSegs[1] and hSegs[2] each have exactly 1 band.
+		// Damage text sits in hSegs[2][0] — white text on dark background → mode 2.
+		if len(vertSegs) == 3 && len(hSegs[1]) == 1 && len(hSegs[2]) == 1 {
+			rectDir := filepath.Join(cropDir, fmt.Sprintf("rect%02d", i))
+			if err := os.MkdirAll(rectDir, 0o755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", rectDir, err)
+			}
+			segPath := filepath.Join(rectDir, "top_damage.png")
+			if err := processMatchedSegment(cropped, hSegs[2][0], segPath, 2); err != nil {
+				return err
+			}
+			topDamage = ocrSegment(segPath, gosseract.PSM_SINGLE_LINE,
+				"TotalDamge :0123456789.,GM", damageRe, normalizeDamage)
 		}
 
 		// Match the member-row pattern:
@@ -215,6 +267,8 @@ func processImage(imagePath, outputDir string) error {
 	// Reconstruct missing/misread ranks using the sequential property:
 	// within one image members are always displayed in rank order with step 1.
 	reconstructSequence(members)
+	fmt.Printf("  top player name:   %s\n", topName)
+	fmt.Printf("  top player damage: %s\n", topDamage)
 	for _, m := range members {
 		fmt.Printf("    rank:   %s\n", m.rank)
 		fmt.Printf("    name:   %s\n", m.name)
@@ -786,6 +840,18 @@ func normalizeDamage(raw string) string {
 		intPart, decPart, unit := m[1], m[2], strings.ToUpper(m[3])
 		if decPart != "" {
 			return fmt.Sprintf("Total Damage: %s.%s%s", intPart, decPart, unit)
+		}
+		// Recover a decimal point that was dropped or misread as '4'.
+		// Game damage values use format X.XXG/M or XX.XXG/M (≤2 integer digits).
+		// Case A – 4-digit integer: XXYY → XX.YY  (dot simply dropped)
+		// Case B – 5-digit integer, 3rd digit is '4': XX4YY → XX.YY  (dot read as '4')
+		switch len(intPart) {
+		case 4:
+			return fmt.Sprintf("Total Damage: %s.%s%s", intPart[:2], intPart[2:], unit)
+		case 5:
+			if intPart[2] == '4' {
+				return fmt.Sprintf("Total Damage: %s.%s%s", intPart[:2], intPart[3:], unit)
+			}
 		}
 		return fmt.Sprintf("Total Damage: %s%s", intPart, unit)
 	}
