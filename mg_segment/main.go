@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
@@ -159,8 +160,7 @@ func processImage(imagePath, outputDir string) error {
 			}
 			fmt.Printf("  → cropped rect%02d → %s\n", i, rectDir)
 			// OCR each segment and validate
-			rank := ocrSegment(filepath.Join(rectDir, "seg1_mid.png"), gosseract.PSM_SPARSE_TEXT,
-				"0123456789", rankRe, normalizeRank)
+			rank := readRankDigits(filepath.Join(rectDir, "seg1_mid.png"))
 			name := ocrSegment(filepath.Join(rectDir, "seg3_2nd.png"), gosseract.PSM_SINGLE_LINE,
 				"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[] ", nameRe, nil)
 			damage := ocrSegment(filepath.Join(rectDir, "seg3_3rd.png"), gosseract.PSM_SINGLE_LINE,
@@ -455,6 +455,159 @@ func runOCR(imgPath string, psm gosseract.PageSegMode, whitelist string) (string
 func normalizeRank(raw string) string {
 	m := regexp.MustCompile(`\d+`).FindString(raw)
 	return m
+}
+
+// readRankDigits reads the already-binarised+upscaled seg1_mid PNG, locates
+// the digit column(s) via a vertical projection of the middle row band
+// (avoiding top/bottom badge ornaments), crops each digit individually, and
+// runs PSM_SINGLE_CHAR OCR on each crop.  The results are concatenated and
+// validated against rankRe.
+func readRankDigits(imgPath string) string {
+	// Load the PNG produced by processMatchedSegment.
+	f, err := os.Open(imgPath)
+	if err != nil {
+		return fmt.Sprintf("ERROR: %v", err)
+	}
+	defer f.Close()
+	gray, _, err := image.Decode(f)
+	if err != nil {
+		return fmt.Sprintf("ERROR: %v", err)
+	}
+	b := gray.Bounds()
+	w, h := b.Max.X, b.Max.Y
+
+	// Middle band: skip top and bottom 25% where badge ornaments live.
+	bandTop := h / 4
+	bandBot := h - h/4
+
+	// Vertical projection: count dark pixels (value < 128) per column
+	// within the middle band only.
+	proj := make([]int, w)
+	for y := bandTop; y < bandBot; y++ {
+		for x := 0; x < w; x++ {
+			if v, _, _, _ := gray.At(x+b.Min.X, y+b.Min.Y).RGBA(); v>>8 < 128 {
+				proj[x]++
+			}
+		}
+	}
+
+	// Find maximum projection value.
+	maxP := 0
+	for _, v := range proj {
+		if v > maxP {
+			maxP = v
+		}
+	}
+	if maxP == 0 {
+		return `FAIL ""`
+	}
+
+	// Collect contiguous column groups above threshold (maxP/4).
+	// Each group represents one digit (or part of a digit).
+	thresh := maxP / 4
+	type span struct{ x0, x1 int }
+	var groups []span
+	inGroup := false
+	var cur span
+	for x, v := range proj {
+		if v > thresh {
+			if !inGroup {
+				cur.x0 = x
+				inGroup = true
+			}
+			cur.x1 = x
+		} else {
+			if inGroup {
+				if cur.x1-cur.x0 >= 12 { // ignore thin badge arcs (< 12 px after 3× upscale)
+					groups = append(groups, cur)
+				}
+				inGroup = false
+			}
+		}
+	}
+	if inGroup && cur.x1-cur.x0 >= 12 {
+		groups = append(groups, cur)
+	}
+	if len(groups) == 0 {
+		return `FAIL ""`
+	}
+
+	// If we have more than 2 groups the badge chrome leaked through;
+	// keep only the 1 or 2 widest groups (most pixels = actual digits).
+	if len(groups) > 2 {
+		// Sort by total projection weight descending, keep top 2.
+		weight := func(s span) int {
+			total := 0
+			for x := s.x0; x <= s.x1; x++ {
+				total += proj[x]
+			}
+			return total
+		}
+		// Bubble-select top 2 (small N, not worth importing sort).
+		for i := 0; i < 2 && i < len(groups); i++ {
+			best := i
+			for j := i + 1; j < len(groups); j++ {
+				if weight(groups[j]) > weight(groups[best]) {
+					best = j
+				}
+			}
+			groups[i], groups[best] = groups[best], groups[i]
+		}
+		groups = groups[:2]
+		// Re-sort left-to-right by x0 so digits are in reading order.
+		if groups[0].x0 > groups[1].x0 {
+			groups[0], groups[1] = groups[1], groups[0]
+		}
+	}
+
+	// OCR each group with PSM_SINGLE_WORD (more tolerant than SINGLE_CHAR
+	// when a crop contains minor surrounding badge pixels).
+	const pad = 4 // pixels of horizontal padding around each crop
+	var digits strings.Builder
+	for _, g := range groups {
+		x0 := g.x0 - pad
+		if x0 < 0 {
+			x0 = 0
+		}
+		x1 := g.x1 + pad + 1
+		if x1 > w {
+			x1 = w
+		}
+		crop := image.NewGray(image.Rect(0, 0, x1-x0, h))
+		for cy := 0; cy < h; cy++ {
+			for cx := x0; cx < x1; cx++ {
+				r, _, _, _ := gray.At(cx+b.Min.X, cy+b.Min.Y).RGBA()
+				crop.SetGray(cx-x0, cy, color.Gray{Y: uint8(r >> 8)})
+			}
+		}
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, crop); err != nil {
+			continue
+		}
+		client := gosseract.NewClient()
+		client.SetImageFromBytes(buf.Bytes()) //nolint:errcheck
+		client.SetPageSegMode(gosseract.PSM_SINGLE_WORD)
+		client.SetVariable("tessedit_char_whitelist", "0123456789") //nolint:errcheck
+		text, err := client.Text()
+		client.Close()
+		if err != nil {
+			continue
+		}
+		// Accept the first digit character found (PSM_SINGLE_WORD may return
+		// a digit followed by whitespace or punctuation).
+		for _, ch := range strings.TrimSpace(text) {
+			if ch >= '0' && ch <= '9' {
+				digits.WriteRune(ch)
+				break
+			}
+		}
+	}
+
+	result := digits.String()
+	if rankRe.MatchString(result) {
+		return fmt.Sprintf("OK   %q", result)
+	}
+	return fmt.Sprintf("FAIL %q", result)
 }
 
 // normalizeDamage reconstructs "Total Damage: X.XXG" from common OCR
