@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	gosseract "github.com/otiai10/gosseract/v2"
@@ -23,6 +24,14 @@ var (
 	nameRe   = regexp.MustCompile(`^\[[A-Za-z0-9]{1,4}\]\s*([A-Za-z0-9 ]+)$`)
 	damageRe = regexp.MustCompile(`^Total Damage:\s\d+(?:\.\d{1,2})?[GM]$`)
 )
+
+// memberRow holds the OCR results for one matched member card in the screenshot.
+type memberRow struct {
+	rectIdx int
+	rank    string
+	name    string
+	damage  string
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -114,6 +123,10 @@ func processImage(imagePath, outputDir string) error {
 	nameNoExt := baseName[:len(baseName)-len(filepath.Ext(baseName))]
 	cropDir := filepath.Join(outputDir, nameNoExt)
 
+	// Collect one entry per matched member row; sequence reconstruction runs after
+	// all rows in this image have been OCR'd.
+	var members []memberRow
+
 	// Step 4: Draw outer dialog annotation — orange border at the crop boundary
 	drawRectangle(cropped, 0, 0, cropW, cropH, color.RGBA{255, 165, 0, 255})
 
@@ -165,10 +178,22 @@ func processImage(imagePath, outputDir string) error {
 				"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[] ", nameRe, nil)
 			damage := ocrSegment(filepath.Join(rectDir, "seg3_3rd.png"), gosseract.PSM_SINGLE_LINE,
 				"TotalDamge :0123456789.,GM", damageRe, normalizeDamage)
-			fmt.Printf("    rank:   %s\n", rank)
-			fmt.Printf("    name:   %s\n", name)
-			fmt.Printf("    damage: %s\n", damage)
+			members = append(members, memberRow{
+				rectIdx: i,
+				rank:    rank,
+				name:    name,
+				damage:  damage,
+			})
 		}
+	}
+
+	// Reconstruct missing/misread ranks using the sequential property:
+	// within one image members are always displayed in rank order with step 1.
+	reconstructSequence(members)
+	for _, m := range members {
+		fmt.Printf("    rank:   %s\n", m.rank)
+		fmt.Printf("    name:   %s\n", m.name)
+		fmt.Printf("    damage: %s\n", m.damage)
 	}
 
 	// Save cropped annotated image
@@ -455,6 +480,74 @@ func runOCR(imgPath string, psm gosseract.PageSegMode, whitelist string) (string
 func normalizeRank(raw string) string {
 	m := regexp.MustCompile(`\d+`).FindString(raw)
 	return m
+}
+
+// reconstructSequence uses the fact that within one screenshot the visible
+// members are always shown in consecutive rank order (step = 1).
+// It fits the best-matching arithmetic sequence to the successfully-read ranks,
+// then fills in FAIL entries and corrects silent misreads.
+//
+// rank strings use the format returned by readRankDigits / ocrResult:
+//
+//	"OK   \"7\""  – successfully validated
+//	"FAIL \"..\"" – failed validation
+//
+// After reconstruction a repaired entry is labelled:
+//
+//	"CORR \"9\""          – was FAIL, filled from sequence
+//	"FIXD \"13\" (was \"3\")" – was wrong OK, corrected
+func reconstructSequence(members []memberRow) {
+	if len(members) == 0 {
+		return
+	}
+
+	// Parse the integer value from an OK rank string; -1 for FAIL.
+	rankVal := func(s string) int {
+		if !strings.HasPrefix(strings.TrimSpace(s), "OK") {
+			return -1
+		}
+		m := regexp.MustCompile(`"(\d+)"`).FindStringSubmatch(s)
+		if m == nil {
+			return -1
+		}
+		v, _ := strconv.Atoi(m[1])
+		return v
+	}
+
+	// For each OK row at index j, the implied start rank is rankVal - j.
+	// Count votes for each candidate start rank.
+	votes := map[int]int{}
+	for j := range members {
+		if v := rankVal(members[j].rank); v >= 0 {
+			votes[v-j]++
+		}
+	}
+	if len(votes) == 0 {
+		return // nothing to anchor on
+	}
+
+	// Pick the candidate with the most votes (ties broken by higher start rank).
+	bestStart, bestCount := 0, 0
+	for s, c := range votes {
+		if c > bestCount || (c == bestCount && s > bestStart) {
+			bestStart, bestCount = s, c
+		}
+	}
+
+	// Apply: fill FAILs and correct misreads.
+	for j := range members {
+		expected := bestStart + j
+		cur := rankVal(members[j].rank)
+		if cur == expected {
+			continue // already correct
+		}
+		es := strconv.Itoa(expected)
+		if cur < 0 {
+			members[j].rank = fmt.Sprintf("CORR %q", es)
+		} else {
+			members[j].rank = fmt.Sprintf("FIXD %q (was %q)", es, strconv.Itoa(cur))
+		}
+	}
 }
 
 // readRankDigits reads the already-binarised+upscaled seg1_mid PNG, finds
