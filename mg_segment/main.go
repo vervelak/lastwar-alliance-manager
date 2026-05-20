@@ -11,7 +11,16 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
-	"sort"
+	"regexp"
+	"strings"
+
+	gosseract "github.com/otiai10/gosseract/v2"
+)
+
+var (
+	rankRe   = regexp.MustCompile(`^([2-9]|[1-9][0-9]|100)$`)
+	nameRe   = regexp.MustCompile(`^\[[A-Za-z0-9]{1,4}\]\s*([A-Za-z0-9 ]+)$`)
+	damageRe = regexp.MustCompile(`^Total Damage:\s\d+(?:\.\d{1,2})?[GM]$`)
 )
 
 func main() {
@@ -99,6 +108,11 @@ func processImage(imagePath, outputDir string) error {
 	rectangles := findColoredRegions(cropped, cropW, cropH)
 	fmt.Printf("Detected %d rectangles\n", len(rectangles))
 
+	// Base name used for both the annotated image and the crop subdirectory
+	baseName := filepath.Base(imagePath)
+	nameNoExt := baseName[:len(baseName)-len(filepath.Ext(baseName))]
+	cropDir := filepath.Join(outputDir, nameNoExt)
+
 	// Step 4: Draw outer dialog annotation — orange border at the crop boundary
 	drawRectangle(cropped, 0, 0, cropW, cropH, color.RGBA{255, 165, 0, 255})
 
@@ -114,19 +128,50 @@ func processImage(imagePath, outputDir string) error {
 	for i, rect := range rectangles {
 		c := colors[i%len(colors)]
 		drawRectangle(cropped, rect.x0, rect.y0, rect.x1, rect.y1, c)
+		vertSegs := drawVerticalSegments(cropped, rect, c)
+		hSegs := make([][]Rectangle, len(vertSegs))
+		for si, seg := range vertSegs {
+			hSegs[si] = drawHorizontalSegments(cropped, seg, c)
+		}
 
-		// Split rectangle into segments and annotate each
-		segments := splitRectangle(cropped, rect)
-		fmt.Printf("  rect %d → %d segments\n", i+1, len(segments))
-		for _, seg := range segments {
-			// Outer annotation in section color
-			drawRectangle(cropped, seg.x0, seg.y0, seg.x1, seg.y1, c)
+		// Match the member-row pattern:
+		//   5 vertical segments (d-bg-d-bg-d-bg-d-bg-d)
+		//   vseg[1]: 3 horizontal regions (d-bg-d-bg-d) → fill middle  [1]
+		//   vseg[3]: 4 horizontal regions (d-bg-d-bg-d-bg-d) → fill [1] and [2]
+		hCounts := make([]int, len(hSegs))
+		for k, hs := range hSegs {
+			hCounts[k] = len(hs)
+		}
+		fmt.Printf("  rect %d: %d vsegs, hsegs=%v\n", i, len(vertSegs), hCounts)
+		if len(vertSegs) == 5 && len(hSegs[1]) == 3 && len(hSegs[3]) == 4 {
+			rectDir := filepath.Join(cropDir, fmt.Sprintf("rect%02d", i))
+			if err := os.MkdirAll(rectDir, 0o755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", rectDir, err)
+			}
+			if err := processMatchedSegment(cropped, hSegs[1][1], filepath.Join(rectDir, "seg1_mid.png"), true); err != nil {
+				return err
+			}
+			if err := processMatchedSegment(cropped, hSegs[3][1], filepath.Join(rectDir, "seg3_2nd.png"), false); err != nil {
+				return err
+			}
+			if err := processMatchedSegment(cropped, hSegs[3][2], filepath.Join(rectDir, "seg3_3rd.png"), true); err != nil {
+				return err
+			}
+			fmt.Printf("  → cropped rect%02d → %s\n", i, rectDir)
+			// OCR each segment and validate
+			rank := ocrSegment(filepath.Join(rectDir, "seg1_mid.png"), gosseract.PSM_SPARSE_TEXT,
+				"0123456789", rankRe, normalizeRank)
+			name := ocrSegment(filepath.Join(rectDir, "seg3_2nd.png"), gosseract.PSM_SINGLE_LINE,
+				"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[] ", nameRe, nil)
+			damage := ocrSegment(filepath.Join(rectDir, "seg3_3rd.png"), gosseract.PSM_SINGLE_LINE,
+				"TotalDamge :0123456789.,GM", damageRe, normalizeDamage)
+			fmt.Printf("    rank:   %s\n", rank)
+			fmt.Printf("    name:   %s\n", name)
+			fmt.Printf("    damage: %s\n", damage)
 		}
 	}
 
 	// Save cropped annotated image
-	baseName := filepath.Base(imagePath)
-	nameNoExt := baseName[:len(baseName)-len(filepath.Ext(baseName))]
 	outputPath := filepath.Join(outputDir, nameNoExt+"_annotated.png")
 
 	if err := saveImage(cropped, outputPath); err != nil {
@@ -218,21 +263,18 @@ type Rectangle struct {
 	x0, y0, x1, y1 int
 }
 
-// Segment represents a horizontal sub-segment within a rectangle
-type Segment struct {
-	x0, y0, x1, y1 int
-}
-
-// splitRectangle splits a rectangle into horizontal sub-segments separated by
-// runs of 20+ columns whose brightness matches the rectangle's background color.
-// Background is detected as the median column brightness across the rectangle.
-func splitRectangle(img image.Image, rect Rectangle) []Segment {
+// drawVerticalSegments scans a rectangle left to right, comparing each column's
+// mean brightness to a reference sample taken from columns 5–14 (skipping the
+// first 5). A vertical line is drawn at every transition between "matches
+// reference" and "differs from reference", marking element boundaries.
+// Returns the bounding rectangles of all content (non-background) segments found.
+func drawVerticalSegments(img *image.RGBA, rect Rectangle, c color.Color) []Rectangle {
 	rectW := rect.x1 - rect.x0
-	if rectW < 1 {
-		return []Segment{{rect.x0, rect.y0, rect.x1, rect.y1}}
+	if rectW < 16 {
+		return nil
 	}
 
-	// Compute mean brightness for each column within the rectangle's y band
+	// Compute mean brightness per column within the rectangle's y band
 	colMeans := make([]int, rectW)
 	for i := 0; i < rectW; i++ {
 		x := rect.x0 + i
@@ -247,73 +289,316 @@ func splitRectangle(img image.Image, rect Rectangle) []Segment {
 		}
 	}
 
-	// Determine background brightness as the median column mean
-	sortedMeans := make([]int, rectW)
-	copy(sortedMeans, colMeans)
-	sort.Ints(sortedMeans)
-	bgMean := sortedMeans[len(sortedMeans)/2]
+	// Reference: average of columns 5–14 (skip first 5, sample next 10)
+	refSum := 0
+	for i := 5; i < 15; i++ {
+		refSum += colMeans[i]
+	}
+	refMean := refSum / 10
 
-	// A column is "background" if its mean is within ±25 of the background mean
-	bgTolerance := 25
-	isBackground := make([]bool, rectW)
-	for i, m := range colMeans {
-		diff := m - bgMean
+	const threshold = 5
+
+	// Sweep left to right. Draw leading+trailing lines around each content block.
+	// A "return to background" only counts after 12+ consecutive background columns.
+	var segments []Rectangle
+	inDifferent := false
+	bgRunLen := 0
+	contentStart := 0
+
+	for i := 0; i < rectW; i++ {
+		diff := colMeans[i] - refMean
 		if diff < 0 {
 			diff = -diff
 		}
-		isBackground[i] = diff <= bgTolerance
-	}
+		isBg := diff <= threshold
 
-	// Find segments: content spans separated by runs of 20+ background columns
-	const minSeparatorWidth = 15
-	segments := []Segment{}
-
-	i := 0
-	for i < rectW {
-		// Skip leading background columns
-		if isBackground[i] {
-			i++
-			continue
-		}
-
-		// Found start of content
-		contentStart := i
-		contentEnd := i + 1
-		i++
-
-		for i < rectW {
-			if !isBackground[i] {
-				contentEnd = i + 1
-				i++
-			} else {
-				// Measure this background run
-				runStart := i
-				for i < rectW && isBackground[i] {
-					i++
+		const segPad = 2
+		if !isBg {
+			if !inDifferent {
+				leadX := rect.x0 + i - segPad
+				if leadX < rect.x0 {
+					leadX = rect.x0
 				}
-				runLen := i - runStart
-				if runLen >= minSeparatorWidth {
-					// Wide gap — separator, end this segment
-					break
+				drawVerticalLine(img, leadX, rect.y0, rect.y1, c)
+				contentStart = leadX - rect.x0
+				inDifferent = true
+			}
+			bgRunLen = 0
+		} else if inDifferent {
+			bgRunLen++
+			if bgRunLen >= 12 {
+				trailX := rect.x0 + (i - bgRunLen) + segPad
+				if trailX > rect.x1-1 {
+					trailX = rect.x1 - 1
 				}
-				// Narrow gap — bridge over it
-				contentEnd = i
+				drawVerticalLine(img, trailX, rect.y0, rect.y1, c)
+				segments = append(segments, Rectangle{
+					rect.x0 + contentStart, rect.y0,
+					trailX + 1, rect.y1,
+				})
+				inDifferent = false
+				bgRunLen = 0
 			}
 		}
+	}
+	// Handle content that extends to the right edge
+	if inDifferent {
+		segments = append(segments, Rectangle{rect.x0 + contentStart, rect.y0, rect.x1, rect.y1})
+	}
+	return segments
+}
 
-		if contentEnd > contentStart {
-			segments = append(segments, Segment{
-				rect.x0 + contentStart, rect.y0,
-				rect.x0 + contentEnd, rect.y1,
-			})
+// drawHorizontalSegments applies the same reference-comparison logic as
+// drawVerticalSegments but scans top to bottom within a content segment,
+// drawing horizontal lines at the leading and trailing edges of content rows.
+// Returns the bounding rectangles of all content (non-background) row bands found.
+func drawHorizontalSegments(img *image.RGBA, rect Rectangle, c color.Color) []Rectangle {
+	rectH := rect.y1 - rect.y0
+	if rectH < 16 {
+		return nil
+	}
+
+	// Compute mean brightness per row within the segment's x range
+	rowMeans := make([]int, rectH)
+	for j := 0; j < rectH; j++ {
+		y := rect.y0 + j
+		sum, count := 0, 0
+		for x := rect.x0; x < rect.x1; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			sum += (int(r>>8) + int(g>>8) + int(b>>8)) / 3
+			count++
+		}
+		if count > 0 {
+			rowMeans[j] = sum / count
 		}
 	}
 
-	// Fallback: if nothing split, return the whole rectangle as one segment
-	if len(segments) == 0 {
-		return []Segment{{rect.x0, rect.y0, rect.x1, rect.y1}}
+	// Reference: rows 5–14
+	refSum := 0
+	for j := 5; j < 15; j++ {
+		refSum += rowMeans[j]
+	}
+	refMean := refSum / 10
+
+	const threshold = 5
+
+	var segments []Rectangle
+	inDifferent := false
+	bgRunLen := 0
+	contentRowStart := 0
+
+	for j := 0; j < rectH; j++ {
+		diff := rowMeans[j] - refMean
+		if diff < 0 {
+			diff = -diff
+		}
+		isBg := diff <= threshold
+
+		const segPad = 2
+		if !isBg {
+			if !inDifferent {
+				leadY := rect.y0 + j - segPad
+				if leadY < rect.y0 {
+					leadY = rect.y0
+				}
+				drawHorizontalLineSegment(img, leadY, rect.x0, rect.x1, c)
+				contentRowStart = leadY
+				inDifferent = true
+			}
+			bgRunLen = 0
+		} else if inDifferent {
+			bgRunLen++
+			if bgRunLen >= 12 {
+				trailY := rect.y0 + (j - bgRunLen) + segPad
+				if trailY > rect.y1-1 {
+					trailY = rect.y1 - 1
+				}
+				drawHorizontalLineSegment(img, trailY, rect.x0, rect.x1, c)
+				segments = append(segments, Rectangle{rect.x0, contentRowStart, rect.x1, trailY + 1})
+				inDifferent = false
+				bgRunLen = 0
+			}
+		}
+	}
+	// Handle content reaching the bottom edge
+	if inDifferent {
+		segments = append(segments, Rectangle{rect.x0, contentRowStart, rect.x1, rect.y1})
 	}
 	return segments
+}
+
+// dockerOCR runs Tesseract on imgPath via a Docker container and returns the
+// recognised text. psm is the Tesseract page-segmentation mode; whitelist
+// restricts which characters Tesseract will consider (empty = no restriction).
+// runOCR reads imgPath with Tesseract via gosseract.
+// psm is the page-segmentation mode; whitelist restricts recognised characters.
+func runOCR(imgPath string, psm gosseract.PageSegMode, whitelist string) (string, error) {
+	client := gosseract.NewClient()
+	defer client.Close()
+	if err := client.SetImage(imgPath); err != nil {
+		return "", err
+	}
+	client.SetPageSegMode(psm)
+	if whitelist != "" {
+		client.SetVariable("tessedit_char_whitelist", whitelist) //nolint:errcheck
+	}
+	text, err := client.Text()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(text), nil
+}
+
+// normalizeRank extracts the first run of digits from raw OCR output.
+// Rank segments contain a decorative badge frame that can produce stray
+// characters; we discard everything except the leading digit sequence.
+func normalizeRank(raw string) string {
+	m := regexp.MustCompile(`\d+`).FindString(raw)
+	return m
+}
+
+// normalizeDamage reconstructs "Total Damage: X.XXG" from common OCR
+// misreadings: missing spaces in the prefix, and ":" used instead of "." as
+// the decimal separator.  It extracts the first integer run, an optional
+// fractional part, and the unit (G or M) from the raw OCR string.
+// It also handles two common glyph confusions:
+//   - trailing "6" misread for "G" (same shape in many game fonts)
+//   - trailing punctuation noise after the unit
+func normalizeDamage(raw string) string {
+	re := regexp.MustCompile(`(\d+)(?:[.:](\d{1,2}))?[^0-9GM]*([GM])`)
+	trailingNoise := regexp.MustCompile(`[^0-9GM]+$`)
+
+	apply := func(s string) string {
+		m := re.FindStringSubmatch(s)
+		if m == nil {
+			return ""
+		}
+		intPart, decPart, unit := m[1], m[2], strings.ToUpper(m[3])
+		if decPart != "" {
+			return fmt.Sprintf("Total Damage: %s.%s%s", intPart, decPart, unit)
+		}
+		return fmt.Sprintf("Total Damage: %s%s", intPart, unit)
+	}
+
+	// Pass 1: try as-is
+	if result := apply(raw); result != "" {
+		return result
+	}
+
+	// Pass 2: strip trailing punctuation noise and retry
+	cleaned := trailingNoise.ReplaceAllString(raw, "")
+	if result := apply(cleaned); result != "" {
+		return result
+	}
+
+	// Pass 3: Tesseract sometimes reads "G" as "6" at end of value; swap and retry
+	sixToG := regexp.MustCompile(`6(\s*)$`)
+	if sixToG.MatchString(cleaned) {
+		if result := apply(sixToG.ReplaceAllString(cleaned, "G$1")); result != "" {
+			return result
+		}
+	}
+
+	return raw
+}
+
+// ocrSegment runs OCR on imgPath and returns a formatted result string
+// showing the recognised text and whether it satisfies the expected pattern.
+// If normalize is non-nil it is applied to the raw OCR text before validation.
+func ocrSegment(imgPath string, psm gosseract.PageSegMode, whitelist string, pattern *regexp.Regexp, normalize func(string) string) string {
+	text, err := runOCR(imgPath, psm, whitelist)
+	if err != nil {
+		return fmt.Sprintf("ERROR: %v", err)
+	}
+	if normalize != nil {
+		text = normalize(text)
+	}
+	if pattern.MatchString(text) {
+		return fmt.Sprintf("OK   %q", text)
+	}
+	return fmt.Sprintf("FAIL %q", text)
+}
+
+// fillRect fills every pixel in rect with colour c.
+func fillRect(img *image.RGBA, rect Rectangle, c color.Color) {
+	for y := rect.y0; y < rect.y1; y++ {
+		for x := rect.x0; x < rect.x1; x++ {
+			img.Set(x, y, c)
+		}
+	}
+}
+
+// processMatchedSegment crops rect from img, converts to grayscale with
+// contrast stretching, and saves the result as a PNG to outPath.
+// If binarize is true the image is also inverted then hard-thresholded:
+// only pixels ≤ 32 (near-black text strokes) stay black; everything else
+// becomes white, giving clean black-on-white output for OCR.
+func processMatchedSegment(img *image.RGBA, rect Rectangle, outPath string, binarize bool) error {
+	w := rect.x1 - rect.x0
+	h := rect.y1 - rect.y0
+
+	// Crop
+	sub := image.NewRGBA(image.Rect(0, 0, w, h))
+	draw.Draw(sub, sub.Bounds(), img, image.Pt(rect.x0, rect.y0), draw.Src)
+
+	// First pass: convert to grayscale and record min/max for contrast stretch
+	pixels := make([]uint8, w*h)
+	minV, maxV := uint8(255), uint8(0)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			g := color.GrayModel.Convert(sub.At(x, y)).(color.Gray).Y
+			pixels[y*w+x] = g
+			if g < minV {
+				minV = g
+			}
+			if g > maxV {
+				maxV = g
+			}
+		}
+	}
+
+	// Second pass: stretch contrast so [minV, maxV] → [0, 255]
+	span := int(maxV) - int(minV)
+	if span == 0 {
+		span = 1
+	}
+	out := image.NewGray(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			stretched := (int(pixels[y*w+x]) - int(minV)) * 255 / span
+			if binarize {
+				// Invert so text strokes become dark, then hard-threshold:
+				// anything not near-black (> 32) becomes pure white.
+				stretched = 255 - stretched
+				if stretched > 32 {
+					stretched = 255
+				} else {
+					stretched = 0
+				}
+			}
+			out.SetGray(x, y, color.Gray{Y: uint8(stretched)})
+		}
+	}
+
+	if !binarize {
+		return saveImage(out, outPath)
+	}
+
+	// Upscale 3× (nearest-neighbour) so small glyphs (e.g. decimal points)
+	// are large enough for Tesseract to read reliably.
+	const scale = 3
+	scaled := image.NewGray(image.Rect(0, 0, w*scale, h*scale))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			v := out.GrayAt(x, y)
+			for dy := 0; dy < scale; dy++ {
+				for dx := 0; dx < scale; dx++ {
+					scaled.SetGray(x*scale+dx, y*scale+dy, v)
+				}
+			}
+		}
+	}
+	return saveImage(scaled, outPath)
 }
 
 // findColoredRegions detects rectangular regions with uniform non-white color
