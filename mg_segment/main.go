@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	rankRe   = regexp.MustCompile(`^([2-9]|[1-9][0-9]|100)$`)
+	rankRe   = regexp.MustCompile(`^([2-9]|1[0-9]|2[01])$`)
 	nameRe   = regexp.MustCompile(`^\[[A-Za-z0-9]{1,4}\]\s*([A-Za-z0-9 ]+)$`)
 	damageRe = regexp.MustCompile(`^Total Damage:\s\d+(?:\.\d{1,2})?[GM]$`)
 )
@@ -149,13 +149,13 @@ func processImage(imagePath, outputDir string) error {
 			if err := os.MkdirAll(rectDir, 0o755); err != nil {
 				return fmt.Errorf("mkdir %s: %w", rectDir, err)
 			}
-			if err := processMatchedSegment(cropped, hSegs[1][1], filepath.Join(rectDir, "seg1_mid.png"), true); err != nil {
+			if err := processMatchedSegment(cropped, hSegs[1][1], filepath.Join(rectDir, "seg1_mid.png"), 1); err != nil {
 				return err
 			}
-			if err := processMatchedSegment(cropped, hSegs[3][1], filepath.Join(rectDir, "seg3_2nd.png"), false); err != nil {
+			if err := processMatchedSegment(cropped, hSegs[3][1], filepath.Join(rectDir, "seg3_2nd.png"), 0); err != nil {
 				return err
 			}
-			if err := processMatchedSegment(cropped, hSegs[3][2], filepath.Join(rectDir, "seg3_3rd.png"), true); err != nil {
+			if err := processMatchedSegment(cropped, hSegs[3][2], filepath.Join(rectDir, "seg3_3rd.png"), 2); err != nil {
 				return err
 			}
 			fmt.Printf("  → cropped rect%02d → %s\n", i, rectDir)
@@ -457,144 +457,160 @@ func normalizeRank(raw string) string {
 	return m
 }
 
-// readRankDigits reads the already-binarised+upscaled seg1_mid PNG, locates
-// the digit column(s) via a vertical projection of the middle row band
-// (avoiding top/bottom badge ornaments), crops each digit individually, and
-// runs PSM_SINGLE_CHAR OCR on each crop.  The results are concatenated and
-// validated against rankRe.
+// readRankDigits reads the already-binarised+upscaled seg1_mid PNG, finds
+// connected components of black pixels, discards noise (small blobs from badge
+// chrome or JPEG artifacts), keeps the 1–2 largest blobs (the digit strokes),
+// sorts them left-to-right, then runs PSM_SINGLE_CHAR OCR on each.
 func readRankDigits(imgPath string) string {
-	// Load the PNG produced by processMatchedSegment.
 	f, err := os.Open(imgPath)
 	if err != nil {
 		return fmt.Sprintf("ERROR: %v", err)
 	}
 	defer f.Close()
-	gray, _, err := image.Decode(f)
+	src, _, err := image.Decode(f)
 	if err != nil {
 		return fmt.Sprintf("ERROR: %v", err)
 	}
-	b := gray.Bounds()
-	w, h := b.Max.X, b.Max.Y
+	bnd := src.Bounds()
+	w, h := bnd.Dx(), bnd.Dy()
 
-	// Middle band: skip top and bottom 25% where badge ornaments live.
-	bandTop := h / 4
-	bandBot := h - h/4
-
-	// Vertical projection: count dark pixels (value < 128) per column
-	// within the middle band only.
-	proj := make([]int, w)
-	for y := bandTop; y < bandBot; y++ {
+	// Build flat dark-pixel map (true = black text pixel).
+	dark := make([]bool, w*h)
+	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
-			if v, _, _, _ := gray.At(x+b.Min.X, y+b.Min.Y).RGBA(); v>>8 < 128 {
-				proj[x]++
-			}
+			r, _, _, _ := src.At(bnd.Min.X+x, bnd.Min.Y+y).RGBA()
+			dark[y*w+x] = r>>8 < 128
 		}
 	}
 
-	// Find maximum projection value.
-	maxP := 0
-	for _, v := range proj {
-		if v > maxP {
-			maxP = v
+	// BFS connected-component labeling (4-connected).
+	type ccBlob struct {
+		pixels int
+		bounds image.Rectangle
+	}
+	visited := make([]bool, w*h)
+	var blobs []ccBlob
+	queue := make([]int, 0, 512)
+	for i, isDark := range dark {
+		if !isDark || visited[i] {
+			continue
+		}
+		ix, iy := i%w, i/w
+		blob := ccBlob{bounds: image.Rect(ix, iy, ix+1, iy+1)}
+		queue = queue[:0]
+		queue = append(queue, i)
+		visited[i] = true
+		for len(queue) > 0 {
+			idx := queue[len(queue)-1]
+			queue = queue[:len(queue)-1]
+			blob.pixels++
+			cx, cy := idx%w, idx/w
+			if cx < blob.bounds.Min.X {
+				blob.bounds.Min.X = cx
+			}
+			if cy < blob.bounds.Min.Y {
+				blob.bounds.Min.Y = cy
+			}
+			if cx+1 > blob.bounds.Max.X {
+				blob.bounds.Max.X = cx + 1
+			}
+			if cy+1 > blob.bounds.Max.Y {
+				blob.bounds.Max.Y = cy + 1
+			}
+			for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+				nx, ny := cx+d[0], cy+d[1]
+				if nx < 0 || nx >= w || ny < 0 || ny >= h {
+					continue
+				}
+				ni := ny*w + nx
+				if dark[ni] && !visited[ni] {
+					visited[ni] = true
+					queue = append(queue, ni)
+				}
+			}
+		}
+		blobs = append(blobs, blob)
+	}
+
+	// Denoise: discard blobs smaller than minArea (JPEG/badge noise after 3× upscale).
+	const minArea = 80
+	var sig []ccBlob
+	for _, bl := range blobs {
+		if bl.pixels >= minArea {
+			sig = append(sig, bl)
 		}
 	}
-	if maxP == 0 {
+	if len(sig) == 0 {
 		return `FAIL ""`
 	}
 
-	// Collect contiguous column groups above threshold (maxP/4).
-	// Each group represents one digit (or part of a digit).
-	thresh := maxP / 4
-	type span struct{ x0, x1 int }
-	var groups []span
-	inGroup := false
-	var cur span
-	for x, v := range proj {
-		if v > thresh {
-			if !inGroup {
-				cur.x0 = x
-				inGroup = true
-			}
-			cur.x1 = x
-		} else {
-			if inGroup {
-				if cur.x1-cur.x0 >= 12 { // ignore thin badge arcs (< 12 px after 3× upscale)
-					groups = append(groups, cur)
-				}
-				inGroup = false
+	// Keep the 1–2 largest blobs (digit strokes); discard badge chrome
+	// which the aggressive binarize threshold should have eliminated, but
+	// this is a safety net for any survivors.
+	for i := 0; i < 2 && i < len(sig); i++ {
+		best := i
+		for j := i + 1; j < len(sig); j++ {
+			if sig[j].pixels > sig[best].pixels {
+				best = j
 			}
 		}
+		sig[i], sig[best] = sig[best], sig[i]
 	}
-	if inGroup && cur.x1-cur.x0 >= 12 {
-		groups = append(groups, cur)
+	if len(sig) > 2 {
+		sig = sig[:2]
 	}
-	if len(groups) == 0 {
-		return `FAIL ""`
+	// Sort left-to-right by bounding-box x (reading order).
+	if len(sig) == 2 && sig[0].bounds.Min.X > sig[1].bounds.Min.X {
+		sig[0], sig[1] = sig[1], sig[0]
 	}
 
-	// If we have more than 2 groups the badge chrome leaked through;
-	// keep only the 1 or 2 widest groups (most pixels = actual digits).
-	if len(groups) > 2 {
-		// Sort by total projection weight descending, keep top 2.
-		weight := func(s span) int {
-			total := 0
-			for x := s.x0; x <= s.x1; x++ {
-				total += proj[x]
-			}
-			return total
-		}
-		// Bubble-select top 2 (small N, not worth importing sort).
-		for i := 0; i < 2 && i < len(groups); i++ {
-			best := i
-			for j := i + 1; j < len(groups); j++ {
-				if weight(groups[j]) > weight(groups[best]) {
-					best = j
-				}
-			}
-			groups[i], groups[best] = groups[best], groups[i]
-		}
-		groups = groups[:2]
-		// Re-sort left-to-right by x0 so digits are in reading order.
-		if groups[0].x0 > groups[1].x0 {
-			groups[0], groups[1] = groups[1], groups[0]
-		}
-	}
-
-	// OCR each group with PSM_SINGLE_WORD (more tolerant than SINGLE_CHAR
-	// when a crop contains minor surrounding badge pixels).
-	const pad = 4 // pixels of horizontal padding around each crop
+	// OCR each digit: crop bounding box + padding, run PSM_SINGLE_CHAR.
+	const pad = 6
+	outDir := filepath.Dir(imgPath)
 	var digits strings.Builder
-	for _, g := range groups {
-		x0 := g.x0 - pad
+	for di, bl := range sig {
+		r := bl.bounds
+		x0 := r.Min.X - pad
 		if x0 < 0 {
 			x0 = 0
 		}
-		x1 := g.x1 + pad + 1
+		y0 := r.Min.Y - pad
+		if y0 < 0 {
+			y0 = 0
+		}
+		x1 := r.Max.X + pad
 		if x1 > w {
 			x1 = w
 		}
-		crop := image.NewGray(image.Rect(0, 0, x1-x0, h))
-		for cy := 0; cy < h; cy++ {
+		y1 := r.Max.Y + pad
+		if y1 > h {
+			y1 = h
+		}
+		crop := image.NewGray(image.Rect(0, 0, x1-x0, y1-y0))
+		for cy := y0; cy < y1; cy++ {
 			for cx := x0; cx < x1; cx++ {
-				r, _, _, _ := gray.At(cx+b.Min.X, cy+b.Min.Y).RGBA()
-				crop.SetGray(cx-x0, cy, color.Gray{Y: uint8(r >> 8)})
+				val := uint8(255)
+				if dark[cy*w+cx] {
+					val = 0
+				}
+				crop.SetGray(cx-x0, cy-y0, color.Gray{Y: val})
 			}
 		}
+		// Save the crop that is sent to OCR so it can be inspected.
+		_ = saveImage(crop, filepath.Join(outDir, fmt.Sprintf("seg1_digit%d.png", di)))
 		var buf bytes.Buffer
 		if err := png.Encode(&buf, crop); err != nil {
 			continue
 		}
 		client := gosseract.NewClient()
 		client.SetImageFromBytes(buf.Bytes()) //nolint:errcheck
-		client.SetPageSegMode(gosseract.PSM_SINGLE_WORD)
+		client.SetPageSegMode(gosseract.PSM_SINGLE_CHAR)
 		client.SetVariable("tessedit_char_whitelist", "0123456789") //nolint:errcheck
 		text, err := client.Text()
 		client.Close()
 		if err != nil {
 			continue
 		}
-		// Accept the first digit character found (PSM_SINGLE_WORD may return
-		// a digit followed by whitespace or punctuation).
 		for _, ch := range strings.TrimSpace(text) {
 			if ch >= '0' && ch <= '9' {
 				digits.WriteRune(ch)
@@ -681,12 +697,17 @@ func fillRect(img *image.RGBA, rect Rectangle, c color.Color) {
 	}
 }
 
-// processMatchedSegment crops rect from img, converts to grayscale with
-// contrast stretching, and saves the result as a PNG to outPath.
-// If binarize is true the image is also inverted then hard-thresholded:
-// only pixels ≤ 32 (near-black text strokes) stay black; everything else
-// becomes white, giving clean black-on-white output for OCR.
-func processMatchedSegment(img *image.RGBA, rect Rectangle, outPath string, binarize bool) error {
+// processMatchedSegment crops rect from img, converts to grayscale and saves as PNG.
+//
+// binarizeMode controls post-processing:
+//
+//	0 = contrast-stretch only (name text)
+//	1 = pure-white test on the original RGBA pixels: only pixels where every
+//	    channel is ≥ whiteMin (tight threshold, close to #ffffff) are classified
+//	    as digit fill and rendered black; everything else is white.  Upscale 3×.
+//	2 = contrast-stretch → invert → hard-threshold ≤ 32 → upscale 3×.
+//	    Used for damage text (white on dark background).
+func processMatchedSegment(img *image.RGBA, rect Rectangle, outPath string, binarizeMode int) error {
 	w := rect.x1 - rect.x0
 	h := rect.y1 - rect.y0
 
@@ -694,23 +715,46 @@ func processMatchedSegment(img *image.RGBA, rect Rectangle, outPath string, bina
 	sub := image.NewRGBA(image.Rect(0, 0, w, h))
 	draw.Draw(sub, sub.Bounds(), img, image.Pt(rect.x0, rect.y0), draw.Src)
 
-	// First pass: convert to grayscale and record min/max for contrast stretch
+	// Mode 1: pure-white test on raw RGBA.
+	// The rank digit fill is #ffffff in the original screenshot; badge chrome and
+	// outlines are visibly different colours.  Only pixels with R, G, B all ≥ 240
+	// (a ±15 JPEG-compression tolerance from pure white) become black.
+	if binarizeMode == 1 {
+		const whiteMin = 240
+		out := image.NewGray(image.Rect(0, 0, w, h))
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				r16, g16, b16, _ := sub.At(x, y).RGBA()
+				var v uint8
+				if uint8(r16>>8) >= whiteMin && uint8(g16>>8) >= whiteMin && uint8(b16>>8) >= whiteMin {
+					v = 0 // pure-white digit fill → black
+				} else {
+					v = 255 // everything else → white
+				}
+				out.SetGray(x, y, color.Gray{Y: v})
+			}
+		}
+		return saveUpscaled(out, w, h, outPath)
+	}
+
+	// Modes 0 and 2: convert to grayscale first.
 	pixels := make([]uint8, w*h)
-	minV, maxV := uint8(255), uint8(0)
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
-			g := color.GrayModel.Convert(sub.At(x, y)).(color.Gray).Y
-			pixels[y*w+x] = g
-			if g < minV {
-				minV = g
-			}
-			if g > maxV {
-				maxV = g
-			}
+			pixels[y*w+x] = color.GrayModel.Convert(sub.At(x, y)).(color.Gray).Y
 		}
 	}
 
-	// Second pass: stretch contrast so [minV, maxV] → [0, 255]
+	// Modes 0 and 2 start with contrast stretching.
+	minV, maxV := uint8(255), uint8(0)
+	for _, g := range pixels {
+		if g < minV {
+			minV = g
+		}
+		if g > maxV {
+			maxV = g
+		}
+	}
 	span := int(maxV) - int(minV)
 	if span == 0 {
 		span = 1
@@ -719,26 +763,28 @@ func processMatchedSegment(img *image.RGBA, rect Rectangle, outPath string, bina
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			stretched := (int(pixels[y*w+x]) - int(minV)) * 255 / span
-			if binarize {
-				// Invert so text strokes become dark, then hard-threshold:
-				// anything not near-black (> 32) becomes pure white.
-				stretched = 255 - stretched
-				if stretched > 32 {
-					stretched = 255
-				} else {
+			if binarizeMode == 2 {
+				// Invert then hard-threshold: white text (→ 0 after invert) stays
+				// black; dark background (→ bright after invert) becomes white.
+				inv := 255 - stretched
+				if inv <= 32 {
 					stretched = 0
+				} else {
+					stretched = 255
 				}
 			}
 			out.SetGray(x, y, color.Gray{Y: uint8(stretched)})
 		}
 	}
 
-	if !binarize {
+	if binarizeMode == 0 {
 		return saveImage(out, outPath)
 	}
+	return saveUpscaled(out, w, h, outPath)
+}
 
-	// Upscale 3× (nearest-neighbour) so small glyphs (e.g. decimal points)
-	// are large enough for Tesseract to read reliably.
+// saveUpscaled writes img upscaled 3× (nearest-neighbour) to outPath.
+func saveUpscaled(out *image.Gray, w, h int, outPath string) error {
 	const scale = 3
 	scaled := image.NewGray(image.Rect(0, 0, w*scale, h*scale))
 	for y := 0; y < h; y++ {
