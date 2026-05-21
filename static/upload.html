@@ -24,12 +24,7 @@
                         <li><strong>⚡ Power Rankings</strong> - Track member power progression over time</li>
                         <li><strong>⚔️ VS Points (Daily Rank)</strong> - Record daily VS points with automatic day detection</li>
                         <li><strong>👥 Alliance Member List</strong> - Import members and ranks from roster screenshots</li>
-                    </ul>
-                </details>
-
-                <!-- Tab Buttons -->
-                <div class="tab-buttons">
-                    <button class="tab-btn active" data-tab="image">📷 Image Upload</button>
+                        <li><strong>💎 Donation Rankings</strong> - Record daily or weekly donation leaderboard</li>
                     <button class="tab-btn" data-tab="text">✍️ Manual Entry</button>
                 </div>
 
@@ -42,6 +37,7 @@
                             <option value="power">⚡ Power Rankings</option>
                             <option value="vs-points">⚔️ VS Points (Daily Rank)</option>
                             <option value="member-list">👥 Alliance Member List (names + ranks)</option>
+                            <option value="donations">💎 Donation Rankings (Daily/Weekly)</option>
                         </select>
                         <p id="screenshot-type-hint" class="help-text">
                             Upload power ranking screenshots from the alliance member list.
@@ -57,6 +53,20 @@
                         </select>
                         <p class="help-text">
                             Select which week to upload VS Points for.
+                        </p>
+                    </div>
+
+                    <!-- Donation Selector (for Donation Rankings) -->
+                    <div id="donation-selector" class="upload-field-group" style="display: none;">
+                        <label>Period Type:</label>
+                        <div class="btn-group" style="margin-bottom: 8px;">
+                            <button type="button" class="tab-btn active" id="don-type-daily" data-dontype="daily">📅 Daily</button>
+                            <button type="button" class="tab-btn" id="don-type-weekly" data-dontype="weekly">📆 Weekly</button>
+                        </div>
+                        <label for="don-date">Date:</label>
+                        <input type="date" id="don-date" class="form-input" style="max-width: 200px;">
+                        <p class="help-text">
+                            Select the date this screenshot was taken. Upload multiple screenshots from the same period — they will be merged automatically.
                         </p>
                     </div>
                     
@@ -111,6 +121,31 @@
                     <div id="member-ocr-errors" style="display:none;"></div>
                     <button id="confirm-member-ocr-btn" class="btn btn-primary">✔ Confirm &amp; Import Selected</button>
                     <button id="cancel-member-ocr-btn" class="btn btn-secondary">Cancel</button>
+                </div>
+
+                <!-- Donations OCR preview (shown only for donations type) -->
+                <div id="donation-ocr-preview" style="display:none;">
+                    <h4>💎 Detected Donations — Review &amp; Confirm</h4>
+                    <p class="help-text">Review the entries extracted from the screenshots. Uncheck rows to skip them. You can adjust member matches or points before saving.</p>
+                    <div id="donation-ocr-meta" class="help-text" style="margin-bottom:8px;"></div>
+                    <div style="overflow-x:auto;">
+                        <table class="data-table" id="donation-ocr-table">
+                            <thead>
+                                <tr>
+                                    <th style="width:36px;"></th>
+                                    <th>#</th>
+                                    <th>OCR Name</th>
+                                    <th>Matched Member</th>
+                                    <th>Points</th>
+                                </tr>
+                            </thead>
+                            <tbody id="donation-ocr-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+                        <button id="confirm-donation-ocr-btn" class="btn btn-primary">✔ Confirm &amp; Save</button>
+                        <button id="cancel-donation-ocr-btn" class="btn btn-secondary">Cancel</button>
+                    </div>
                 </div>
             </div>
         </main>

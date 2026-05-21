@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Donations - Last War Alliance</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="branding.js"></script>
+    <script src="toast.js"></script>
+    <script src="common.js"></script>
+    <script src="navigation.js"></script>
+</head>
+<body data-h1="💎 Last War: Survival" data-subtitle="Donation leaderboard — daily &amp; weekly rankings.">
+    <div class="container">
+
+        <main>
+            <!-- Type toggle + date navigation -->
+            <div class="card" style="margin-bottom: 16px;">
+                <div style="display:flex; flex-wrap:wrap; align-items:center; gap:12px;">
+                    <!-- Daily / Weekly tabs -->
+                    <div class="btn-group">
+                        <button class="tab-btn active" id="tab-daily" data-dontype="daily">📅 Daily</button>
+                        <button class="tab-btn" id="tab-weekly" data-dontype="weekly">📆 Weekly</button>
+                    </div>
+
+                    <!-- Date navigation -->
+                    <div style="display:flex; align-items:center; gap:8px; flex:1; min-width:200px;">
+                        <button class="btn btn-secondary" id="don-prev" style="padding:6px 12px;">← Prev</button>
+                        <span id="don-date-label" style="flex:1; text-align:center; font-weight:600; min-width:160px;">—</span>
+                        <button class="btn btn-secondary" id="don-next" style="padding:6px 12px;">Next →</button>
+                    </div>
+
+                    <button class="btn btn-secondary" id="don-today" style="padding:6px 12px; white-space:nowrap;">Today / This Week</button>
+
+                    <a href="/upload.html?type=donations" class="btn btn-primary" style="padding:6px 14px; white-space:nowrap;">
+                        📸 Upload Screenshots
+                    </a>
+                </div>
+            </div>
+
+            <!-- Status message -->
+            <div id="don-status" class="help-text" style="margin-bottom:8px; display:none;"></div>
+
+            <!-- Leaderboard table -->
+            <div class="card" style="padding:0; overflow:hidden;">
+                <div style="overflow-x:auto;">
+                    <table class="data-table" id="don-table">
+                        <thead>
+                            <tr>
+                                <th style="width:50px; text-align:center;">#</th>
+                                <th>Commander</th>
+                                <th style="width:80px; text-align:center;">Rank</th>
+                                <th style="width:110px; text-align:right; padding-right:16px;">Points</th>
+                            </tr>
+                        </thead>
+                        <tbody id="don-tbody">
+                            <tr><td colspan="4" style="text-align:center; padding:32px; color:var(--text-muted);">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="don-empty" style="display:none; text-align:center; padding:40px; color:var(--text-muted);">
+                <p style="font-size:2em;">💎</p>
+                <p>No donation data for this period.</p>
+                <p style="font-size:13px;">Upload screenshots via the button above.</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="theme.js"></script>
+    <script src="donations.js"></script>
+</body>
+</html>

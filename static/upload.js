@@ -200,6 +200,12 @@ processImageBtn.addEventListener('click', async () => {
         await processMemberListScreenshots();
         return;
     }
+
+    // Donations use a separate OCR-then-confirm flow
+    if (screenshotType === 'donations') {
+        await processDonationScreenshots();
+        return;
+    }
     
     const originalText = processImageBtn.innerHTML;
     processImageBtn.innerHTML = '<span class="loading"></span> Processing...';
@@ -450,16 +456,21 @@ function updateScreenshotTypeHint() {
     const screenshotType = document.getElementById('screenshot-type').value;
     const hintElement = document.getElementById('screenshot-type-hint');
     const weekSelector = document.getElementById('week-selector');
-    
+    const donSelector = document.getElementById('donation-selector');
+
+    if (weekSelector) weekSelector.style.display = 'none';
+    if (donSelector) donSelector.style.display = 'none';
+
     if (screenshotType === 'power') {
         hintElement.textContent = 'Upload power ranking screenshots from the alliance member list.';
-        if (weekSelector) weekSelector.style.display = 'none';
     } else if (screenshotType === 'vs-points') {
         hintElement.innerHTML = '<strong>⚔️ VS Points Instructions:</strong> Make sure to screenshot the "Daily Rank" tab. The system will automatically detect which day (Mon-Sat) is selected from the screenshot.';
         if (weekSelector) weekSelector.style.display = 'block';
     } else if (screenshotType === 'member-list') {
         hintElement.innerHTML = '<strong>👥 Alliance Member List:</strong> Screenshot the full alliance roster (names + ranks). OCR will extract members and prompt you to confirm changes before saving.';
-        if (weekSelector) weekSelector.style.display = 'none';
+    } else if (screenshotType === 'donations') {
+        hintElement.innerHTML = '<strong>💎 Donation Rankings:</strong> Upload screenshots of the Strength Ranking → Donation tab. Upload all scrolled screenshots together — they are merged automatically.';
+        if (donSelector) donSelector.style.display = 'block';
     }
 }
 
@@ -474,6 +485,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         screenshotTypeSelector.addEventListener('change', updateScreenshotTypeHint);
         updateScreenshotTypeHint(); // Set initial hint
     }
+
+    // Pre-fill donation date with today, wire type-toggle buttons
+    const donDateInput = document.getElementById('don-date');
+    if (donDateInput) {
+        donDateInput.value = new Date().toISOString().slice(0, 10);
+    }
+    document.querySelectorAll('[data-dontype]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('[data-dontype]').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            // When switching to weekly, snap date to nearest Monday
+            if (btn.dataset.dontype === 'weekly' && donDateInput) {
+                const d = new Date(donDateInput.value || new Date());
+                const day = d.getDay(); // 0=Sun,1=Mon,...
+                const diff = (day === 0) ? -6 : 1 - day;
+                d.setDate(d.getDate() + diff);
+                donDateInput.value = d.toISOString().slice(0, 10);
+            }
+        });
+    });
     
     // Check if power tracking is enabled
     try {
@@ -494,7 +525,171 @@ document.addEventListener('DOMContentLoaded', async () => {
         document.getElementById('member-ocr-preview').style.display = 'none';
         document.getElementById('result-container').innerHTML = '';
     });
+
+    // Donation OCR confirm/cancel buttons
+    document.getElementById('confirm-donation-ocr-btn').addEventListener('click', confirmDonationOCR);
+    document.getElementById('cancel-donation-ocr-btn').addEventListener('click', () => {
+        document.getElementById('donation-ocr-preview').style.display = 'none';
+        document.getElementById('result-container').innerHTML = '';
+    });
 });
+
+// ---- Donations OCR flow ----
+
+let donationOCRData = null; // holds DonationOCRResult from backend
+
+async function processDonationScreenshots() {
+    if (selectedFiles.length === 0) return;
+
+    const donTypeBtn = document.querySelector('[data-dontype].active');
+    const donType = donTypeBtn ? donTypeBtn.dataset.dontype : 'weekly';
+    const donDate = document.getElementById('don-date').value || new Date().toISOString().slice(0, 10);
+
+    const originalText = processImageBtn.innerHTML;
+    processImageBtn.innerHTML = '<span class="loading"></span> Processing...';
+    processImageBtn.disabled = true;
+    document.getElementById('donation-ocr-preview').style.display = 'none';
+    document.getElementById('result-container').innerHTML = '';
+
+    try {
+        showResult(`🔍 Processing ${selectedFiles.length} donation screenshot${selectedFiles.length > 1 ? 's' : ''} with OCR...`, 'info');
+        for (let j = 0; j < selectedFiles.length; j++) setTileStatus(j, 'pending');
+
+        const formData = new FormData();
+        formData.append('donation_type', donType);
+        formData.append('record_date', donDate);
+        for (let i = 0; i < selectedFiles.length; i++) {
+            setTileStatus(i, 'processing');
+            formData.append('images', selectedFiles[i]);
+        }
+
+        const response = await fetch(`${API_BASE}/donations/process-screenshots`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(errText || 'OCR processing failed');
+        }
+
+        donationOCRData = await response.json();
+
+        for (let j = 0; j < selectedFiles.length; j++) setTileStatus(j, 'done');
+
+        if (!donationOCRData.entries || donationOCRData.entries.length === 0) {
+            showResult('⚠️ No donation entries detected. Try a cleaner screenshot with better contrast.', 'error');
+            return;
+        }
+
+        renderDonationOCRPreview(donationOCRData);
+        document.getElementById('donation-ocr-preview').style.display = 'block';
+        document.getElementById('result-container').innerHTML = '';
+
+    } catch (error) {
+        console.error('Donation OCR error:', error);
+        showResult(`❌ OCR failed: ${error.message}`, 'error');
+        for (let j = 0; j < selectedFiles.length; j++) setTileStatus(j, 'error');
+    } finally {
+        processImageBtn.innerHTML = originalText;
+        processImageBtn.disabled = false;
+    }
+}
+
+function renderDonationOCRPreview(data) {
+    const meta = document.getElementById('donation-ocr-meta');
+    const typeLabel = data.donation_type === 'daily' ? '📅 Daily' : '📆 Weekly';
+    meta.innerHTML = `${typeLabel} · <strong>${data.record_date}</strong> · ${data.total_rows} entries from ${data.total_images} screenshot${data.total_images !== 1 ? 's' : ''}`;
+
+    const tbody = document.getElementById('donation-ocr-tbody');
+    tbody.innerHTML = data.entries.map((e, i) => {
+        const matchColor = e.match_type === 'exact' ? 'var(--success-color, #81c784)'
+            : e.match_type === 'nickname' ? 'var(--success-color, #81c784)'
+            : e.match_type === 'fuzzy' ? 'var(--warning-color, #ffb74d)'
+            : 'var(--text-muted)';
+        const matchLabel = e.match_type === 'exact' ? '✓ exact'
+            : e.match_type === 'nickname' ? '✓ alias'
+            : e.match_type === 'fuzzy' ? `~ fuzzy (${e.match_confidence}%)`
+            : '✗ none';
+        const memberDisplay = e.member_name
+            ? `<span style="color:${matchColor}">${escapeHtml(e.member_name)}</span> <small style="color:var(--text-muted)">${matchLabel}</small>`
+            : `<span style="color:var(--text-muted)">— ${matchLabel}</span>`;
+
+        return `<tr data-idx="${i}">
+            <td><input type="checkbox" data-idx="${i}" checked></td>
+            <td style="text-align:center; color:var(--text-muted)">${e.rank_in_snapshot}</td>
+            <td>${escapeHtml(e.name_snapshot)}</td>
+            <td>${memberDisplay}</td>
+            <td><input type="number" class="form-input don-pts-input" data-idx="${i}" value="${e.points}" min="0" style="width:90px; padding:4px 6px; font-size:13px;"></td>
+        </tr>`;
+    }).join('');
+}
+
+async function confirmDonationOCR() {
+    if (!donationOCRData) return;
+
+    const checkboxes = document.querySelectorAll('#donation-ocr-tbody input[type=checkbox]');
+    const ptsInputs = document.querySelectorAll('.don-pts-input');
+    const entries = [];
+
+    checkboxes.forEach(cb => {
+        if (!cb.checked) return;
+        const idx = parseInt(cb.dataset.idx);
+        const e = donationOCRData.entries[idx];
+        const pts = parseInt(ptsInputs[idx]?.value ?? e.points) || 0;
+        entries.push({
+            rank_in_snapshot: e.rank_in_snapshot,
+            name_snapshot: e.name_snapshot,
+            points: pts,
+            member_id: e.member_id || null,
+            member_name: e.member_name || '',
+            member_rank: e.member_rank || '',
+            match_confidence: e.match_confidence,
+            match_type: e.match_type
+        });
+    });
+
+    if (entries.length === 0) {
+        showResult('Please select at least one entry to save.', 'error');
+        return;
+    }
+
+    const confirmBtn = document.getElementById('confirm-donation-ocr-btn');
+    const originalText = confirmBtn.innerHTML;
+    confirmBtn.innerHTML = '<span class="loading"></span> Saving...';
+    confirmBtn.disabled = true;
+
+    try {
+        const response = await fetch(`${API_BASE}/donations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                donation_type: donationOCRData.donation_type,
+                record_date: donationOCRData.record_date,
+                entries
+            })
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(errText || 'Save failed');
+        }
+
+        const result = await response.json();
+        document.getElementById('donation-ocr-preview').style.display = 'none';
+        showResult(`✅ Saved ${result.saved} donation records for ${donationOCRData.donation_type} ${donationOCRData.record_date}. <a href="/donations.html?type=${donationOCRData.donation_type}&date=${donationOCRData.record_date}" style="color:var(--accent-primary)">View Leaderboard →</a>`, 'success');
+        donationOCRData = null;
+        selectedFiles = [];
+        imageInput.value = '';
+        updatePreview();
+    } catch (error) {
+        console.error('Donation save error:', error);
+        showResult(`❌ Save failed: ${error.message}`, 'error');
+    } finally {
+        confirmBtn.innerHTML = originalText;
+        confirmBtn.disabled = false;
+    }
+}
 
 // ---- Member list OCR flow ----
 

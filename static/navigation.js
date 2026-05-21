@@ -53,6 +53,7 @@
                 <a href="/marshal-guard.html" class="nav-link" id="mg-nav-link">🛡️ Marshal Guard</a>
                 <a href="/vs.html" class="nav-link">⚔️ VS Points</a>
                 <a href="/vs-compliance.html" class="nav-link">✅ VS Compliance</a>
+                <a href="/donations.html" class="nav-link">💎 Donations</a>
                 <a href="/participation.html" class="nav-link">📋 Participation</a>
                 <a href="/upload.html" class="nav-link">📸 Upload</a>
                 <a href="/settings.html" class="nav-link">⚙️ Settings</a>
