@@ -53,3 +53,10 @@ mg_output/
 playwright-tests/auth.json
 playwright-tests/test-results/
 playwright-tests/report/
+
+# Images (screenshots, debug output)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
