@@ -7434,6 +7434,16 @@ section:last-child {
 }
 .mg-dmg-input { max-width: 8rem; }
 
+/* Inline screenshot crop in ⚠ damage cell */
+.mg-row-crop {
+    display: block;
+    margin-top: 3px;
+    border-radius: 3px;
+    max-width: 100%;
+    border: 1px solid var(--border-color, #e2e8f0);
+    cursor: zoom-in;
+}
+
 /* Screenshot viewer button inside MG event card header */
 .mg-view-screenshots-btn {
     padding: .25rem .7rem;

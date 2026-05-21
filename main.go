@@ -8909,17 +8909,20 @@ type MGMemberStats struct {
 // V2 OCR preview types (mg_segment pipeline)
 
 type MGV2PreviewRow struct {
-	Rank           int    `json:"rank"`
-	Name           string `json:"name"`         // player name without alliance tag
-	AllianceTag    string `json:"alliance_tag"` // e.g. "RSRP"
-	NameOK         bool   `json:"name_ok"`
-	DamageStr      string `json:"damage_str"` // e.g. "27.35G"
-	Damage         int64  `json:"damage"`
-	DamageOK       bool   `json:"damage_ok"`
-	RankFixed      bool   `json:"rank_fixed"`
-	MemberID       *int   `json:"member_id,omitempty"`
-	MemberName     string `json:"member_name,omitempty"`
-	GraveyardMatch bool   `json:"graveyard_match,omitempty"`
+	Rank           int     `json:"rank"`
+	Name           string  `json:"name"`         // player name without alliance tag
+	AllianceTag    string  `json:"alliance_tag"` // e.g. "RSRP"
+	NameOK         bool    `json:"name_ok"`
+	DamageStr      string  `json:"damage_str"` // e.g. "27.35G"
+	Damage         int64   `json:"damage"`
+	DamageOK       bool    `json:"damage_ok"`
+	RankFixed      bool    `json:"rank_fixed"`
+	MemberID       *int    `json:"member_id,omitempty"`
+	MemberName     string  `json:"member_name,omitempty"`
+	GraveyardMatch bool    `json:"graveyard_match,omitempty"`
+	SourceFileIdx  *int    `json:"source_file_idx,omitempty"` // index into uploaded files
+	CropY0Pct      float64 `json:"crop_y0_pct,omitempty"`     // row crop top (0.0–1.0)
+	CropY1Pct      float64 `json:"crop_y1_pct,omitempty"`     // row crop bottom (0.0–1.0)
 }
 
 type MGV2PreviewEvent struct {
@@ -8959,7 +8962,7 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 		topDmgStr   string
 		topDmgInt   int64
 		members     map[int]*mgMemberOCR // rank → best OCR result
-		fileIndices []int               // which input file indices contributed
+		fileIndices []int                // which input file indices contributed
 	}
 	byDate := map[string]*eventAccum{}
 	dateOrder := []string{}
@@ -9004,6 +9007,7 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 			existing, has := acc.members[m.Rank]
 			if !has || m.DamageInt > existing.DamageInt || (!existing.NameOK && m.NameOK) {
 				cp := *m
+				cp.FileIdx = fileIdx // record which uploaded file this row came from
 				acc.members[m.Rank] = &cp
 			}
 		}
@@ -9040,15 +9044,19 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 					m := acc.members[rank]
 					// Parse alliance tag and plain name from "[TAG]PlayerName".
 					allianceTag, nameOnly := parsePlayerTag(m.Name, knownTag)
+					srcIdx := m.FileIdx
 					row := MGV2PreviewRow{
-						Rank:        rank,
-						Name:        nameOnly,
-						AllianceTag: allianceTag,
-						NameOK:      m.NameOK,
-						DamageStr:   m.DamageStr,
-						Damage:      m.DamageInt,
-						DamageOK:    m.DamageOK,
-						RankFixed:   m.RankFixed,
+						Rank:          rank,
+						Name:          nameOnly,
+						AllianceTag:   allianceTag,
+						NameOK:        m.NameOK,
+						DamageStr:     m.DamageStr,
+						Damage:        m.DamageInt,
+						DamageOK:      m.DamageOK,
+						RankFixed:     m.RankFixed,
+						SourceFileIdx: &srcIdx,
+						CropY0Pct:     m.CropY0,
+						CropY1Pct:     m.CropY1,
 					}
 					// Match to member using plain name (without alliance tag).
 					if allMembers != nil {
@@ -9876,6 +9884,31 @@ func parsePlayerTag(name, knownTag string) (tag, nameOnly string) {
 	return "", name
 }
 
+// mgOcrNormForCompare maps visually-similar characters to a canonical form for
+// name-matching only, so OCR confusions (O↔0, l/I↔1) do not prevent a fuzzy match.
+func mgOcrNormForCompare(s string) string {
+	s = strings.ToLower(s)
+	s = strings.NewReplacer("o", "0", "l", "1", "i", "1").Replace(s)
+	return s
+}
+
+// mgSimilarityNorm computes the Levenshtein-based similarity (0–100) between two
+// already-normalised strings.
+func mgSimilarityNorm(n1, n2 string) int {
+	if n1 == n2 {
+		return 100
+	}
+	dist := levenshteinDistance(n1, n2)
+	maxLen := len(n1)
+	if len(n2) > maxLen {
+		maxLen = len(n2)
+	}
+	if maxLen == 0 {
+		return 0
+	}
+	return (maxLen - dist) * 100 / maxLen
+}
+
 func matchMGParticipant(p *MGOCRParticipant, members []Member) {
 	name := strings.TrimSpace(p.NameSnapshot)
 	if name == "" {
@@ -9908,6 +9941,37 @@ func matchMGParticipant(p *MGOCRParticipant, members []Member) {
 			nickSim := calculateSimilarity(name, *m.Nickname)
 			if nickSim > sim {
 				sim = nickSim
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		p.MemberID = &members[bestIdx].ID
+		p.MemberName = members[bestIdx].Name
+		return
+	}
+
+	// Second pass: OCR character normalisation (O↔0, l/I↔1, try without
+	// spurious leading character added by OCR e.g. "J" before "KM011").
+	ocrNorm := mgOcrNormForCompare(name)
+	bestScore = 0
+	bestIdx = -1
+	for i, m := range members {
+		dbNorm := mgOcrNormForCompare(m.Name)
+		sim := mgSimilarityNorm(ocrNorm, dbNorm)
+		// Also try without the first character (spurious leading OCR char).
+		if len(ocrNorm) > 3 {
+			if s2 := mgSimilarityNorm(ocrNorm[1:], dbNorm); s2 > sim {
+				sim = s2
+			}
+		}
+		if m.Nickname != nil && *m.Nickname != "" {
+			nickNorm := mgOcrNormForCompare(*m.Nickname)
+			if s := mgSimilarityNorm(ocrNorm, nickNorm); s > sim {
+				sim = s
 			}
 		}
 		if sim > bestScore {

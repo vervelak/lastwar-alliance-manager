@@ -25,13 +25,16 @@ import (
 type mgRect struct{ x0, y0, x1, y1 int }
 
 type mgMemberOCR struct {
-	Rank      int    // reconstructed rank (2–100)
-	Name      string // e.g. "[RSRP]Gargoland"
-	NameOK    bool   // name OCR was validated
-	DamageStr string // e.g. "27.35G"
-	DamageInt int64  // parsed value in bytes/units
-	DamageOK  bool   // damage OCR was validated
-	RankFixed bool   // rank was inferred (CORR/FIXD)
+	Rank      int     // reconstructed rank (2–100)
+	Name      string  // e.g. "[RSRP]Gargoland"
+	NameOK    bool    // name OCR was validated
+	DamageStr string  // e.g. "27.35G"
+	DamageInt int64   // parsed value in bytes/units
+	DamageOK  bool    // damage OCR was validated
+	RankFixed bool    // rank was inferred (CORR/FIXD)
+	FileIdx   int     // index of the source uploaded file (set by caller)
+	CropY0    float64 // row top relative to full image (0.0–1.0)
+	CropY1    float64 // row bottom relative to full image (0.0–1.0)
 }
 
 // MGImgResult holds all data extracted from one Marshal Guard screenshot.
@@ -639,6 +642,8 @@ type mgMemberRow struct {
 	nameOK  bool
 	dmgStr  string
 	dmgOK   bool
+	cropY0  float64 // top of row relative to full image (0.0–1.0)
+	cropY1  float64 // bottom of row relative to full image
 }
 
 // mgReconstructSequence fills FAIL ranks and corrects misreads using the
@@ -927,6 +932,8 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 				nameOK:  nameOK,
 				dmgStr:  dmg,
 				dmgOK:   dmgOK,
+				cropY0:  float64(rect.y0+dialogY0) / float64(height),
+				cropY1:  float64(rect.y1+dialogY0) / float64(height),
 			})
 		}
 
@@ -975,6 +982,8 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 			DamageInt: dmgInt,
 			DamageOK:  row.dmgOK,
 			RankFixed: fixed,
+			CropY0:    row.cropY0,
+			CropY1:    row.cropY1,
 		})
 	}
 

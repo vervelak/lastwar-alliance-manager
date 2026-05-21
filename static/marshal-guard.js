@@ -410,6 +410,7 @@ function renderMGV2Events() {
         card.className = 'mg-v2-event-card';
         card.innerHTML = buildEventCardHTML(ev, evIdx);
         container.appendChild(card);
+        drawMGRowCrops(card);
     });
 
     // Wire up per-event import buttons.
@@ -449,7 +450,12 @@ function buildEventCardHTML(ev, evIdx) {
         // Player cell: search input + member select + OCR hint
         let playerCellContent;
         if (isGap) {
-            playerCellContent = '<span class="text-muted">—</span>';
+            // Gap row — allow manual assignment of a member and damage
+            const opts = buildMGMemberOptions(row.member_id || null, null);
+            playerCellContent = `
+                <input class="mg-search-input" placeholder="🔍 filter…" autocomplete="off" aria-label="Search member">
+                <select class="mg-member-select mg-member-select--warn" data-ev="${evIdx}" data-row="${rIdx}">${opts}</select>
+                <div class="mg-ocr-hint">Gap — no screenshot for rank ${row.rank}</div>`;
         } else {
             const ocrText = (row.alliance_tag ? `[${row.alliance_tag}] ` : '') + (row.name || '');
             const warnClass = noMember ? ' mg-member-select--warn' : '';
@@ -470,7 +476,7 @@ function buildEventCardHTML(ev, evIdx) {
         // Status icon
         let statusIcon;
         if (isGap) {
-            statusIcon = '<span class="mg-si mg-si-gap" title="Rank gap — no screenshot for this position">—</span>';
+            statusIcon = '<span class="mg-si mg-si-none" title="Rank gap — assign member manually">❓</span>';
         } else if (noMember) {
             statusIcon = '<span class="mg-si mg-si-none" title="No member matched — please select">❓</span>';
         } else if (!row.damage_ok) {
@@ -481,10 +487,26 @@ function buildEventCardHTML(ev, evIdx) {
             statusIcon = '<span class="mg-si mg-si-ok">✓</span>';
         }
 
+        // Inline screenshot crop for ⚠ rows (damage_ok === false)
+        // Shows a canvas thumbnail of the row's location in the source image.
+        let cropCanvas = '';
+        if (!row.damage_ok && row.source_file_idx != null) {
+            const blobURL = ev.blobURLs && ev.blobURLs[row.source_file_idx] != null
+                ? ev.blobURLs[row.source_file_idx]
+                : (ev.blobURLs && ev.blobURLs[0]);
+            if (blobURL && row.crop_y0_pct != null && row.crop_y1_pct != null && row.crop_y1_pct > row.crop_y0_pct) {
+                cropCanvas = `<canvas class="mg-row-crop" aria-hidden="true"
+                    data-src="${escapeAttr(blobURL)}"
+                    data-y0="${row.crop_y0_pct}"
+                    data-y1="${row.crop_y1_pct}"
+                    title="Screenshot crop for this row"></canvas>`;
+            }
+        }
+
         memberRows += `<tr class="${rowClass}">
             <td class="mg-rank-col">${rankCell}</td>
             <td class="mg-name-col"><div class="mg-player-cell">${playerCellContent}</div></td>
-            <td class="mg-dmg-col">${dmgInput}</td>
+            <td class="mg-dmg-col">${dmgInput}${cropCanvas}</td>
             <td class="mg-status-col">${statusIcon}</td>
         </tr>`;
     });
@@ -638,6 +660,36 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('mg-v2-modal').style.display = 'none';
     });
 });
+
+// ─── Inline screenshot crop thumbnails ───────────────────────────────────────
+
+// After rendering an event card, find all canvas.mg-row-crop elements and draw
+// the appropriate crop from the source blob URL onto each.
+function drawMGRowCrops(container) {
+    container.querySelectorAll('canvas.mg-row-crop').forEach(canvas => {
+        const src  = canvas.dataset.src;
+        const y0   = parseFloat(canvas.dataset.y0);
+        const y1   = parseFloat(canvas.dataset.y1);
+        if (!src || isNaN(y0) || isNaN(y1) || y1 <= y0) return;
+
+        const img = new Image();
+        img.onload = () => {
+            const srcH   = img.naturalHeight;
+            const srcW   = img.naturalWidth;
+            const cropH  = Math.round(srcH * (y1 - y0));
+            const cropY  = Math.round(srcH * y0);
+            // Scale to a fixed display width (200px max), preserve aspect ratio
+            const dispW  = Math.min(srcW, 220);
+            const dispH  = Math.round(dispW * cropH / srcW);
+            canvas.width  = dispW;
+            canvas.height = Math.max(dispH, 20);
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, cropY, srcW, cropH, 0, 0, dispW, dispH);
+        };
+        img.onerror = () => { canvas.style.display = 'none'; };
+        img.src = src;
+    });
+}
 
 // ─── Screenshot Lightbox ──────────────────────────────────────────────────────
 
