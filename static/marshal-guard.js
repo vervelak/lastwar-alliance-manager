@@ -1,5 +1,6 @@
 // Marshal Guard page logic
-let isOfficer = false;
+let canUpload = false; // R3, R4, R5, admin — can upload screenshots & import events
+let isOfficer = false; // R4, R5, admin — can edit/delete events
 let isAdmin = false;
 let ocrPreviewData = null;
 let selectedFiles = [];
@@ -13,12 +14,31 @@ async function checkAuth() {
 
         let display = `👤 ${data.username}`;
         if (data.rank) display += ` (${data.rank})`;
-        document.getElementById('username-display').textContent = display;
+        const usernameDisplay = document.getElementById('username-display');
+        if (usernameDisplay) {
+            usernameDisplay.textContent = display;
+            usernameDisplay.addEventListener('click', toggleUserDropdown);
+        }
+
+        const logoutBtn = document.getElementById('dropdown-logout-btn');
+        if (logoutBtn) logoutBtn.addEventListener('click', handleLogout);
+
+        document.addEventListener('click', (event) => {
+            const dropdown = document.getElementById('user-dropdown-menu');
+            const btn = document.getElementById('username-display');
+            if (dropdown && btn && !btn.contains(event.target) && !dropdown.contains(event.target)) {
+                dropdown.classList.remove('show');
+            }
+        });
 
         isAdmin = data.is_admin || false;
         const rank = (data.rank || '').toUpperCase();
+        canUpload = isAdmin || rank === 'R3' || rank === 'R4' || rank === 'R5';
         isOfficer = isAdmin || rank === 'R4' || rank === 'R5';
 
+        if (canUpload) {
+            document.querySelectorAll('.uploader-only').forEach(el => el.style.display = '');
+        }
         if (isOfficer) {
             document.querySelectorAll('.officer-only').forEach(el => el.style.display = '');
         }
@@ -201,7 +221,7 @@ function initUpload() {
 function handleFiles(fileList) {
     const files = Array.from(fileList).filter(f => f.type.startsWith('image/'));
     if (files.length === 0) return;
-    selectedFiles = selectedFiles.concat(files).slice(0, 10);
+    selectedFiles = selectedFiles.concat(files).slice(0, 40);
     renderFilePreview();
 }
 
@@ -252,8 +272,24 @@ function clearFiles() {
 async function processScreenshots() {
     if (selectedFiles.length === 0) return;
     const processBtn = document.getElementById('mg-process-btn');
+    const progressWrap = document.getElementById('mg-progress-wrap');
+    const progressBar  = document.getElementById('mg-progress-bar');
+    const progressLabel = document.getElementById('mg-progress-label');
+    const progressTime  = document.getElementById('mg-progress-time');
+
     processBtn.disabled = true;
     processBtn.textContent = '⏳ Processing…';
+    progressWrap.style.display = 'block';
+    progressBar.style.width = '0%';
+    progressLabel.textContent = `Processing ${selectedFiles.length} image${selectedFiles.length > 1 ? 's' : ''}…`;
+
+    let pct = 0;
+    const startMs = Date.now();
+    const timer = setInterval(() => {
+        pct += (90 - pct) * 0.12;
+        progressBar.style.width = pct.toFixed(1) + '%';
+        progressTime.textContent = ((Date.now() - startMs) / 1000).toFixed(0) + 's';
+    }, 300);
 
     try {
         const formData = new FormData();
@@ -268,10 +304,14 @@ async function processScreenshots() {
             return;
         }
         document.getElementById('event-modal').style.display = 'none';
+        progressBar.style.width = '100%';
+        setTimeout(() => { progressWrap.style.display = 'none'; }, 600);
         showMGV2Preview(events);
     } catch (e) {
         showToast('OCR processing failed: ' + e.message, 'error');
+        progressWrap.style.display = 'none';
     } finally {
+        clearInterval(timer);
         processBtn.disabled = false;
         processBtn.textContent = '🔍 Process Screenshots with OCR';
     }
@@ -281,6 +321,64 @@ async function processScreenshots() {
 
 // Live data store for the preview — mutated by inline edits.
 let mgV2Events = [];
+// All active members, loaded once for the member-select dropdowns.
+let mgAllMembers = [];
+
+async function loadMGMembers() {
+    try {
+        const res = await fetch('/api/members');
+        if (!res.ok) return;
+        const data = await res.json();
+        mgAllMembers = (data || []).sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+    } catch { /* non-critical, dropdown just stays empty */ }
+}
+
+// Build <option> elements for a member select, pre-selecting memberId.
+// graveyardName is non-null when the match is a deleted member.
+function buildMGMemberOptions(memberId, graveyardName) {
+    let opts = '<option value="">— Unmatched —</option>';
+    if (graveyardName) {
+        const sel = memberId ? ' selected' : '';
+        opts += `<option value="${memberId}"${sel} data-name="${escapeAttr(graveyardName.toLowerCase())}">⚰️ ${escapeHtml(graveyardName)} (graveyard)</option>`;
+    }
+    for (const m of mgAllMembers) {
+        const nick = m.nickname ? ` [${m.nickname}]` : '';
+        const searchName = escapeAttr((m.name + (m.nickname ? ' ' + m.nickname : '')).toLowerCase());
+        const sel = (!graveyardName && m.id === memberId) ? ' selected' : '';
+        opts += `<option value="${m.id}"${sel} data-name="${searchName}">${escapeHtml(m.name)}${escapeHtml(nick)} (${m.rank})</option>`;
+    }
+    return opts;
+}
+
+// Filter a .mg-member-select by search term and sync mgV2Events on single match.
+function filterMGSelect(select, term) {
+    let visible = 0, lastIdx = -1;
+    for (let i = 0; i < select.options.length; i++) {
+        const opt = select.options[i];
+        if (i === 0) { opt.style.display = ''; continue; } // keep "Unmatched"
+        const name = opt.dataset.name || '';
+        const show = !term || name.includes(term) || fuzzyMatchMG(name, term);
+        opt.style.display = show ? '' : 'none';
+        if (show) { visible++; lastIdx = i; }
+    }
+    if (visible === 1 && term && lastIdx > 0) {
+        select.selectedIndex = lastIdx;
+        const evIdx = parseInt(select.dataset.ev), rowIdx = parseInt(select.dataset.row);
+        if (!isNaN(evIdx) && !isNaN(rowIdx)) {
+            mgV2Events[evIdx].rows[rowIdx].member_id = parseInt(select.value) || null;
+        }
+    }
+}
+
+function fuzzyMatchMG(str, pattern) {
+    if (!pattern) return true;
+    if (str.includes(pattern)) return true;
+    let pi = 0;
+    for (let i = 0; i < str.length && pi < pattern.length; i++) {
+        if (str[i] === pattern[pi]) pi++;
+    }
+    return pi === pattern.length;
+}
 
 function showMGV2Preview(events) {
     mgV2Events = events.map(ev => ({
@@ -316,74 +414,88 @@ function buildEventCardHTML(ev, evIdx) {
                </div></div>`
         : '';
 
-    const topRow = (ev.top_player_name || ev.top_player_damage_str)
-        ? `<tr class="mg-v2-top-row">
-               <td>🏆</td>
-               <td>${escapeHtml(ev.top_player_name || '—')}</td>
-               <td>${escapeHtml(ev.top_player_damage_str || '—')}</td>
-               <td>–</td>
-               <td class="text-muted" style="font-size:.8em;">top player</td>
-           </tr>`
-        : '';
+    // Match quality summary for the card header.
+    const named      = (ev.rows || []).filter(r => r.name);
+    const nMatched   = named.filter(r => r.member_id && !r.graveyard_match).length;
+    const nGraveyard = named.filter(r => r.graveyard_match).length;
+    const nUnmatched = named.filter(r => !r.member_id).length;
+    const summaryParts = [];
+    if (nMatched)   summaryParts.push(`<span class="mg-sum-ok">✅ ${nMatched}</span>`);
+    if (nGraveyard) summaryParts.push(`<span class="mg-sum-gy">⚰️ ${nGraveyard}</span>`);
+    if (nUnmatched) summaryParts.push(`<span class="mg-sum-un">❓ ${nUnmatched}</span>`);
+    const matchSummary = summaryParts.join(' ');
 
     let memberRows = '';
     (ev.rows || []).forEach((row, rIdx) => {
-        const isGap   = !row.name && !row.damage_str;         // rank gap
-        const needsReview = isGap || !row.name_ok || !row.damage_ok;
-        const rowClass = isGap ? 'mg-v2-gap-row' : (needsReview ? 'mg-v2-warn-row' : '');
+        const isGap  = !row.name && !row.damage_str;
+        const isTop  = row.rank === 1;
+        const noMember = !row.member_id && !isGap;
+        const needsReview = isGap || !row.damage_ok || noMember;
+        const rowClass = isTop ? 'mg-v2-top-row' : (isGap ? 'mg-v2-gap-row' : (needsReview ? 'mg-v2-warn-row' : ''));
+        const rankCell = isTop ? '🏆' : row.rank;
 
-        const nameCell = `<input class="mg-cell-input" data-ev="${evIdx}" data-row="${rIdx}" data-field="name"
-                                 value="${escapeAttr(row.name || '')}"
-                                 placeholder="[TAG]PlayerName" style="${!row.name_ok ? 'border-color:var(--warning,#f59e0b);' : ''}">`;
-        const dmgCell  = `<input class="mg-cell-input mg-dmg-input" data-ev="${evIdx}" data-row="${rIdx}" data-field="damage_str"
-                                 value="${escapeAttr(row.damage_str || '')}"
-                                 placeholder="e.g. 15.20G" style="${!row.damage_ok ? 'border-color:var(--warning,#f59e0b);' : ''}">`;
-        const status = isGap
-            ? '<span class="badge badge-warn">gap</span>'
-            : (row.rank_fixed
-                ? '<span class="badge badge-info" title="Rank inferred from sequence">fixed</span>'
-                : (needsReview
-                    ? '<span class="badge badge-warn">review</span>'
-                    : '<span class="badge badge-ok">✓</span>'));
-        const member = row.member_id
-            ? `<span class="text-muted" style="font-size:.8em;">✅ ${escapeHtml(row.member_name)}</span>`
-            : '<span class="text-muted" style="font-size:.8em;">—</span>';
+        // Player cell: search input + member select + OCR hint
+        let playerCellContent;
+        if (isGap) {
+            playerCellContent = '<span class="text-muted">—</span>';
+        } else {
+            const ocrText = (row.alliance_tag ? `[${row.alliance_tag}] ` : '') + (row.name || '');
+            const warnClass = noMember ? ' mg-member-select--warn' : '';
+            const opts = buildMGMemberOptions(
+                row.member_id,
+                row.graveyard_match ? (row.member_name || null) : null
+            );
+            playerCellContent = `
+                <input class="mg-search-input" placeholder="🔍 filter…" autocomplete="off" aria-label="Search member">
+                <select class="mg-member-select${warnClass}" data-ev="${evIdx}" data-row="${rIdx}">${opts}</select>
+                <div class="mg-ocr-hint">OCR: ${escapeHtml(ocrText)}</div>`;
+        }
+
+        const dmgInput = `<input class="mg-cell-input mg-dmg-input" data-ev="${evIdx}" data-row="${rIdx}" data-field="damage_str"
+            value="${escapeAttr(row.damage_str || '')}" placeholder="—"
+            style="${!row.damage_ok ? 'border-color:var(--warning,#f59e0b);' : ''}">`;
+
+        // Status icon
+        let statusIcon;
+        if (isGap) {
+            statusIcon = '<span class="mg-si mg-si-gap" title="Rank gap — no screenshot for this position">—</span>';
+        } else if (noMember) {
+            statusIcon = '<span class="mg-si mg-si-none" title="No member matched — please select">❓</span>';
+        } else if (!row.damage_ok) {
+            statusIcon = '<span class="mg-si mg-si-warn" title="Damage OCR uncertain or out of order">⚠</span>';
+        } else if (row.rank_fixed) {
+            statusIcon = '<span class="mg-si mg-si-fixed" title="Rank inferred from sequence">✓<sup>+</sup></span>';
+        } else {
+            statusIcon = '<span class="mg-si mg-si-ok">✓</span>';
+        }
 
         memberRows += `<tr class="${rowClass}">
-            <td>${row.rank}</td>
-            <td>${nameCell}</td>
-            <td>${dmgCell}</td>
-            <td>${status}</td>
-            <td>${member}</td>
+            <td class="mg-rank-col">${rankCell}</td>
+            <td class="mg-name-col"><div class="mg-player-cell">${playerCellContent}</div></td>
+            <td class="mg-dmg-col">${dmgInput}</td>
+            <td class="mg-status-col">${statusIcon}</td>
         </tr>`;
     });
 
     return `
         <div class="mg-v2-card-header">
-            <div>
-                <strong>📅 ${escapeHtml(ev.event_date || 'Unknown date')}</strong>
-                <span class="text-muted" style="margin-left:.5rem;font-size:.85em;">${ev.rows.length} player${ev.rows.length !== 1 ? 's' : ''}</span>
+            <div class="mg-card-meta">
+                <strong class="mg-event-date">📅 ${escapeHtml(ev.event_date || 'Unknown date')}</strong>
+                <span class="mg-match-summary">${ev.rows.length} players &nbsp;·&nbsp; ${matchSummary}</span>
             </div>
-            <button class="primary-btn" style="padding:.3rem .8rem;font-size:.85em;" data-import-event="${evIdx}">
-                ✔ Import this event
-            </button>
+            <div class="mg-card-controls">
+                <input type="date" class="mg-date-input" data-ev="${evIdx}"
+                       value="${escapeAttr(ev.event_date || '')}" title="Edit event date">
+                <input type="text" class="mg-notes-input" data-ev="${evIdx}"
+                       value="${escapeAttr(ev.notes || '')}" placeholder="Notes (optional)" title="Event notes">
+                <button class="mg-import-btn" data-import-event="${evIdx}">✔ Import</button>
+            </div>
         </div>
         ${overwrite}
-        <div class="form-group" style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem;">
-            <label style="margin:0;">Date:
-                <input type="date" class="form-control mg-date-input" data-ev="${evIdx}"
-                       value="${escapeAttr(ev.event_date || '')}" style="display:inline-block;width:auto;margin-left:.4rem;">
-            </label>
-            <label style="margin:0;">Notes:
-                <input type="text" class="form-control mg-notes-input" data-ev="${evIdx}"
-                       value="${escapeAttr(ev.notes || '')}" placeholder="optional"
-                       style="display:inline-block;width:18rem;margin-left:.4rem;">
-            </label>
-        </div>
-        <div class="rk-table-wrapper" style="max-height:400px;overflow-y:auto;">
-            <table class="rk-table">
-                <thead><tr><th>#</th><th>Player</th><th>Damage</th><th>Status</th><th>Member</th></tr></thead>
-                <tbody>${topRow}${memberRows}</tbody>
+        <div class="rk-table-wrapper" style="max-height:420px;overflow-y:auto;">
+            <table class="rk-table mg-v2-table">
+                <thead><tr><th class="mg-rank-col">#</th><th>Player</th><th class="mg-dmg-col">Damage</th><th class="mg-status-col">✓</th></tr></thead>
+                <tbody>${memberRows}</tbody>
             </table>
         </div>`;
 }
@@ -407,6 +519,23 @@ document.addEventListener('input', e => {
         const evIdx = parseInt(t.dataset.ev);
         if (!isNaN(evIdx)) mgV2Events[evIdx].notes = t.value;
     }
+    // Member search input — filter the adjacent select
+    if (t.classList.contains('mg-search-input')) {
+        const select = t.closest('.mg-player-cell')?.querySelector('.mg-member-select');
+        if (select) filterMGSelect(select, t.value.toLowerCase().trim());
+    }
+});
+
+// Member select change — update member_id in live data.
+document.addEventListener('change', e => {
+    const t = e.target;
+    if (t.classList.contains('mg-member-select')) {
+        const evIdx  = parseInt(t.dataset.ev);
+        const rowIdx = parseInt(t.dataset.row);
+        if (!isNaN(evIdx) && !isNaN(rowIdx)) {
+            mgV2Events[evIdx].rows[rowIdx].member_id = t.value ? parseInt(t.value) : null;
+        }
+    }
 });
 
 async function importSingleEvent(evIdx) {
@@ -414,26 +543,20 @@ async function importSingleEvent(evIdx) {
     if (!ev.event_date) { showToast('Event date is required', 'warning'); return; }
 
     const participants = [];
-    // Top player as rank 1.
-    if (ev.top_player_name || ev.top_player_damage) {
-        const parsed = parseMGName(ev.top_player_name || '');
-        participants.push({
-            rank_in_event: 1,
-            name_snapshot: parsed.name,
-            alliance_tag:  parsed.tag,
-            damage:        ev.top_player_damage || 0,
-            attack_count:  null,
-        });
-    }
     for (const row of ev.rows) {
-        const name  = (row.name || '').trim();
         const dmgStr = (row.damage_str || '').trim();
-        if (!name && !dmgStr) continue; // skip empty gap rows
-        const parsed = parseMGName(name);
+        if (!row.name && !dmgStr) continue; // skip empty gap rows
+        // Prefer the matched member's canonical name; fall back to OCR name.
+        const matchedMember = row.member_id
+            ? mgAllMembers.find(m => m.id === row.member_id) || null
+            : null;
+        const name_snapshot = matchedMember
+            ? matchedMember.name
+            : (row.member_name || row.name || '').trim(); // graveyard or OCR fallback
         participants.push({
             rank_in_event: row.rank,
-            name_snapshot: parsed.name,
-            alliance_tag:  parsed.tag,
+            name_snapshot,
+            alliance_tag:  row.alliance_tag || '',
             damage:        parseMGDamageStr(dmgStr),
             attack_count:  null,
             member_id:     row.member_id || null,
@@ -499,10 +622,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ─── Damage / name parsing helpers ────────────────────────────────────────────
 
-// parseMGName splits "[TAG]PlayerName" → { tag, name }.
+// parseMGName splits "[TAG]PlayerName" → { tag, name }. Also handles fuzzy ] (OCR reads ] as l, 1, | or I).
 function parseMGName(raw) {
-    const m = raw.match(/^\[([A-Za-z0-9]{1,4})\]\s*(.+)$/);
+    const m = raw.match(/^\[([A-Za-z0-9]{1,10})\]\s*(.+)$/);
     if (m) return { tag: m[1], name: m[2].trim() };
+    const f = raw.match(/^\[([A-Za-z0-9]{1,10})[lI1|]\s*(.+)$/);
+    if (f) return { tag: f[1], name: f[2].trim() };
     return { tag: '', name: raw.trim() };
 }
 
@@ -608,5 +733,5 @@ document.addEventListener('DOMContentLoaded', async () => {
     initManualForm();
     initSearch();
 
-    await Promise.all([loadEvents(), loadMemberStats()]);
+    await Promise.all([loadEvents(), loadMemberStats(), loadMGMembers()]);
 });

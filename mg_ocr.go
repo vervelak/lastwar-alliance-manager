@@ -552,6 +552,11 @@ func mgNormalizeDamage(raw string) string {
 		if decPart != "" {
 			return fmt.Sprintf("Total Damage: %s.%s%s", intPart, decPart, unit)
 		}
+		// Reject implausibly long integer parts — they are OCR noise, not real values.
+		// Real values: 5G, 23G, 962M (1–3 digits). Recovery handles 4–5 digit cases below.
+		if len(intPart) > 5 {
+			return ""
+		}
 		switch len(intPart) {
 		case 4:
 			return fmt.Sprintf("Total Damage: %s.%s%s", intPart[:2], intPart[2:], unit)
@@ -607,6 +612,14 @@ func mgParseDamageInt(s string) int64 {
 		val += frac * (multiplier / 100)
 	}
 	return val
+}
+
+// mgFormatDamageStr converts an int64 damage value (raw units) to a display string like "2.37G" or "498.13M".
+func mgFormatDamageStr(d int64) string {
+	if d >= 1_000_000_000 {
+		return fmt.Sprintf("%.2fG", float64(d)/1e9)
+	}
+	return fmt.Sprintf("%.2fM", float64(d)/1e6)
 }
 
 // mgParseDamageStr extracts just the "X.XXG" portion from a full "Total Damage: X.XXG" string.
@@ -778,36 +791,102 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 		for si, seg := range vertSegs {
 			hSegs[si] = mgFindHorizontalSegments(cropped, seg)
 		}
+		hLens := make([]int, len(hSegs))
+		for i, h := range hSegs {
+			hLens[i] = len(h)
+		}
+		log.Printf("mg_ocr: rect %v vsegs=%d hSegs=%v", rect, len(vertSegs), hLens)
 
-		// ── Top player card: 3 vsegs, hSegs[2]==1, hSegs[1]>=2 ──
-		if len(vertSegs) == 3 && len(hSegs[2]) == 1 && len(hSegs[1]) >= 2 {
-			data, err := mgCropAndBinarize(cropped, hSegs[2][0], 0)
+		// ── Top player card ──
+		// Layout A (original mg_segment): 3 vsegs, hSegs[2]>=1, hSegs[1]>=2  → name in hSegs[2][0]
+		//   damage comes from a SEPARATE rect: 3 vsegs, hSegs[1]==1, hSegs[2]==1 (handled below).
+		// Layout B (4-vseg): vseg[3] is a combined text block with both name and damage.
+		// Layout C (2-vseg): hSegs[0]>=2, hSegs[1]==1 → text area is hSegs[1][0].
+		var topNameRect, topDmgRect mgRect
+		topLayoutB := false
+		topDetected := false
+		if len(vertSegs) == 3 && len(hSegs[1]) >= 2 && len(hSegs[2]) >= 1 {
+			topNameRect = hSegs[2][0]
+			topDetected = true
+		} else if len(vertSegs) == 4 && len(hSegs) >= 4 && len(hSegs[3]) >= 1 {
+			// vseg[3] is the text area containing name and damage as a block.
+			topNameRect = hSegs[3][0]
+			topDmgRect = hSegs[3][0]
+			topLayoutB = true
+			topDetected = true
+		} else if len(vertSegs) == 2 && len(hSegs) >= 2 && len(hSegs[0]) >= 2 && len(hSegs[1]) == 1 {
+			// Layout C: 2 vsegs — left side is avatar (multi-band), right side is text block.
+			topNameRect = hSegs[1][0]
+			topDmgRect = hSegs[1][0]
+			topLayoutB = true
+			topDetected = true
+		}
+		if topDetected && result.TopPlayerName == "" {
+			data, err := mgCropAndBinarize(cropped, topNameRect, 0)
 			if err != nil {
-				continue
-			}
-			raw, _ := mgRunOCR(data, gosseract.PSM_SINGLE_BLOCK, "")
-			for _, line := range strings.Split(raw, "\n") {
-				line = strings.TrimSpace(line)
-				if result.TopPlayerName == "" {
+				log.Printf("mg_ocr: top card binarize: %v", err)
+			} else {
+				// Use SINGLE_BLOCK with no whitelist so name characters are captured.
+				raw, _ := mgRunOCR(data, gosseract.PSM_SINGLE_BLOCK, "")
+				log.Printf("mg_ocr: top card raw OCR: %q", raw)
+				for _, line := range strings.Split(raw, "\n") {
+					line = strings.TrimSpace(line)
 					if idx := strings.Index(line, "["); idx >= 0 {
 						candidate := strings.TrimSpace(line[idx:])
 						norm := mgNormalizeName(candidate)
 						if mgNameRe.MatchString(norm) {
 							result.TopPlayerName = norm
+							log.Printf("mg_ocr: top player name: %q", norm)
+							break
+						}
+					}
+				}
+				// Layout B: also try to extract damage from the same block.
+				if topLayoutB && result.TopPlayerDmgStr == "" {
+					for _, line := range strings.Split(raw, "\n") {
+						line = strings.TrimSpace(line)
+						norm := mgNormalizeDamage(line)
+						if mgDamageRe.MatchString(norm) {
+							result.TopPlayerDmgStr = mgParseDamageStr(norm)
+							result.TopPlayerDmgInt = mgParseDamageInt(norm)
+							log.Printf("mg_ocr: top damage (layout B from block): %q", norm)
+							break
 						}
 					}
 				}
 			}
 		}
+		// Top player damage from layout B/C: try all three binarise modes and keep the first
+		// non-zero result (mode 2 finds the text but can misread digits; mode 0/1 may do better).
+		if topDetected && topLayoutB && (topDmgRect != mgRect{}) && result.TopPlayerDmgStr == "" {
+			for _, bmode := range []int{2, 0, 1} {
+				data, err := mgCropAndBinarize(cropped, topDmgRect, bmode)
+				if err != nil {
+					continue
+				}
+				dmg, ok := mgOcrSegment(data, gosseract.PSM_SINGLE_LINE, "TotalDamge :0123456789.,GM", mgDamageRe, mgNormalizeDamage)
+				log.Printf("mg_ocr: top damage OCR mode=%d ok=%v %q", bmode, ok, dmg)
+				if ok && mgParseDamageInt(dmg) > 0 {
+					result.TopPlayerDmgStr = mgParseDamageStr(dmg)
+					result.TopPlayerDmgInt = mgParseDamageInt(dmg)
+					break
+				}
+			}
+			if result.TopPlayerDmgStr == "" {
+				log.Printf("mg_ocr: top damage could not be extracted for layout B/C")
+			}
+		}
 
-		// ── Top player damage row: 3 vsegs, hSegs[1]==1, hSegs[2]==1 ──
+		// ── Top player damage row (layout A): 3 vsegs, hSegs[1]==1, hSegs[2]==1 ──
 		if len(vertSegs) == 3 && len(hSegs[1]) == 1 && len(hSegs[2]) == 1 {
 			data, err := mgCropAndBinarize(cropped, hSegs[2][0], 2)
 			if err != nil {
+				log.Printf("mg_ocr: top damage binarize: %v", err)
 				continue
 			}
 			dmg, ok := mgOcrSegment(data, gosseract.PSM_SINGLE_LINE, "TotalDamge :0123456789.,GM", mgDamageRe, mgNormalizeDamage)
-			if ok {
+			log.Printf("mg_ocr: top damage OCR (layout A) ok=%v %q", ok, dmg)
+			if ok && result.TopPlayerDmgStr == "" {
 				result.TopPlayerDmgStr = mgParseDamageStr(dmg)
 				result.TopPlayerDmgInt = mgParseDamageInt(dmg)
 			}
@@ -851,24 +930,23 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 			})
 		}
 
-		// ── Datetime: 1 vseg, hSegs[0]==3 ──
-		if len(vertSegs) == 1 && len(hSegs[0]) == 3 {
-			data, err := mgCropAndBinarize(cropped, hSegs[0][1], 0)
-			if err != nil {
-				continue
-			}
-			dt, ok := mgOcrSegment(data, gosseract.PSM_SINGLE_LINE, "0123456789:- ", mgDatetimeRe, nil)
-			if ok && result.EventDate == "" {
-				// Keep only date portion: "2026-5-6 20:30:10" → "2026-05-06"
-				parts := strings.Fields(dt)
-				if len(parts) >= 1 {
-					dateParts := strings.Split(parts[0], "-")
-					if len(dateParts) == 3 {
-						y, _ := strconv.Atoi(dateParts[0])
-						mo, _ := strconv.Atoi(dateParts[1])
-						d, _ := strconv.Atoi(dateParts[2])
-						result.EventDate = fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
-					}
+		// ── Datetime: 1 vseg, hSegs[0]>=2 (originally ==3, some layouts ==2) ──
+		if len(vertSegs) == 1 && len(hSegs[0]) >= 2 && result.EventDate == "" {
+			dateRe := regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
+			for _, hseg := range hSegs[0] {
+				data, err := mgCropAndBinarize(cropped, hseg, 0)
+				if err != nil {
+					continue
+				}
+				rawDt, _ := mgRunOCR(data, gosseract.PSM_SINGLE_LINE, "")
+				log.Printf("mg_ocr: datetime hseg %v raw OCR: %q", hseg, rawDt)
+				if m := dateRe.FindStringSubmatch(rawDt); m != nil {
+					y, _ := strconv.Atoi(m[1])
+					mo, _ := strconv.Atoi(m[2])
+					d, _ := strconv.Atoi(m[3])
+					result.EventDate = fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
+					log.Printf("mg_ocr: event date: %q", result.EventDate)
+					break
 				}
 			}
 		}

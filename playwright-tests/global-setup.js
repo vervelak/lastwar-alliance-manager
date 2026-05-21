@@ -13,7 +13,7 @@ module.exports = async function globalSetup() {
 
   await page.goto(`${BASE}/login.html`);
   await page.fill('#username', 'admin');
-  await page.fill('#password', 'admin123');
+  await page.fill('#password', process.env.TEST_PASSWORD || 'admin123');
   await page.click('#login-btn');
   await page.waitForURL(url => !url.href.includes('login.html'), { timeout: 10000 });
 

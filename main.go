@@ -1914,6 +1914,27 @@ func rankManagementMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// r3PlusMiddleware allows R3, R4, R5, and admin (used for MG upload/confirm).
+func r3PlusMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session, _ := store.Get(r, "session")
+		if isAdmin, ok := session.Values["is_admin"].(bool); ok && isAdmin {
+			next(w, r)
+			return
+		}
+		if memberID, ok := session.Values["member_id"].(int); ok {
+			var rank string
+			if err := db.QueryRow("SELECT rank FROM members WHERE id = ? AND deleted_at IS NULL", memberID).Scan(&rank); err == nil {
+				if rank == "R3" || rank == "R4" || rank == "R5" {
+					next(w, r)
+					return
+				}
+			}
+		}
+		http.Error(w, "Forbidden: R3 or higher required", http.StatusForbidden)
+	}
+}
+
 // Permission middleware - only R5 or admin
 func adminR5Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -8888,15 +8909,17 @@ type MGMemberStats struct {
 // V2 OCR preview types (mg_segment pipeline)
 
 type MGV2PreviewRow struct {
-	Rank       int    `json:"rank"`
-	Name       string `json:"name"`
-	NameOK     bool   `json:"name_ok"`
-	DamageStr  string `json:"damage_str"` // e.g. "27.35G"
-	Damage     int64  `json:"damage"`
-	DamageOK   bool   `json:"damage_ok"`
-	RankFixed  bool   `json:"rank_fixed"`
-	MemberID   *int   `json:"member_id,omitempty"`
-	MemberName string `json:"member_name,omitempty"`
+	Rank           int    `json:"rank"`
+	Name           string `json:"name"`         // player name without alliance tag
+	AllianceTag    string `json:"alliance_tag"` // e.g. "RSRP"
+	NameOK         bool   `json:"name_ok"`
+	DamageStr      string `json:"damage_str"` // e.g. "27.35G"
+	Damage         int64  `json:"damage"`
+	DamageOK       bool   `json:"damage_ok"`
+	RankFixed      bool   `json:"rank_fixed"`
+	MemberID       *int   `json:"member_id,omitempty"`
+	MemberName     string `json:"member_name,omitempty"`
+	GraveyardMatch bool   `json:"graveyard_match,omitempty"`
 }
 
 type MGV2PreviewEvent struct {
@@ -8984,7 +9007,12 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load members for matching.
-	allMembers, _ := loadAllMembers()
+	allMembers, membErr := loadAllMembers()
+	log.Printf("processMGV2: loaded %d members (err=%v)", len(allMembers), membErr)
+	deletedMembers, _ := loadDeletedMembers()
+	var knownTag string
+	db.QueryRow(`SELECT COALESCE(alliance_short_name, '') FROM settings WHERE id = 1`).Scan(&knownTag)
+	knownTag = strings.ToUpper(strings.TrimSpace(knownTag))
 
 	// Build preview events.
 	var events []MGV2PreviewEvent
@@ -9007,21 +9035,34 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 			for rank := minRank; rank <= maxRank; rank++ {
 				if memberIdx < len(ranks) && ranks[memberIdx] == rank {
 					m := acc.members[rank]
+					// Parse alliance tag and plain name from "[TAG]PlayerName".
+					allianceTag, nameOnly := parsePlayerTag(m.Name, knownTag)
 					row := MGV2PreviewRow{
-						Rank:      rank,
-						Name:      m.Name,
-						NameOK:    m.NameOK,
-						DamageStr: m.DamageStr,
-						Damage:    m.DamageInt,
-						DamageOK:  m.DamageOK,
-						RankFixed: m.RankFixed,
+						Rank:        rank,
+						Name:        nameOnly,
+						AllianceTag: allianceTag,
+						NameOK:      m.NameOK,
+						DamageStr:   m.DamageStr,
+						Damage:      m.DamageInt,
+						DamageOK:    m.DamageOK,
+						RankFixed:   m.RankFixed,
 					}
-					// Match to member.
+					// Match to member using plain name (without alliance tag).
 					if allMembers != nil {
-						fake := MGOCRParticipant{NameSnapshot: m.Name}
+						fake := MGOCRParticipant{NameSnapshot: nameOnly}
 						matchMGParticipant(&fake, allMembers)
 						row.MemberID = fake.MemberID
 						row.MemberName = fake.MemberName
+					}
+					// If still unmatched, check the graveyard (deleted members).
+					if row.MemberID == nil && deletedMembers != nil {
+						fake := MGOCRParticipant{NameSnapshot: nameOnly}
+						matchMGParticipant(&fake, deletedMembers)
+						if fake.MemberID != nil {
+							row.MemberID = fake.MemberID
+							row.MemberName = fake.MemberName
+							row.GraveyardMatch = true
+						}
 					}
 					rows = append(rows, row)
 					memberIdx++
@@ -9030,6 +9071,64 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 					rows = append(rows, MGV2PreviewRow{Rank: rank})
 				}
 			}
+		}
+
+		// Add the top player as rank 1.
+		if acc.topName != "" {
+			topTag, topName := parsePlayerTag(acc.topName, knownTag)
+			topRow := MGV2PreviewRow{
+				Rank:        1,
+				Name:        topName,
+				AllianceTag: topTag,
+				NameOK:      topName != "",
+				DamageStr:   acc.topDmgStr,
+				Damage:      acc.topDmgInt,
+				DamageOK:    acc.topDmgInt > 0,
+			}
+			if topName != "" {
+				fake := MGOCRParticipant{NameSnapshot: topName}
+				if allMembers != nil {
+					matchMGParticipant(&fake, allMembers)
+					topRow.MemberID = fake.MemberID
+					topRow.MemberName = fake.MemberName
+				}
+				if topRow.MemberID == nil && deletedMembers != nil {
+					fake2 := MGOCRParticipant{NameSnapshot: topName}
+					matchMGParticipant(&fake2, deletedMembers)
+					if fake2.MemberID != nil {
+						topRow.MemberID = fake2.MemberID
+						topRow.MemberName = fake2.MemberName
+						topRow.GraveyardMatch = true
+					}
+				}
+			}
+			rows = append([]MGV2PreviewRow{topRow}, rows...)
+		}
+
+		// Fix rows where a lower-ranked player has higher damage than the one above —
+		// almost always a missing decimal point in the OCR output (e.g. 237G → 2.37G).
+		// Rank 1 is skipped in the top-down pass because its OCR is less reliable;
+		// a wrongly-low rank 1 value would cascade bad corrections into rank 2+ rows.
+		prevDamage := int64(-1)
+		for i := range rows {
+			r := &rows[i]
+			if r.Rank == 1 || r.Damage == 0 {
+				continue // skip rank 1 and gap/unread rows
+			}
+			if prevDamage >= 0 && r.Damage > prevDamage {
+				fixed := r.Damage / 100
+				if fixed > 0 && fixed <= prevDamage {
+					r.Damage = fixed
+					r.DamageStr = mgFormatDamageStr(fixed)
+				}
+			}
+			if r.Damage > 0 {
+				prevDamage = r.Damage
+			}
+		}
+		// Validate rank 1: top player's damage must be ≥ rank 2. If not, flag for review.
+		if len(rows) >= 2 && rows[0].Rank == 1 && rows[1].Damage > 0 && rows[0].Damage > 0 && rows[0].Damage < rows[1].Damage {
+			rows[0].DamageOK = false
 		}
 
 		// Check for existing event.
@@ -9351,8 +9450,8 @@ func processMarshalGuardScreenshots(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No images provided", http.StatusBadRequest)
 		return
 	}
-	if len(files) > 10 {
-		http.Error(w, "Maximum 10 images allowed", http.StatusBadRequest)
+	if len(files) > 40 {
+		http.Error(w, "Maximum 40 images allowed", http.StatusBadRequest)
 		return
 	}
 
@@ -9705,8 +9804,8 @@ func extractMGByRows(imageData []byte) ([]MGOCRParticipant, string, int64) {
 	return participants, eventDate, totalDamage
 }
 
-func loadAllMembers() ([]Member, error) {
-	rows, err := db.Query(`SELECT id, name, rank, eligible, nickname FROM members WHERE deleted = 0`)
+func loadDeletedMembers() ([]Member, error) {
+	rows, err := db.Query(`SELECT id, name, rank, nickname FROM members WHERE deleted_at IS NOT NULL ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -9715,7 +9814,7 @@ func loadAllMembers() ([]Member, error) {
 	for rows.Next() {
 		var m Member
 		var nickname sql.NullString
-		if err := rows.Scan(&m.ID, &m.Name, &m.Rank, &m.Eligible, &nickname); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Rank, &nickname); err != nil {
 			continue
 		}
 		if nickname.Valid {
@@ -9724,6 +9823,53 @@ func loadAllMembers() ([]Member, error) {
 		members = append(members, m)
 	}
 	return members, nil
+}
+
+func loadAllMembers() ([]Member, error) {
+	rows, err := db.Query(`SELECT id, name, rank, nickname FROM members WHERE deleted_at IS NULL ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var members []Member
+	for rows.Next() {
+		var m Member
+		var nickname sql.NullString
+		if err := rows.Scan(&m.ID, &m.Name, &m.Rank, &nickname); err != nil {
+			continue
+		}
+		if nickname.Valid {
+			m.Nickname = &nickname.String
+		}
+		members = append(members, m)
+	}
+	return members, nil
+}
+
+// parsePlayerTag extracts the alliance tag and plain player name from strings like
+// "[RSRP]Gargoland" or "[RSRPlJazzyopolis" (where ] was OCR'd as l, 1, | or I).
+// knownTag (from settings) is used for fuzzy bracket matching before standard parsing.
+func parsePlayerTag(name, knownTag string) (tag, nameOnly string) {
+	name = strings.TrimSpace(name)
+	// Prefer known-tag match with fuzzy closing bracket.
+	if knownTag != "" {
+		upper := strings.ToUpper(name)
+		prefix := "[" + strings.ToUpper(knownTag)
+		if idx := strings.Index(upper, prefix); idx >= 0 {
+			after := name[idx+len(prefix):]
+			if len(after) > 0 && strings.ContainsRune("]l1|I", rune(after[0])) {
+				return knownTag, strings.TrimSpace(after[1:])
+			}
+		}
+	}
+	// Standard parsing: first [...] group.
+	if close := strings.Index(name, "]"); close >= 0 {
+		open := strings.Index(name, "[")
+		if open >= 0 && open < close {
+			return name[open+1 : close], strings.TrimSpace(name[close+1:])
+		}
+	}
+	return "", name
 }
 
 func matchMGParticipant(p *MGOCRParticipant, members []Member) {
@@ -11544,10 +11690,10 @@ func main() {
 
 	// Marshal Guard routes (protected)
 	router.HandleFunc("/api/marshal-guard", authMiddleware(listMarshalGuardEvents)).Methods("GET")
-	router.HandleFunc("/api/marshal-guard", authMiddleware(rankManagementMiddleware(createMarshalGuardEvent))).Methods("POST")
-	router.HandleFunc("/api/marshal-guard/process-screenshots", authMiddleware(rankManagementMiddleware(processMarshalGuardScreenshots))).Methods("POST")
-	router.HandleFunc("/api/marshal-guard/process-mg-v2", authMiddleware(rankManagementMiddleware(processMGV2))).Methods("POST")
-	router.HandleFunc("/api/marshal-guard/confirm", authMiddleware(rankManagementMiddleware(confirmMarshalGuard))).Methods("POST")
+	router.HandleFunc("/api/marshal-guard", authMiddleware(r3PlusMiddleware(createMarshalGuardEvent))).Methods("POST")
+	router.HandleFunc("/api/marshal-guard/process-screenshots", authMiddleware(r3PlusMiddleware(processMarshalGuardScreenshots))).Methods("POST")
+	router.HandleFunc("/api/marshal-guard/process-mg-v2", authMiddleware(r3PlusMiddleware(processMGV2))).Methods("POST")
+	router.HandleFunc("/api/marshal-guard/confirm", authMiddleware(r3PlusMiddleware(confirmMarshalGuard))).Methods("POST")
 	router.HandleFunc("/api/marshal-guard/member-stats", authMiddleware(getMarshalGuardMemberStats)).Methods("GET")
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(getMarshalGuardEvent)).Methods("GET")
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(rankManagementMiddleware(updateMarshalGuardEvent))).Methods("PUT")

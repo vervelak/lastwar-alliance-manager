@@ -15,4 +15,5 @@ services:
       # Set SESSION_KEY via .env file or shell environment.
       # Generate one with: openssl rand -hex 32
       SESSION_KEY: "${SESSION_KEY}"
+      MG_DEBUG_DIR: "/data/mg-debug"
     restart: unless-stopped

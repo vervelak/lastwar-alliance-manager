@@ -25,7 +25,7 @@
                 <section class="form-section">
                     <div class="mg-toolbar">
                         <h3>🛡️ Marshal Guard Events</h3>
-                        <button id="add-event-btn" class="primary-btn officer-only" style="display:none;">➕ Add Event</button>
+                        <button id="add-event-btn" class="primary-btn uploader-only" style="display:none;">➕ Add Event</button>
                     </div>
                     <div id="event-list" class="rk-table-wrapper">
                         <p class="loading">⏳ Loading events...</p>
@@ -68,7 +68,7 @@
                         <div id="mg-drop-content">
                             <div class="drop-icon">📁</div>
                             <p class="drop-text">Tap to upload or drag &amp; drop</p>
-                            <p class="drop-subtext">MG mail screenshots (up to 20 images, multiple events OK)</p>
+                            <p class="drop-subtext">MG mail screenshots (up to 40 images, multiple events OK)</p>
                         </div>
                         <div id="mg-preview-container" class="preview-container">
                             <div class="preview-header">
@@ -79,6 +79,15 @@
                         </div>
                     </div>
                     <button type="button" id="mg-process-btn" class="btn btn-primary" style="display:none;">🔍 Process Screenshots with OCR</button>
+                    <div id="mg-progress-wrap" style="display:none;margin-top:.75rem;">
+                        <div style="display:flex;justify-content:space-between;font-size:.82em;margin-bottom:.3rem;">
+                            <span id="mg-progress-label">Processing…</span>
+                            <span id="mg-progress-time">0s</span>
+                        </div>
+                        <div style="background:var(--bg-secondary,#e5e7eb);border-radius:999px;height:8px;overflow:hidden;">
+                            <div id="mg-progress-bar" style="height:100%;width:0%;background:var(--primary,#6366f1);border-radius:999px;transition:width .3s ease;"></div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Manual sub-tab -->
