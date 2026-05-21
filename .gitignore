@@ -53,6 +53,13 @@ mg_output/
 playwright-tests/auth.json
 playwright-tests/test-results/
 playwright-tests/report/
+playwright-tests/screenshots/
+playwright-tests/tests/screenshots/
+playwright-tests/node_modules/
+
+# Test / temp projects
+ocr_test/
+scripts/
 
 # Images (screenshots, debug output)
 *.png
