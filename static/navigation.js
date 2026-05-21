@@ -46,17 +46,17 @@
                 <a href="/" class="nav-link">👥 Members</a>
                 <a href="/train.html" class="nav-link">🚂 Train</a>
                 <a href="/awards.html" class="nav-link">🏆 Awards</a>
-                <a href="/recommendations.html" class="nav-link">⭐ Recs</a>
+                <a href="/recommendations.html" class="nav-link">⭐ Recommendations</a>
                 <a href="/conduct.html" class="nav-link">📋 Conduct Reports</a>
                 <a href="/rankings.html" class="nav-link">📊 Rankings</a>
                 <a href="/storm.html" class="nav-link">🏜️ Storm</a>
                 <a href="/marshal-guard.html" class="nav-link" id="mg-nav-link">🛡️ Marshal Guard</a>
                 <a href="/vs.html" class="nav-link">⚔️ VS Points</a>
-                <a href="/vs-compliance.html" class="nav-link">📋 VS Compliance</a>
+                <a href="/vs-compliance.html" class="nav-link">✅ VS Compliance</a>
                 <a href="/upload.html" class="nav-link">📸 Upload</a>
                 <a href="/settings.html" class="nav-link">⚙️ Settings</a>
                 <a href="/recruit.html" class="nav-link">🎯 Recruit</a>
-                <a href="/admin.html" class="nav-link admin-link" id="admin-nav-link" style="display: none;">🔐 Admin</a>
+                <a href="/admin.html" class="nav-link admin-link" id="admin-nav-link" style="display: none;">🔐 Admin Panel</a>
                 <a href="/graveyard.html" class="nav-link admin-link" id="graveyard-nav-link" style="display: none;">🪦 Graveyard</a>
             </div>
         </nav>`;
