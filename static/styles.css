@@ -7433,6 +7433,113 @@ section:last-child {
     font-size: .85em;
 }
 .mg-dmg-input { max-width: 8rem; }
+
+/* Screenshot viewer button inside MG event card header */
+.mg-view-screenshots-btn {
+    padding: .25rem .7rem;
+    font-size: .82em;
+    font-weight: 600;
+    white-space: nowrap;
+    border: 1px solid var(--border-color, #e2e8f0);
+    border-radius: 6px;
+    cursor: pointer;
+    background: var(--card-bg, #fff);
+    color: var(--text-primary, #241a13);
+    transition: background .15s;
+}
+.mg-view-screenshots-btn:hover {
+    background: var(--accent-primary, #df8730);
+    color: #fff;
+    border-color: transparent;
+}
+
+/* ── Screenshot Lightbox ─────────────────────────────────────────────────── */
+#mg-lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: rgba(0, 0, 0, .93);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    /* allow vertical scrolling if image is taller than viewport */
+    overflow: auto;
+}
+#mg-lightbox-close {
+    position: fixed;
+    top: 12px;
+    right: 16px;
+    background: none;
+    border: none;
+    color: #fff;
+    font-size: 2.2rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 10px;
+    z-index: 10001;
+    border-radius: 4px;
+    transition: color .15s;
+}
+#mg-lightbox-close:hover { color: #f59e0b; }
+#mg-lightbox-img-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3rem 3.5rem;   /* space for arrows + close btn */
+    max-width: 100vw;
+    box-sizing: border-box;
+}
+#mg-lightbox-img {
+    max-width: min(100%, 960px);
+    max-height: 80vh;
+    object-fit: contain;
+    border-radius: 4px;
+    user-select: none;
+    box-shadow: 0 4px 32px rgba(0,0,0,.6);
+}
+#mg-lightbox-prev,
+#mg-lightbox-next {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    background: rgba(255, 255, 255, .12);
+    border: none;
+    color: #fff;
+    font-size: 2.8rem;
+    line-height: 1;
+    /* large touch target */
+    padding: 16px 14px;
+    min-width: 54px;
+    min-height: 70px;
+    cursor: pointer;
+    border-radius: 6px;
+    z-index: 10001;
+    transition: background .15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+#mg-lightbox-prev { left: 4px; }
+#mg-lightbox-next { right: 4px; }
+#mg-lightbox-prev:hover,
+#mg-lightbox-next:hover { background: rgba(255, 255, 255, .25); }
+#mg-lightbox-counter {
+    position: fixed;
+    bottom: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255, 255, 255, .65);
+    font-size: .9rem;
+    pointer-events: none;
+    letter-spacing: .04em;
+}
+/* Mobile: reduce padding so full image fits */
+@media (max-width: 600px) {
+    #mg-lightbox-img-wrap { padding: 3.5rem 1.2rem; }
+    #mg-lightbox-prev, #mg-lightbox-next { font-size: 2rem; padding: 12px 10px; min-width: 42px; }
+    #mg-lightbox-img { max-height: 75vh; }
+}
 .badge {
     display: inline-block;
     padding: 1px 7px;

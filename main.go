@@ -8923,12 +8923,13 @@ type MGV2PreviewRow struct {
 }
 
 type MGV2PreviewEvent struct {
-	EventDate       string           `json:"event_date"`
-	TopPlayerName   string           `json:"top_player_name"`
-	TopPlayerDmgStr string           `json:"top_player_damage_str"`
-	TopPlayerDmg    int64            `json:"top_player_damage"`
-	Rows            []MGV2PreviewRow `json:"rows"`
-	ExistingEventID *int             `json:"existing_event_id,omitempty"`
+	EventDate         string           `json:"event_date"`
+	TopPlayerName     string           `json:"top_player_name"`
+	TopPlayerDmgStr   string           `json:"top_player_damage_str"`
+	TopPlayerDmg      int64            `json:"top_player_damage"`
+	Rows              []MGV2PreviewRow `json:"rows"`
+	ExistingEventID   *int             `json:"existing_event_id,omitempty"`
+	SourceFileIndices []int            `json:"source_file_indices,omitempty"`
 }
 
 // POST /api/marshal-guard/process-mg-v2 — OCR using the mg_segment pipeline.
@@ -8954,15 +8955,16 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 
 	// Process each image and collect results keyed by event date.
 	type eventAccum struct {
-		topName   string
-		topDmgStr string
-		topDmgInt int64
-		members   map[int]*mgMemberOCR // rank → best OCR result
+		topName     string
+		topDmgStr   string
+		topDmgInt   int64
+		members     map[int]*mgMemberOCR // rank → best OCR result
+		fileIndices []int               // which input file indices contributed
 	}
 	byDate := map[string]*eventAccum{}
 	dateOrder := []string{}
 
-	for _, fh := range files {
+	for fileIdx, fh := range files {
 		f, err := fh.Open()
 		if err != nil {
 			continue
@@ -8989,6 +8991,7 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 			byDate[date] = acc
 			dateOrder = append(dateOrder, date)
 		}
+		acc.fileIndices = append(acc.fileIndices, fileIdx)
 		if acc.topName == "" && imgResult.TopPlayerName != "" {
 			acc.topName = imgResult.TopPlayerName
 		}
@@ -9141,12 +9144,13 @@ func processMGV2(w http.ResponseWriter, r *http.Request) {
 		}
 
 		events = append(events, MGV2PreviewEvent{
-			EventDate:       date,
-			TopPlayerName:   acc.topName,
-			TopPlayerDmgStr: acc.topDmgStr,
-			TopPlayerDmg:    acc.topDmgInt,
-			Rows:            rows,
-			ExistingEventID: existingID,
+			EventDate:         date,
+			TopPlayerName:     acc.topName,
+			TopPlayerDmgStr:   acc.topDmgStr,
+			TopPlayerDmg:      acc.topDmgInt,
+			Rows:              rows,
+			ExistingEventID:   existingID,
+			SourceFileIndices: acc.fileIndices,
 		})
 	}
 

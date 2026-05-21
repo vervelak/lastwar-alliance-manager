@@ -323,6 +323,12 @@ async function processScreenshots() {
 let mgV2Events = [];
 // All active members, loaded once for the member-select dropdowns.
 let mgAllMembers = [];
+// Blob URLs created from the uploaded files (revoked when preview closes).
+let mgV2BlobURLs = [];
+// Lightbox state
+let mgLightboxURLs = [];
+let mgLightboxIdx   = 0;
+let mgLbTouchStartX = 0;
 
 async function loadMGMembers() {
     try {
@@ -381,9 +387,15 @@ function fuzzyMatchMG(str, pattern) {
 }
 
 function showMGV2Preview(events) {
+    // Create fresh blob URLs for all uploaded files (revoke old ones first).
+    mgV2BlobURLs.forEach(u => URL.revokeObjectURL(u));
+    mgV2BlobURLs = selectedFiles.map(f => URL.createObjectURL(f));
+
     mgV2Events = events.map(ev => ({
         ...ev,
         notes: '',
+        // Attach blob URLs matching the source file indices returned by the server.
+        blobURLs: (ev.source_file_indices || []).map(i => mgV2BlobURLs[i]).filter(Boolean),
         rows: (ev.rows || []).map(r => ({ ...r })),
     }));
     renderMGV2Events();
@@ -477,6 +489,12 @@ function buildEventCardHTML(ev, evIdx) {
         </tr>`;
     });
 
+    // Screenshot viewer button — only when we have blob URLs for this event.
+    const screenshotCount = (ev.blobURLs && ev.blobURLs.length) || 0;
+    const screenshotBtn = screenshotCount > 0
+        ? `<button class="mg-view-screenshots-btn" data-ev-shots="${evIdx}" title="View original screenshot(s) to fill gaps or fix OCR errors">📷${screenshotCount > 1 ? ' ' + screenshotCount : ''}</button>`
+        : '';
+
     return `
         <div class="mg-v2-card-header">
             <div class="mg-card-meta">
@@ -484,6 +502,7 @@ function buildEventCardHTML(ev, evIdx) {
                 <span class="mg-match-summary">${ev.rows.length} players &nbsp;·&nbsp; ${matchSummary}</span>
             </div>
             <div class="mg-card-controls">
+                ${screenshotBtn}
                 <input type="date" class="mg-date-input" data-ev="${evIdx}"
                        value="${escapeAttr(ev.event_date || '')}" title="Edit event date">
                 <input type="text" class="mg-notes-input" data-ev="${evIdx}"
@@ -620,6 +639,40 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
+// ─── Screenshot Lightbox ──────────────────────────────────────────────────────
+
+function openMGLightbox(blobURLs, startIdx) {
+    mgLightboxURLs = blobURLs;
+    mgLightboxIdx  = startIdx || 0;
+    mgLbUpdateLightbox();
+    document.getElementById('mg-lightbox').style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+}
+
+function closeMGLightbox() {
+    document.getElementById('mg-lightbox').style.display = 'none';
+    document.body.style.overflow = '';
+}
+
+function mgLbNav(dir) {
+    if (mgLightboxURLs.length <= 1) return;
+    mgLightboxIdx = (mgLightboxIdx + dir + mgLightboxURLs.length) % mgLightboxURLs.length;
+    mgLbUpdateLightbox();
+}
+
+function mgLbUpdateLightbox() {
+    const img     = document.getElementById('mg-lightbox-img');
+    const counter = document.getElementById('mg-lightbox-counter');
+    const prevBtn = document.getElementById('mg-lightbox-prev');
+    const nextBtn = document.getElementById('mg-lightbox-next');
+    if (!img) return;
+    img.src = mgLightboxURLs[mgLightboxIdx];
+    const multi = mgLightboxURLs.length > 1;
+    counter.textContent = multi ? `${mgLightboxIdx + 1} / ${mgLightboxURLs.length}` : '';
+    prevBtn.style.display = multi ? '' : 'none';
+    nextBtn.style.display = multi ? '' : 'none';
+}
+
 // ─── Damage / name parsing helpers ────────────────────────────────────────────
 
 // parseMGName splits "[TAG]PlayerName" → { tag, name }. Also handles fuzzy ] (OCR reads ] as l, 1, | or I).
@@ -734,4 +787,46 @@ document.addEventListener('DOMContentLoaded', async () => {
     initSearch();
 
     await Promise.all([loadEvents(), loadMemberStats(), loadMGMembers()]);
+
+    // ── Screenshot lightbox setup ─────────────────────────────────────────────
+    const lb = document.getElementById('mg-lightbox');
+    if (lb) {
+        document.getElementById('mg-lightbox-close')
+            .addEventListener('click', closeMGLightbox);
+        document.getElementById('mg-lightbox-prev')
+            .addEventListener('click', () => mgLbNav(-1));
+        document.getElementById('mg-lightbox-next')
+            .addEventListener('click', () => mgLbNav(1));
+        // Close on backdrop click
+        lb.addEventListener('click', e => {
+            if (e.target === lb) closeMGLightbox();
+        });
+        // Touch swipe (left = next, right = prev)
+        lb.addEventListener('touchstart', e => {
+            mgLbTouchStartX = e.touches[0].clientX;
+        }, { passive: true });
+        lb.addEventListener('touchend', e => {
+            const diff = e.changedTouches[0].clientX - mgLbTouchStartX;
+            if (Math.abs(diff) > 48) mgLbNav(diff > 0 ? -1 : 1);
+        }, { passive: true });
+    }
+
+    // ── Screenshot button click delegation ───────────────────────────────────
+    document.addEventListener('click', e => {
+        const btn = e.target.closest('[data-ev-shots]');
+        if (!btn) return;
+        const evIdx = parseInt(btn.dataset.evShots);
+        if (!isNaN(evIdx) && mgV2Events[evIdx]?.blobURLs?.length) {
+            openMGLightbox(mgV2Events[evIdx].blobURLs, 0);
+        }
+    });
+
+    // ── Lightbox keyboard navigation ─────────────────────────────────────────
+    document.addEventListener('keydown', e => {
+        const lb = document.getElementById('mg-lightbox');
+        if (!lb || lb.style.display === 'none') return;
+        if (e.key === 'Escape')      { e.preventDefault(); closeMGLightbox(); }
+        if (e.key === 'ArrowLeft')   { e.preventDefault(); mgLbNav(-1); }
+        if (e.key === 'ArrowRight')  { e.preventDefault(); mgLbNav(1); }
+    });
 });
