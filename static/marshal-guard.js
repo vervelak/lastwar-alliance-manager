@@ -265,6 +265,9 @@ function renderFilePreview() {
 
 function clearFiles() {
     selectedFiles = [];
+    // Revoke any outstanding blob URLs so the browser can free the image memory.
+    mgV2BlobURLs.forEach(u => URL.revokeObjectURL(u));
+    mgV2BlobURLs = [];
     document.getElementById('mg-image-input').value = '';
     renderFilePreview();
 }
@@ -491,9 +494,8 @@ function buildEventCardHTML(ev, evIdx) {
         // Shows a canvas thumbnail of the row's location in the source image.
         let cropCanvas = '';
         if (!row.damage_ok && row.source_file_idx != null) {
-            const blobURL = ev.blobURLs && ev.blobURLs[row.source_file_idx] != null
-                ? ev.blobURLs[row.source_file_idx]
-                : (ev.blobURLs && ev.blobURLs[0]);
+            // source_file_idx is a global index into mgV2BlobURLs, not into ev.blobURLs
+            const blobURL = mgV2BlobURLs[row.source_file_idx] || (ev.blobURLs && ev.blobURLs[0]);
             if (blobURL && row.crop_y0_pct != null && row.crop_y1_pct != null && row.crop_y1_pct > row.crop_y0_pct) {
                 cropCanvas = `<canvas class="mg-row-crop" aria-hidden="true"
                     data-src="${escapeAttr(blobURL)}"
@@ -658,6 +660,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     document.getElementById('mg-v2-cancel-btn').addEventListener('click', () => {
         document.getElementById('mg-v2-modal').style.display = 'none';
+        // Free browser memory: revoke blob URLs and clear the file list.
+        clearFiles();
     });
 });
 
@@ -871,6 +875,47 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!isNaN(evIdx) && mgV2Events[evIdx]?.blobURLs?.length) {
             openMGLightbox(mgV2Events[evIdx].blobURLs, 0);
         }
+    });
+
+    // ── Crop canvas click — open full screenshot annotated with row highlight ─
+    document.addEventListener('click', e => {
+        const cropCanvas = e.target.closest('canvas.mg-row-crop');
+        if (!cropCanvas) return;
+        const src = cropCanvas.dataset.src;
+        const y0  = parseFloat(cropCanvas.dataset.y0);
+        const y1  = parseFloat(cropCanvas.dataset.y1);
+        if (!src || isNaN(y0) || isNaN(y1) || y1 <= y0) return;
+
+        const img = new Image();
+        img.onload = () => {
+            const w = img.naturalWidth;
+            const h = img.naturalHeight;
+            const off = document.createElement('canvas');
+            off.width  = w;
+            off.height = h;
+            const ctx = off.getContext('2d');
+            // Draw full screenshot
+            ctx.drawImage(img, 0, 0);
+            // Dim rows above and below
+            const ry0 = Math.round(h * y0);
+            const ry1 = Math.round(h * y1);
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            if (ry0 > 0)    ctx.fillRect(0, 0,   w, ry0);
+            if (ry1 < h)    ctx.fillRect(0, ry1,  w, h - ry1);
+            // Orange highlight border around the row
+            ctx.strokeStyle = '#f0a030';
+            ctx.lineWidth   = Math.max(3, Math.round(w / 120));
+            const pad = Math.round(ctx.lineWidth / 2);
+            ctx.strokeRect(pad, ry0 + pad, w - pad * 2, (ry1 - ry0) - pad * 2);
+            off.toBlob(blob => {
+                if (!blob) return;
+                const url = URL.createObjectURL(blob);
+                openMGLightbox([url], 0);
+                setTimeout(() => URL.revokeObjectURL(url), 120000);
+            }, 'image/jpeg', 0.92);
+        };
+        img.onerror = () => { /* silent */ };
+        img.src = src;
     });
 
     // ── Lightbox keyboard navigation ─────────────────────────────────────────
