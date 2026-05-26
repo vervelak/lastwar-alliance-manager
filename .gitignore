@@ -45,6 +45,8 @@ logs/
 # Temporary files
 tmp/
 temp/
+.vs/*
+data/*
 
 # Marshal Guard output
 mg_output/
