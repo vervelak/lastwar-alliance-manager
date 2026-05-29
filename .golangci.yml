@@ -22,12 +22,13 @@ linters:
         - fieldalignment
     staticcheck:
       checks: ["all"]
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
 
 issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
   max-issues-per-linter: 50
   max-same-issues: 5
 

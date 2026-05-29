@@ -996,6 +996,8 @@ func initDB() error {
 		password TEXT NOT NULL,
 		member_id INTEGER,
 		is_admin BOOLEAN DEFAULT 0,
+		active BOOLEAN NOT NULL DEFAULT 1,
+		must_change_password BOOLEAN NOT NULL DEFAULT 0,
 		FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
 	);`
 
