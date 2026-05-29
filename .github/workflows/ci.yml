@@ -36,12 +36,11 @@ jobs:
           fi
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           version: latest
 
       - name: Install gosec
-        # Pin to v2.21.4 — gosec v2.26+ requires Go 1.25; project uses Go 1.23
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
       - name: Run gosec
