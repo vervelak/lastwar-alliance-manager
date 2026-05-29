@@ -3,7 +3,7 @@ const { test, expect } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
 
-const DOWNLOADS = path.join(process.env.USERPROFILE, 'Downloads');
+const DOWNLOADS = path.join(process.env.USERPROFILE || process.env.HOME || '', 'Downloads');
 const IMAGES = [
     'WhatsApp Image 2026-05-14 at 08.20.06.jpeg',
     'WhatsApp Image 2026-05-14 at 08.20.06 (1).jpeg',

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# pre-push hook — mirrors the CI pipeline using Docker.
+# Runs automatically before `git push`. Exit non-zero to abort the push.
+#
+# What it checks (matching .github/workflows/ci.yml):
+#   1. Docker build  — verifies the app compiles (same as CI "Go Build" + "Docker Build")
+#   2. Playwright    — regression tests against the running container (same as CI "Playwright E2E")
+#
+# Requirements: docker, docker compose, node/npm, playwright installed in playwright-tests/
+#
+# To skip in an emergency:  git push --no-verify
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PW_DIR="$REPO_ROOT/playwright-tests"
+CONTAINER_NAME="lastwar-alliance"
+SESSION_KEY="${SESSION_KEY:-ci-test-session-key-at-least-32-bytes-long}"
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+pass() { echo -e "${GREEN}[pre-push] ✓ $*${NC}"; }
+fail() { echo -e "${RED}[pre-push] ✗ $*${NC}"; }
+info() { echo -e "${YELLOW}[pre-push] → $*${NC}"; }
+
+# ── 1. Docker build ───────────────────────────────────────────────────────────
+info "Building Docker image (Go compile check)…"
+cd "$REPO_ROOT"
+if ! docker compose build lastwar; then
+  fail "Docker build failed — fix compile errors before pushing."
+  exit 1
+fi
+pass "Docker build succeeded."
+
+# ── 2. Start container ────────────────────────────────────────────────────────
+info "Starting container…"
+docker compose up -d lastwar
+
+# Wait up to 30 s for the app to be ready
+for i in $(seq 1 30); do
+  if curl -sf http://localhost:8080/api/health >/dev/null 2>&1 || \
+     curl -sf http://localhost:8080/login.html  >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+# Confirm it's actually up
+if ! curl -sf http://localhost:8080/login.html >/dev/null 2>&1; then
+  fail "Container did not become ready within 30 s."
+  docker compose logs --tail=50 lastwar
+  docker compose down
+  exit 1
+fi
+pass "Container is ready."
+
+# ── 3. Playwright regression suite ───────────────────────────────────────────
+info "Running Playwright regression tests…"
+cd "$PW_DIR"
+
+# Ensure dependencies are installed (fast no-op if already done)
+npm ci --silent 2>/dev/null || true
+
+PW_EXIT=0
+npx playwright test \
+  --reporter=list \
+  --project=chromium \
+  --ignore-snapshots \
+  2>&1 || PW_EXIT=$?
+
+# ── 4. Tear down ─────────────────────────────────────────────────────────────
+info "Stopping container…"
+cd "$REPO_ROOT"
+docker compose stop lastwar
+
+if [ "$PW_EXIT" -ne 0 ]; then
+  fail "Playwright tests failed (exit $PW_EXIT). Push aborted."
+  echo -e "${YELLOW}[pre-push] Review the output above or run:${NC}"
+  echo "  cd playwright-tests && npx playwright show-report"
+  echo "  Use 'git push --no-verify' to bypass (not recommended)."
+  exit 1
+fi
+
+pass "All checks passed. Proceeding with push."
+exit 0
