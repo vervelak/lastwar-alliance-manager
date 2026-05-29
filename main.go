@@ -11164,7 +11164,7 @@ func mgDebugInit(img image.Image) {
 		mgDebug = nil
 		return
 	}
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o755) // #nosec G703 -- dir is from MG_DEBUG_DIR env var, not user input
 	mgDebugSeq++
 	mgDebug = &mgDebugContext{
 		dir:    dir,
@@ -12784,18 +12784,18 @@ func processDonationScreenshots(w http.ResponseWriter, r *http.Request) {
 	for _, fh := range files {
 		f, err := fh.Open()
 		if err != nil {
-			log.Printf("donation OCR: open %s: %v", fh.Filename, err)
+			log.Printf("donation OCR: open %q: %v", fh.Filename, err)
 			continue
 		}
 		data, err := io.ReadAll(f)
 		f.Close()
 		if err != nil {
-			log.Printf("donation OCR: read %s: %v", fh.Filename, err)
+			log.Printf("donation OCR: read %q: %v", fh.Filename, err)
 			continue
 		}
 		rows := extractDonationsByRows(data, imgCount)
 		imgCount++
-		log.Printf("donation OCR: %s → %d rows", fh.Filename, len(rows))
+		log.Printf("donation OCR: %q → %d rows", fh.Filename, len(rows))
 		allEntries = append(allEntries, rows...)
 	}
 
@@ -12968,6 +12968,13 @@ func main() {
 	defer db.Close()
 
 	router := mux.NewRouter()
+
+	// Health check (public, no auth required)
+	router.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}).Methods("GET")
 
 	// Auth routes (public)
 	router.HandleFunc("/api/login", login).Methods("POST")

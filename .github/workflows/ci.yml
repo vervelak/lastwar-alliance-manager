@@ -98,10 +98,12 @@ jobs:
             -p 8080:8080 \
             -e SESSION_KEY="ci-test-session-key-at-least-32-bytes-long" \
             lastwar-alliance:ci
-          # Wait for server to be ready
-          for i in $(seq 1 30); do
+          # Wait for server to be ready (uses /api/health which returns 200)
+          for i in $(seq 1 60); do
             curl -sf http://localhost:8080/api/health && break || sleep 1
           done
+          # Fail the step if server is still not reachable, printing container logs
+          curl -sf http://localhost:8080/api/health || (echo "=== Container logs ===" && docker logs lastwar-ci && exit 1)
 
       - uses: actions/setup-node@v6
         with:

@@ -20,11 +20,17 @@ module.exports = async function globalSetup() {
   await page.waitForURL(url => !url.href.includes('login.html'), { timeout: 10000 });
 
   // In a fresh environment the admin account has must_change_password=true, which
-  // blocks all API calls. Call change-password to clear the flag so tests can run.
-  await context.request.post(`${BASE}/api/change-password`, {
-    data: JSON.stringify({ current_password: password, new_password: password }),
-    headers: { 'Content-Type': 'application/json' },
-  }).catch(() => {}); // already cleared on subsequent runs — ignore errors
+  // blocks all API calls. Call change-password via page.evaluate so the request
+  // runs inside the browser with the correct session cookie, then waits for the
+  // Set-Cookie response to be applied before saving storageState.
+  await page.evaluate(async (pwd) => {
+    await fetch('/api/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current_password: pwd, new_password: pwd }),
+      credentials: 'same-origin',
+    });
+  }, password);
 
   // Save cookies and localStorage to reuse in tests
   await context.storageState({ path: AUTH_FILE });
