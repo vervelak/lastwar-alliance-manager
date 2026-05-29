@@ -113,11 +113,14 @@ cd "$PW_DIR"
 npm ci --silent 2>/dev/null || true
 
 # Run all spec files except those that require machine-local assets
-# (mg-ocr.spec.js and vs-ocr.spec.js need screenshot files in ~/Downloads)
+# (mg-ocr.spec.js, vs-ocr.spec.js, mg-ui-review.spec.js need screenshot files
+#  in ~/Downloads; mg-ui-review also triggers heavy 12-image OCR that can OOM
+#  the container and cause cascading failures)
 PW_EXIT=0
 find tests -maxdepth 1 -name '*.spec.js' \
   ! -name 'mg-ocr.spec.js' \
   ! -name 'vs-ocr.spec.js' \
+  ! -name 'mg-ui-review.spec.js' \
   -print0 | \
 xargs -0 npx playwright test \
   --reporter=list \
