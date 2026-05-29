@@ -10462,7 +10462,8 @@ func matchMGParticipant(p *MGOCRParticipant, members []Member) {
 	// Exact name match
 	for _, m := range members {
 		if strings.ToLower(m.Name) == lower {
-			p.MemberID = &m.ID
+			id := m.ID
+			p.MemberID = &id
 			p.MemberName = m.Name
 			return
 		}
@@ -10470,7 +10471,8 @@ func matchMGParticipant(p *MGOCRParticipant, members []Member) {
 	// Nickname match
 	for _, m := range members {
 		if m.Nickname != nil && strings.ToLower(*m.Nickname) == lower {
-			p.MemberID = &m.ID
+			id := m.ID
+			p.MemberID = &id
 			p.MemberName = m.Name
 			return
 		}
@@ -11145,7 +11147,14 @@ func mgDebugInit(img image.Image) {
 		mgDebug = nil
 		return
 	}
-	_ = os.MkdirAll(dir, 0o755)
+	// Sanitise the admin-configured path: resolve to absolute, remove any ".." traversal.
+	dir = filepath.Clean(dir)
+	if !filepath.IsAbs(dir) {
+		log.Printf("mgDebugInit: MG_DEBUG_DIR must be an absolute path, ignoring: %q", dir) // #nosec G706 -- %q escapes all special chars
+		mgDebug = nil
+		return
+	}
+	_ = os.MkdirAll(dir, 0o750) // #nosec G703 -- path is cleaned and validated as absolute above
 	mgDebugSeq++
 	mgDebug = &mgDebugContext{
 		dir:    dir,
@@ -12333,6 +12342,13 @@ func main() {
 	// Serve static files
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./static")))
 
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      requestLoggingMiddleware(router),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 	log.Println("Server starting on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", requestLoggingMiddleware(router)))
+	log.Fatal(srv.ListenAndServe())
 }
