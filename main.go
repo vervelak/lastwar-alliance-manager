@@ -6266,25 +6266,23 @@ func generateConductorMessages(w http.ResponseWriter, r *http.Request) {
 // R4/R5/Admin middleware - checks if user has R4, R5 rank or is admin
 func r4r5Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		session, _ := store.Get(r, "session-name")
-		memberID, ok := session.Values["member_id"].(int)
-		if !ok {
-			http.Error(w, "Not authenticated", http.StatusUnauthorized)
-			return
-		}
+		session, _ := store.Get(r, "session")
 
-		// Check if user is admin
-		var isAdmin bool
-		err := db.QueryRow("SELECT is_admin FROM users WHERE member_id = ?", memberID).Scan(&isAdmin)
-		if err == nil && isAdmin {
+		// Admin bypass — check is_admin first (matches sibling middlewares)
+		if isAdmin, ok := session.Values["is_admin"].(bool); ok && isAdmin {
 			next(w, r)
 			return
 		}
 
-		// Get member rank
+		// Check member rank
+		memberID, ok := session.Values["member_id"].(int)
+		if !ok {
+			http.Error(w, "Access denied - R4, R5 rank or admin privileges required", http.StatusForbidden)
+			return
+		}
+
 		var rank string
-		err = db.QueryRow("SELECT rank FROM members WHERE id = ? AND deleted_at IS NULL", memberID).Scan(&rank)
-		if err != nil {
+		if err := db.QueryRow("SELECT rank FROM members WHERE id = ? AND deleted_at IS NULL", memberID).Scan(&rank); err != nil {
 			http.Error(w, "Member not found", http.StatusNotFound)
 			return
 		}
