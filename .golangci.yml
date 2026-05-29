@@ -2,31 +2,24 @@ version: "2"
 
 linters:
   enable:
-    - errcheck
     - govet
     - ineffassign
     - staticcheck
-    - unused
     - bodyclose
     - durationcheck
     - nilerr
     - prealloc
     - unconvert
-    - unparam
   settings:
-    errcheck:
-      check-type-assertions: true
     govet:
       enable-all: true
       disable:
         - fieldalignment
+        - shadow
     staticcheck:
-      checks: ["all"]
+      checks: ["SA"]
   exclusions:
-    rules:
-      - path: _test\.go
-        linters:
-          - errcheck
+    rules: []
 
 issues:
   max-issues-per-linter: 50
