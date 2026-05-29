@@ -3,6 +3,8 @@ const { defineConfig, devices } = require('@playwright/test');
 
 module.exports = defineConfig({
   testDir: './tests',
+  // Exclude tests that require local Downloads assets not available in CI
+  testIgnore: process.env.CI ? ['**/mg-ocr.spec.js', '**/vs-ocr.spec.js', '**/mg-ui-review.spec.js'] : [],
   fullyParallel: false,
   retries: 0,
   workers: 1,
