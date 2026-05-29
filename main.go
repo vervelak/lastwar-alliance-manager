@@ -6284,7 +6284,7 @@ func generateConductorMessages(w http.ResponseWriter, r *http.Request) {
 // R4/R5/Admin middleware - checks if user has R4, R5 rank or is admin
 func r4r5Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		session, _ := store.Get(r, "session-name")
+		session, _ := store.Get(r, "session")
 		memberID, ok := session.Values["member_id"].(int)
 		if !ok {
 			http.Error(w, "Not authenticated", http.StatusUnauthorized)
