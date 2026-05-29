@@ -4,7 +4,8 @@
 #
 # What it checks (matching .github/workflows/ci.yml):
 #   1. Docker build  — verifies the app compiles (same as CI "Go Build" + "Docker Build")
-#   2. Playwright    — regression tests against the running container (same as CI "Playwright E2E")
+#   2. Lint & security — go vet, gofmt, gosec, govulncheck (same as CI "Go Build & Lint")
+#   3. Playwright    — regression tests against the running container (same as CI "Playwright E2E")
 #
 # Requirements: docker, docker compose, node/npm, playwright installed in playwright-tests/
 #
@@ -32,7 +33,55 @@ if ! docker compose build lastwar; then
 fi
 pass "Docker build succeeded."
 
-# ── 2. Start container ────────────────────────────────────────────────────────
+# ── 2. Go lint & security checks ─────────────────────────────────────────────
+info "Running Go lint and security checks…"
+cd "$REPO_ROOT"
+
+# Reuse the builder stage already in Docker's layer cache from step 1 (fast)
+docker build --target builder -t lastwar-lint:latest . >/dev/null 2>&1 || {
+  fail "Could not prepare lint image."
+  exit 1
+}
+
+LINT_EXIT=0
+MSYS_NO_PATHCONV=1 docker run --rm \
+  -v "${REPO_ROOT}:/app" \
+  -v "lastwar-gotools:/root/go" \
+  -w /app \
+  -e CGO_ENABLED=1 \
+  -e GOPATH=/root/go \
+  lastwar-lint:latest \
+  sh -c '
+    export PATH="$PATH:/root/go/bin"
+
+    printf "[lint] go vet\n"
+    go vet ./...
+
+    printf "[lint] gofmt\n"
+    unformatted=$(gofmt -l .)
+    if [ -n "$unformatted" ]; then
+      echo "Files not gofmt-formatted:"
+      echo "$unformatted"
+      exit 1
+    fi
+
+    printf "[lint] gosec\n"
+    command -v gosec >/dev/null 2>&1 || go install github.com/securego/gosec/v2/cmd/gosec@latest
+    gosec ./...
+
+    printf "[lint] govulncheck\n"
+    command -v govulncheck >/dev/null 2>&1 || go install golang.org/x/vuln/cmd/govulncheck@latest
+    govulncheck ./...
+  ' || LINT_EXIT=$?
+
+if [ "$LINT_EXIT" -ne 0 ]; then
+  fail "Lint/security checks failed (exit $LINT_EXIT). Push aborted."
+  echo -e "${YELLOW}[pre-push] Fix the issues above, or use 'git push --no-verify' to bypass.${NC}"
+  exit 1
+fi
+pass "Lint and security checks passed."
+
+# ── 3. Start container ────────────────────────────────────────────────────────
 info "Starting container…"
 docker compose up -d lastwar
 
@@ -54,7 +103,7 @@ if ! curl -sf http://localhost:8080/login.html >/dev/null 2>&1; then
 fi
 pass "Container is ready."
 
-# ── 3. Playwright regression suite ───────────────────────────────────────────
+# ── 4. Playwright regression suite ───────────────────────────────────────────
 info "Running Playwright regression tests…"
 cd "$PW_DIR"
 
@@ -74,7 +123,7 @@ xargs -0 npx playwright test \
   --ignore-snapshots \
   2>&1 || PW_EXIT=$?
 
-# ── 4. Tear down ─────────────────────────────────────────────────────────────
+# ── 5. Tear down ─────────────────────────────────────────────────────────────
 info "Stopping container…"
 cd "$REPO_ROOT"
 docker compose stop lastwar
