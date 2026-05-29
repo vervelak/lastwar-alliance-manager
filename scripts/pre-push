@@ -115,7 +115,7 @@ npm ci --silent 2>/dev/null || true
 # Run all spec files except those that require machine-local assets
 # (mg-ocr.spec.js and vs-ocr.spec.js need screenshot files in ~/Downloads)
 PW_EXIT=0
-find "$PW_DIR/tests" -maxdepth 1 -name '*.spec.js' \
+find tests -maxdepth 1 -name '*.spec.js' \
   ! -name 'mg-ocr.spec.js' \
   ! -name 'vs-ocr.spec.js' \
   -print0 | \
