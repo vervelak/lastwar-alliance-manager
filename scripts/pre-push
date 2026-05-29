@@ -61,13 +61,17 @@ cd "$PW_DIR"
 # Ensure dependencies are installed (fast no-op if already done)
 npm ci --silent 2>/dev/null || true
 
+# Run all spec files except those that require machine-local assets
+# (mg-ocr.spec.js and vs-ocr.spec.js need screenshot files in ~/Downloads)
 PW_EXIT=0
-npx playwright test \
+find "$PW_DIR/tests" -maxdepth 1 -name '*.spec.js' \
+  ! -name 'mg-ocr.spec.js' \
+  ! -name 'vs-ocr.spec.js' \
+  -print0 | \
+xargs -0 npx playwright test \
   --reporter=list \
   --project=chromium \
   --ignore-snapshots \
-  --ignore-glob "tests/mg-ocr.spec.js" \
-  --ignore-glob "tests/vs-ocr.spec.js" \
   2>&1 || PW_EXIT=$?
 
 # ── 4. Tear down ─────────────────────────────────────────────────────────────
