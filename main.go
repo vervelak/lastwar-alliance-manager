@@ -1605,6 +1605,35 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 		log.Println("Database migration: Added alliance_short_name column to settings table")
 	}
 
+	// Migrate users table to add must_change_password column
+	var mustChangePwdExists bool
+	err = db.QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'must_change_password'`).Scan(&mustChangePwdExists)
+	if err != nil {
+		return err
+	}
+	if !mustChangePwdExists {
+		_, err = db.Exec(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0`)
+		if err != nil {
+			return err
+		}
+		// Flag existing admin accounts that still have the default password
+		rows, qErr := db.Query(`SELECT id, password FROM users WHERE username = 'admin' AND is_admin = 1`)
+		if qErr == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var uid int
+				var hash string
+				if rows.Scan(&uid, &hash) == nil {
+					if bcrypt.CompareHashAndPassword([]byte(hash), []byte("admin123")) == nil {
+						db.Exec(`UPDATE users SET must_change_password = 1 WHERE id = ?`, uid)
+						log.Println("Flagged default admin account for mandatory password change")
+					}
+				}
+			}
+		}
+		log.Println("Database migration: Added must_change_password column to users table")
+	}
+
 	// Create default admin user if no users exist
 	var userCount int
 	err = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&userCount)
@@ -1665,35 +1694,6 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 			return err
 		}
 		log.Println("Database migration: Added active column to users table")
-	}
-
-	// Migrate users table to add must_change_password column
-	var mustChangePwdExists bool
-	err = db.QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'must_change_password'`).Scan(&mustChangePwdExists)
-	if err != nil {
-		return err
-	}
-	if !mustChangePwdExists {
-		_, err = db.Exec(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0`)
-		if err != nil {
-			return err
-		}
-		// Flag existing admin accounts that still have the default password
-		rows, qErr := db.Query(`SELECT id, password FROM users WHERE username = 'admin' AND is_admin = 1`)
-		if qErr == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var uid int
-				var hash string
-				if rows.Scan(&uid, &hash) == nil {
-					if bcrypt.CompareHashAndPassword([]byte(hash), []byte("admin123")) == nil {
-						db.Exec(`UPDATE users SET must_change_password = 1 WHERE id = ?`, uid)
-						log.Println("Flagged default admin account for mandatory password change")
-					}
-				}
-			}
-		}
-		log.Println("Database migration: Added must_change_password column to users table")
 	}
 
 	// Migrate train_schedules to add name snapshot columns (preserved even after member is deleted)
