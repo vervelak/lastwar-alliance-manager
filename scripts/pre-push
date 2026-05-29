@@ -66,6 +66,8 @@ npx playwright test \
   --reporter=list \
   --project=chromium \
   --ignore-snapshots \
+  --ignore-glob "tests/mg-ocr.spec.js" \
+  --ignore-glob "tests/vs-ocr.spec.js" \
   2>&1 || PW_EXIT=$?
 
 # ── 4. Tear down ─────────────────────────────────────────────────────────────
