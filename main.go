@@ -12784,18 +12784,18 @@ func processDonationScreenshots(w http.ResponseWriter, r *http.Request) {
 	for _, fh := range files {
 		f, err := fh.Open()
 		if err != nil {
-			log.Printf("donation OCR: open %q: %v", fh.Filename, err)
+			log.Printf("donation OCR: open %q: %v", fh.Filename, err) // #nosec G706 -- %q prevents log injection
 			continue
 		}
 		data, err := io.ReadAll(f)
 		f.Close()
 		if err != nil {
-			log.Printf("donation OCR: read %q: %v", fh.Filename, err)
+			log.Printf("donation OCR: read %q: %v", fh.Filename, err) // #nosec G706 -- %q prevents log injection
 			continue
 		}
 		rows := extractDonationsByRows(data, imgCount)
 		imgCount++
-		log.Printf("donation OCR: %q → %d rows", fh.Filename, len(rows))
+		log.Printf("donation OCR: %q → %d rows", fh.Filename, len(rows)) // #nosec G706 -- %q prevents log injection
 		allEntries = append(allEntries, rows...)
 	}
 
