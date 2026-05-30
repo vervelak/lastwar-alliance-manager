@@ -23,7 +23,8 @@ FROM alpine:3.23
 #   ca-certificates  - HTTPS support
 #   tesseract-ocr    - Tesseract OCR engine (required by gosseract)
 #   tesseract-ocr-data-eng - English language data for OCR
-RUN apk add --no-cache ca-certificates tesseract-ocr tesseract-ocr-data-eng
+#   tesseract-ocr-data-deu - German language data for OCR
+RUN apk add --no-cache ca-certificates tesseract-ocr tesseract-ocr-data-eng tesseract-ocr-data-deu
 
 WORKDIR /app
 
