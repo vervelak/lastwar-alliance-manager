@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/gorilla/mux v1.8.1
-	github.com/gorilla/sessions v1.2.2
+	github.com/gorilla/sessions v1.4.0
 	github.com/otiai10/gosseract/v2 v2.4.1
 	golang.org/x/crypto v0.17.0
 	modernc.org/sqlite v1.28.0
