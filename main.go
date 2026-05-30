@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/csv"
@@ -333,6 +334,41 @@ type VSPointsWithMember struct {
 	MemberRank string `json:"member_rank"`
 }
 
+// VSOCRRecord is the richer OCR result type returned by the row-segmented OCR
+// pipeline. Confidence is "high" when no adjustments were made, "review" when
+// heuristics changed the read. Notes records the reasons for any adjustments.
+type VSOCRRecord struct {
+	MemberName      string   `json:"member_name"`
+	Points          int64    `json:"points"`
+	Confidence      string   `json:"confidence,omitempty"`
+	Notes           []string `json:"notes,omitempty"`
+	RawPoints       string   `json:"raw_points,omitempty"`
+	PointCandidates []int64  `json:"point_candidates,omitempty"`
+}
+
+// vsRowOCRResult holds the intermediate per-row OCR result before finalisation.
+type vsRowOCRResult struct {
+	MemberName string
+	Points     int64
+	RawPoints  string
+	Candidates []vsPointsCandidate
+	Notes      []string
+}
+
+// vsPointsCandidate is a single OCR reading from one preprocessing variant.
+type vsPointsCandidate struct {
+	Value int64
+	Raw   string
+	Votes int
+	Score int
+}
+
+// tesseractTextCacheEntry is the value stored in tesseractTextCache.
+type tesseractTextCacheEntry struct {
+	Text string
+	OK   bool
+}
+
 var db *sql.DB
 var store *sessions.CookieStore
 var logger *slog.Logger
@@ -472,6 +508,13 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // loginRateLimiter tracks failed login attempts per IP to prevent brute force attacks.
@@ -7964,10 +8007,7 @@ func detectDayFromTabRegion(imageData []byte) string {
 }
 
 // Extract VS points data from image and detect which day
-func extractVSPointsDataFromImage(imageData []byte) (day string, records []struct {
-	MemberName string `json:"member_name"`
-	Points     int64  `json:"points"`
-}, error error) {
+func extractVSPointsDataFromImage(imageData []byte) (day string, records []VSOCRRecord, error error) {
 	// First try to detect the day from the tab region specifically
 	detectedDay := detectDayFromTabRegion(imageData)
 
@@ -7989,18 +8029,23 @@ func extractVSPointsDataFromImage(imageData []byte) (day string, records []struc
 	log.Printf("Attempting row-by-row segmented OCR...")
 	records, err = extractVSPointsByRows(img, attrs)
 
-	// Validate row-based results: reject if any name contains a newline or a
-	// known UI label (header row leaked in, alliance text, etc.)
+	// Validate row-based results: reject if any name contains a newline, a known
+	// UI label, or a points value outside the plausible range.
 	rowResultsValid := err == nil && len(records) >= 3
 	if rowResultsValid {
 		for _, r := range records {
 			if strings.ContainsRune(r.MemberName, '\n') || strings.ContainsRune(r.MemberName, '\r') {
-				log.Printf("Row OCR quality check: name %q contains newline — discarding row results", r.MemberName)
+				log.Printf("Row OCR quality check: name %q contains newline - discarding row results", r.MemberName)
 				rowResultsValid = false
 				break
 			}
 			if isVSUILabel(r.MemberName) {
-				log.Printf("Row OCR quality check: name %q matches UI label — discarding row results", r.MemberName)
+				log.Printf("Row OCR quality check: name %q matches UI/header text - discarding row results", r.MemberName)
+				rowResultsValid = false
+				break
+			}
+			if r.Points < 10000 || r.Points > 999999999 {
+				log.Printf("Row OCR quality check: points %d for %q outside expected range - discarding row results", r.Points, r.MemberName)
 				rowResultsValid = false
 				break
 			}
@@ -8009,36 +8054,21 @@ func extractVSPointsDataFromImage(imageData []byte) (day string, records []struc
 
 	if !rowResultsValid {
 		log.Printf("Segmented OCR failed or produced invalid results (%v), falling back to full image OCR", err)
-		// Fallback to original full-image OCR approach
 		records, err = extractVSPointsFullImage(imageData, attrs)
 		if err != nil {
 			return detectedDay, nil, err
 		}
+	} else if len(records) < 5 {
+		log.Printf("Segmented OCR produced only %d records; trying full-image OCR to supplement missing rows", len(records))
+		if supplemental, fullErr := extractVSPointsFullImage(imageData, attrs); fullErr == nil {
+			records = mergeVSRecordsByName(records, supplemental)
+		} else {
+			log.Printf("Supplemental full-image OCR failed: %v", fullErr)
+		}
 	}
 
-	// If we didn't detect day from tab region, try text-based detection as fallback
 	if detectedDay == "" {
-		// Use current system day as last resort
-		now := getServerTime()
-		weekday := now.Weekday()
-		switch weekday {
-		case time.Monday:
-			detectedDay = "monday"
-		case time.Tuesday:
-			detectedDay = "tuesday"
-		case time.Wednesday:
-			detectedDay = "wednesday"
-		case time.Thursday:
-			detectedDay = "thursday"
-		case time.Friday:
-			detectedDay = "friday"
-		case time.Saturday:
-			detectedDay = "saturday"
-		default:
-			// Sunday - default to Monday
-			detectedDay = "monday"
-		}
-		log.Printf("Warning: Could not detect day from screenshot, using current system day: %s", detectedDay)
+		return "", nil, fmt.Errorf("could not detect selected VS day from screenshot; please specify the day manually")
 	}
 
 	if len(records) == 0 {
@@ -8048,29 +8078,763 @@ func extractVSPointsDataFromImage(imageData []byte) (day string, records []struc
 	return detectedDay, records, nil
 }
 
+// encodePNGBytes encodes an image to PNG bytes.
+func encodePNGBytes(img image.Image) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// saveVSOCRDebugCrop writes a row crop to disk when VS_OCR_SAVE_CROPS env var is set.
+func saveVSOCRDebugCrop(kind string, row int, img image.Image) {
+	if os.Getenv("VS_OCR_SAVE_CROPS") == "" {
+		return
+	}
+	dir := filepath.Join("data", "ocr-debug")
+	if err := os.MkdirAll(dir, 0755); err != nil { // #nosec G301
+		log.Printf("VS OCR debug: mkdir failed: %v", err)
+		return
+	}
+	path := filepath.Join(dir, fmt.Sprintf("vs_%02d_%s.png", row, kind))
+	data, err := encodePNGBytes(img)
+	if err != nil {
+		log.Printf("VS OCR debug: encode %s failed: %v", kind, err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		log.Printf("VS OCR debug: write %s failed: %v", path, err)
+	}
+}
+
+// getVSDataRegion adjusts the generic DataRegion to skip the day-tab row at
+// the top of VS Daily Rank screenshots so the header row does not leak into
+// row OCR.
+func getVSDataRegion(attrs *ScreenshotAttributes) *ImageRegion {
+	if attrs == nil || attrs.DataRegion == nil {
+		return nil
+	}
+	region := *attrs.DataRegion
+	top := int(float64(attrs.Height) * 0.215)
+	bottom := int(float64(attrs.Height) * 0.855)
+	if top > region.Top {
+		region.Top = top
+	}
+	if bottom < region.Bottom {
+		region.Bottom = bottom
+	}
+	if region.Bottom-region.Top < 120 {
+		region = *attrs.DataRegion
+	}
+	region.Name = "VSDataRows"
+	return &region
+}
+
+// findVSRowBoundaries detects ranking-card row boundaries using colour-saturation
+// scanning (pass 1) and Sobel edge density (pass 2) before falling back to
+// findRowBoundaries.
+func findVSRowBoundaries(img image.Image, gray *image.Gray, region *ImageRegion, minRowH int) [][2]int {
+	b := gray.Bounds()
+	top := region.Top
+	bottom := region.Bottom
+	if top < b.Min.Y {
+		top = b.Min.Y
+	}
+	if bottom > b.Max.Y {
+		bottom = b.Max.Y
+	}
+	if bottom-top < minRowH {
+		return [][2]int{{top, bottom}}
+	}
+
+	x0 := region.Left + (region.Right-region.Left)*3/100
+	x1 := region.Left + (region.Right-region.Left)*96/100
+	if x0 < b.Min.X {
+		x0 = b.Min.X
+	}
+	if x1 > b.Max.X {
+		x1 = b.Max.X
+	}
+	if x1 <= x0 {
+		return findRowBoundaries(gray, top, bottom, minRowH)
+	}
+
+	// Pass 1: look for tinted card bands.
+	cardRows := make([]bool, bottom-top)
+	for y := top; y < bottom; y++ {
+		cardPixels := 0
+		sampled := 0
+		for x := x0; x < x1; x += 5 {
+			r, g, bl, _ := img.At(x, y).RGBA()
+			r8, g8, b8 := int(r>>8), int(g>>8), int(bl>>8)
+			maxC := max(r8, max(g8, b8))
+			minC := min(r8, min(g8, b8))
+			brightness := (r8 + g8 + b8) / 3
+			if brightness >= 125 && brightness <= 238 && maxC-minC >= 14 {
+				cardPixels++
+			}
+			sampled++
+		}
+		cardRows[y-top] = sampled > 0 && cardPixels >= sampled*42/100
+	}
+
+	var filledRows [][2]int
+	inBand := false
+	bandStart := 0
+	gap := 0
+	for i, active := range cardRows {
+		y := top + i
+		if active {
+			if !inBand {
+				inBand = true
+				bandStart = y
+			}
+			gap = 0
+			continue
+		}
+		if inBand {
+			gap++
+			if gap > 4 {
+				bandEnd := y - gap + 1
+				h := bandEnd - bandStart
+				if h >= minRowH*2 && h <= minRowH*5 {
+					filledRows = append(filledRows, [2]int{bandStart, bandEnd})
+				}
+				inBand = false
+				gap = 0
+			}
+		}
+	}
+	if inBand {
+		bandEnd := bottom
+		h := bandEnd - bandStart
+		if h >= minRowH*2 && h <= minRowH*5 {
+			filledRows = append(filledRows, [2]int{bandStart, bandEnd})
+		}
+	}
+	if len(filledRows) >= 3 {
+		return filledRows
+	}
+
+	// Pass 2: Sobel edge density to find row separators.
+	scores := make([]int, bottom-top)
+	maxScore := 0
+	for y := top + 1; y < bottom-1; y++ {
+		score := 0
+		for x := x0; x < x1; x++ {
+			prev := int(gray.GrayAt(x, y-1).Y)
+			cur := int(gray.GrayAt(x, y).Y)
+			if prev-cur < 0 {
+				if cur-prev > 18 {
+					score++
+				}
+			} else if prev-cur > 18 {
+				score++
+			}
+		}
+		scores[y-top] = score
+		if score > maxScore {
+			maxScore = score
+		}
+	}
+
+	lineThreshold := max((x1-x0)*22/100, maxScore*45/100)
+	if lineThreshold < 45 {
+		lineThreshold = 45
+	}
+
+	type lineGroup struct{ start, end int }
+	var groups []lineGroup
+	inGroup := false
+	groupStart := 0
+	quiet := 0
+	for i, score := range scores {
+		y := top + i
+		if score >= lineThreshold {
+			if !inGroup {
+				inGroup = true
+				groupStart = y
+			}
+			quiet = 0
+			continue
+		}
+		if inGroup {
+			quiet++
+			if quiet > 2 {
+				groups = append(groups, lineGroup{start: groupStart, end: y - quiet + 1})
+				inGroup = false
+				quiet = 0
+			}
+		}
+	}
+	if inGroup {
+		groups = append(groups, lineGroup{start: groupStart, end: bottom})
+	}
+
+	var rows [][2]int
+	for i := 0; i+1 < len(groups); i++ {
+		rowTop2 := groups[i].start
+		rowBottom2 := groups[i+1].end + 1
+		rowH2 := rowBottom2 - rowTop2
+		if rowH2 < minRowH || rowH2 > minRowH*6 {
+			continue
+		}
+		midY := rowTop2 + rowH2/2
+		colored := 0
+		sampled := 0
+		for x := x0; x < x1; x += 4 {
+			r, g, bl, _ := img.At(x, midY).RGBA()
+			r8, g8, b8 := int(r>>8), int(g>>8), int(bl>>8)
+			maxC := max(r8, max(g8, b8))
+			minC := min(r8, min(g8, b8))
+			if maxC < 245 && (maxC-minC > 10 || maxC < 225) {
+				colored++
+			}
+			sampled++
+		}
+		if sampled == 0 || colored < sampled*45/100 {
+			continue
+		}
+		if len(rows) > 0 && rowTop2-rows[len(rows)-1][1] < minRowH/2 {
+			continue
+		}
+		rows = append(rows, [2]int{rowTop2, rowBottom2})
+	}
+
+	if len(rows) >= 3 {
+		return rows
+	}
+	return findRowBoundaries(gray, top, bottom, minRowH)
+}
+
+// findVSPointsColumnStart detects the left edge of the digit cluster in a row
+// by scanning the right half of the image for edge and dark-pixel activity.
+func findVSPointsColumnStart(gray *image.Gray, rowTop, rowBottom, imgW int) int {
+	b := gray.Bounds()
+	if rowTop < b.Min.Y {
+		rowTop = b.Min.Y
+	}
+	if rowBottom > b.Max.Y {
+		rowBottom = b.Max.Y
+	}
+	if rowBottom <= rowTop {
+		return imgW * 70 / 100
+	}
+
+	y0 := rowTop + (rowBottom-rowTop)*25/100
+	y1 := rowTop + (rowBottom-rowTop)*72/100
+	x0 := imgW * 55 / 100
+	x1 := imgW * 97 / 100
+	if x0 < b.Min.X {
+		x0 = b.Min.X
+	}
+	if x1 > b.Max.X {
+		x1 = b.Max.X
+	}
+
+	active := make([]bool, x1-x0)
+	for x := x0; x < x1; x++ {
+		edgeHits := 0
+		darkHits := 0
+		for y := y0; y < y1; y++ {
+			if sobelMagnitude(gray, x, y) > 28 {
+				edgeHits++
+			}
+			if gray.GrayAt(x, y).Y < 120 {
+				darkHits++
+			}
+		}
+		active[x-x0] = edgeHits >= 2 || darkHits >= 2
+	}
+
+	type segment struct{ start, end int }
+	var segments []segment
+	inSeg := false
+	start := 0
+	gap := 0
+	for i, on := range active {
+		if on {
+			if !inSeg {
+				inSeg = true
+				start = i
+			}
+			gap = 0
+			continue
+		}
+		if inSeg {
+			gap++
+			if gap > 4 {
+				end := i - gap + 1
+				if end-start >= 8 {
+					segments = append(segments, segment{x0 + start, x0 + end})
+				}
+				inSeg = false
+				gap = 0
+			}
+		}
+	}
+	if inSeg {
+		end := len(active) - gap
+		if end-start >= 8 {
+			segments = append(segments, segment{x0 + start, x0 + end})
+		}
+	}
+
+	for i := len(segments) - 1; i >= 0; i-- {
+		seg := segments[i]
+		if seg.end-seg.start >= imgW*3/100 {
+			startX := seg.start - imgW*2/100
+			minStart := imgW * 60 / 100
+			if startX < minStart {
+				startX = minStart
+			}
+			return startX
+		}
+	}
+
+	return imgW * 70 / 100
+}
+
+// tesseractTextCache caches Tesseract OCR results keyed by image-content hash.
+// Identical crops (e.g. reprocessed header) hit the cache instead of re-running OCR.
+var tesseractTextCache sync.Map // key: string → tesseractTextCacheEntry
+
+func tesseractCacheKey(data []byte, mode gosseract.PageSegMode, whitelist string) string {
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%d|%s|%x", mode, whitelist, sum)
+}
+
+// cachedTesseractText runs Tesseract and caches the result by content hash.
+func cachedTesseractText(client *gosseract.Client, data []byte, mode gosseract.PageSegMode, whitelist string) (string, error) {
+	key := tesseractCacheKey(data, mode, whitelist)
+	if cached, ok := tesseractTextCache.Load(key); ok {
+		entry := cached.(tesseractTextCacheEntry)
+		if !entry.OK {
+			return "", nil
+		}
+		return entry.Text, nil
+	}
+	if err := client.SetImageFromBytes(data); err != nil {
+		return "", err
+	}
+	if whitelist != "" {
+		client.SetVariable("tessedit_char_whitelist", whitelist)
+	}
+	client.SetPageSegMode(mode)
+	text, err := client.Text()
+	if err != nil {
+		return "", err
+	}
+	text = strings.TrimSpace(text)
+	tesseractTextCache.Store(key, tesseractTextCacheEntry{Text: text, OK: text != ""})
+	return text, nil
+}
+
+// preprocessVSPointsVariants returns multiple preprocessing variants of the
+// points crop for multi-vote OCR.
+func preprocessVSPointsVariants(img image.Image) []image.Image {
+	scaled := scaleImage(img, 4)
+	gray := convertToGrayscale(scaled)
+	enhanced := enhanceContrast(gray)
+	thresholded := applyAdaptiveThreshold(enhanced, 25)
+	inverted := invertImage(thresholded)
+	return []image.Image{gray, enhanced, thresholded, inverted}
+}
+
+// ocrVSPointsValue runs Tesseract on multiple preprocessing variants of the
+// points crop and selects the winning value by vote count + digit-length score.
+// Returns (value, raw, candidates, ok).
+func ocrVSPointsValue(img image.Image) (int64, string, []vsPointsCandidate, bool) {
+	var best vsPointsCandidate
+	seen := map[int64]int{}
+	rawByValue := map[int64]string{}
+	scoreByValue := map[int64]int{}
+	nonDigitRe := regexp.MustCompile(`[^0-9]`)
+	modes := []gosseract.PageSegMode{gosseract.PSM_SINGLE_LINE, gosseract.PSM_SINGLE_WORD, gosseract.PSM_SINGLE_BLOCK}
+	client := gosseract.NewClient()
+	defer client.Close()
+
+	for _, variant := range preprocessVSPointsVariants(img) {
+		data, err := encodePNGBytes(variant)
+		if err != nil {
+			continue
+		}
+		for _, mode := range modes {
+			raw, err := cachedTesseractText(client, data, mode, "0123456789,.")
+			if err != nil || raw == "" {
+				continue
+			}
+			pointsStr := nonDigitRe.ReplaceAllString(raw, "")
+			if pointsStr == "" {
+				continue
+			}
+			value, err := strconv.ParseInt(pointsStr, 10, 64)
+			if err != nil || value < 1000 || value > 999999999 {
+				continue
+			}
+			score := len(pointsStr)
+			if strings.Contains(raw, ".") || strings.Contains(raw, ",") {
+				score += 2
+			}
+			seen[value]++
+			rawByValue[value] = raw
+			scoreByValue[value] += score
+			totalScore := scoreByValue[value] + seen[value]*3
+			if totalScore > best.Score {
+				best = vsPointsCandidate{Value: value, Raw: raw, Votes: seen[value], Score: totalScore}
+			}
+		}
+	}
+
+	if best.Value == 0 {
+		return 0, "", nil, false
+	}
+
+	candidateList := make([]vsPointsCandidate, 0, len(seen))
+	for value, votes := range seen {
+		candidateList = append(candidateList, vsPointsCandidate{
+			Value: value,
+			Raw:   rawByValue[value],
+			Votes: votes,
+			Score: scoreByValue[value] + votes*3,
+		})
+	}
+	sort.Slice(candidateList, func(i, j int) bool {
+		if candidateList[i].Votes == candidateList[j].Votes {
+			return candidateList[i].Value > candidateList[j].Value
+		}
+		return candidateList[i].Votes > candidateList[j].Votes
+	})
+
+	if len(seen) > 1 {
+		candidates := make([]int64, 0, len(seen))
+		totalVotes := 0
+		weightedSum := int64(0)
+		for value, votes := range seen {
+			candidates = append(candidates, value)
+			totalVotes += votes
+			weightedSum += value * int64(votes)
+		}
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
+
+		minValue := candidates[0]
+		maxValue := candidates[len(candidates)-1]
+		sameDigitCount := true
+		digits := len(strconv.FormatInt(candidates[0], 10))
+		for _, value := range candidates[1:] {
+			if len(strconv.FormatInt(value, 10)) != digits {
+				sameDigitCount = false
+				break
+			}
+		}
+		// If variants disagree only on one nearby digit and there is no clear winner,
+		// pick the candidate nearest the weighted centre.
+		if sameDigitCount && maxValue-minValue <= 10000 && seen[best.Value]*2 <= totalVotes {
+			center := weightedSum / int64(totalVotes)
+			smoothed := best.Value
+			bestDistance := absInt64(best.Value - center)
+			for _, value := range candidates {
+				distance := absInt64(value - center)
+				if distance < bestDistance {
+					smoothed = value
+					bestDistance = distance
+				}
+			}
+			if smoothed != best.Value {
+				log.Printf("VS points OCR smoothed ambiguous candidates: selected %d instead of %d", smoothed, best.Value)
+				best.Value = smoothed
+				best.Raw = fmt.Sprintf("%d", smoothed)
+			}
+		}
+	}
+	if os.Getenv("VS_OCR_DEBUG") != "" && len(seen) > 1 {
+		parts := make([]string, 0, len(candidateList))
+		for _, c := range candidateList {
+			parts = append(parts, fmt.Sprintf("%d(x%d)", c.Value, c.Votes))
+		}
+		log.Printf("VS points OCR candidates: %s; selected %d from %q", strings.Join(parts, ", "), best.Value, best.Raw)
+	}
+	return best.Value, best.Raw, candidateList, true
+}
+
+// adjustVSPointsByOrder applies descending-ranking heuristics to pick the best
+// candidate when the primary read seems off relative to the previous row.
+func adjustVSPointsByOrder(points int64, raw string, candidates []vsPointsCandidate, previousPoints int64) (int64, string) {
+	if len(candidates) == 0 {
+		return points, raw
+	}
+	selected := points
+	selectedRaw := raw
+	choose := func(c vsPointsCandidate, reason string) {
+		if c.Value != selected {
+			log.Printf("VS points OCR order adjustment: selected %d instead of %d (%s)", c.Value, selected, reason)
+			selected = c.Value
+			selectedRaw = c.Raw
+		}
+	}
+
+	if selected < 1000000 {
+		var bestLarge *vsPointsCandidate
+		for i := range candidates {
+			c := &candidates[i]
+			if c.Value < 1000000 {
+				continue
+			}
+			if previousPoints > 0 && c.Value > previousPoints*105/100 {
+				continue
+			}
+			if bestLarge == nil || c.Score > bestLarge.Score {
+				bestLarge = c
+			}
+		}
+		if bestLarge != nil {
+			choose(*bestLarge, "tiny selected value had million-scale alternative")
+		}
+	}
+
+	if previousPoints > 0 && selected > previousPoints*105/100 {
+		var bestBelow *vsPointsCandidate
+		for i := range candidates {
+			c := &candidates[i]
+			if c.Value > previousPoints*105/100 {
+				continue
+			}
+			if c.Value < 1000 {
+				continue
+			}
+			if bestBelow == nil || c.Score > bestBelow.Score {
+				bestBelow = c
+			}
+		}
+		if bestBelow != nil {
+			choose(*bestBelow, "would increase within descending ranking")
+		}
+	}
+
+	if previousPoints > 0 && selected < previousPoints*60/100 {
+		var bestNearPrevious *vsPointsCandidate
+		for i := range candidates {
+			c := &candidates[i]
+			if c.Value <= selected {
+				continue
+			}
+			if c.Value > previousPoints*105/100 {
+				continue
+			}
+			if c.Value < previousPoints*60/100 {
+				continue
+			}
+			if bestNearPrevious == nil || c.Score > bestNearPrevious.Score {
+				bestNearPrevious = c
+			}
+		}
+		if bestNearPrevious != nil {
+			choose(*bestNearPrevious, "large drop had plausible higher alternative")
+		}
+	}
+
+	return selected, selectedRaw
+}
+
+func vsCandidateValues(candidates []vsPointsCandidate) []int64 {
+	values := make([]int64, 0, len(candidates))
+	seen := map[int64]bool{}
+	for _, c := range candidates {
+		if c.Value == 0 || seen[c.Value] {
+			continue
+		}
+		values = append(values, c.Value)
+		seen[c.Value] = true
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] > values[j] })
+	return values
+}
+
+// bestVSPointCandidate uses global context (previous and next accepted row) to
+// select a better candidate when the primary read is suspect.
+func bestVSPointCandidate(candidates []vsPointsCandidate, selected, previous, next int64) (vsPointsCandidate, bool, string) {
+	if len(candidates) == 0 {
+		return vsPointsCandidate{}, false, ""
+	}
+	sentinel := math.MinInt32
+	selectedScore := sentinel
+	best := vsPointsCandidate{}
+	bestScore := sentinel
+
+	scoreCandidate := func(c vsPointsCandidate) int {
+		score := c.Score
+		if c.Value == selected {
+			score += 8
+		}
+		if previous > 0 {
+			if c.Value <= previous*105/100 {
+				score += 5
+			} else {
+				score -= 20
+			}
+			if selected < previous && c.Value < previous {
+				selectedGap := previous - selected
+				candidateGap := previous - c.Value
+				if candidateGap >= 0 && candidateGap < selectedGap/2 && c.Value >= selected*98/100 {
+					score += 10
+				}
+			}
+		}
+		if next > 0 {
+			if c.Value >= next*95/100 {
+				score += 5
+			} else {
+				score -= 8
+			}
+			if previous > 0 && c.Value <= previous*105/100 && c.Value >= next*85/100 {
+				score += 5
+			}
+		}
+		return score
+	}
+
+	for _, c := range candidates {
+		if selected >= 1000000 && c.Value < 1000000 {
+			continue
+		}
+		score := scoreCandidate(c)
+		if c.Value == selected {
+			selectedScore = score
+		}
+		if score > bestScore || (score == bestScore && c.Value == selected) {
+			best = c
+			bestScore = score
+		}
+	}
+
+	if selectedScore == sentinel {
+		selectedScore = 0
+	}
+	if best.Value == 0 || best.Value == selected || bestScore < selectedScore+7 {
+		return vsPointsCandidate{}, false, ""
+	}
+
+	reason := "global candidate reconciliation"
+	if previous > 0 && best.Value < previous && selected < previous && previous-best.Value < (previous-selected)/2 {
+		reason = "closer to previous ranking row"
+	}
+	return best, true, reason
+}
+
+// reconcileVSPointCandidates makes a global pass over all rows, using
+// previous and next accepted values to pick a better candidate for each row.
+func reconcileVSPointCandidates(rows []vsRowOCRResult) []vsRowOCRResult {
+	for i := range rows {
+		var previous, next int64
+		if i > 0 {
+			previous = rows[i-1].Points
+		}
+		if i+1 < len(rows) {
+			next = rows[i+1].Points
+		}
+		if best, ok, reason := bestVSPointCandidate(rows[i].Candidates, rows[i].Points, previous, next); ok {
+			log.Printf("VS points OCR global adjustment: row %q selected %d instead of %d (%s)",
+				rows[i].MemberName, best.Value, rows[i].Points, reason)
+			rows[i].Points = best.Value
+			rows[i].RawPoints = best.Raw
+			rows[i].Notes = append(rows[i].Notes, "points adjusted: "+reason)
+		}
+	}
+	return rows
+}
+
+// finalizeVSOCRRecords converts the internal vsRowOCRResult list to VSOCRRecord,
+// setting confidence to "review" when any adjustment notes exist.
+func finalizeVSOCRRecords(rows []vsRowOCRResult) []VSOCRRecord {
+	records := make([]VSOCRRecord, 0, len(rows))
+	for _, row := range rows {
+		confidence := "high"
+		if len(row.Notes) > 0 {
+			confidence = "review"
+		}
+		records = append(records, VSOCRRecord{
+			MemberName:      row.MemberName,
+			Points:          row.Points,
+			Confidence:      confidence,
+			Notes:           row.Notes,
+			RawPoints:       row.RawPoints,
+			PointCandidates: vsCandidateValues(row.Candidates),
+		})
+	}
+	return records
+}
+
+// mergeVSRecordsByName appends supplemental (full-image fallback) records that
+// are not already present in the primary (row-segmented) list.
+func mergeVSRecordsByName(primary []VSOCRRecord, supplemental []VSOCRRecord) []VSOCRRecord {
+	if len(supplemental) == 0 {
+		return primary
+	}
+	seen := map[string]bool{}
+	for _, r := range primary {
+		seen[normalizeName(r.MemberName)] = true
+	}
+	for _, r := range supplemental {
+		r.MemberName = cleanVSRowName(r.MemberName)
+		key := normalizeName(r.MemberName)
+		if isVSUILabel(r.MemberName) || len(key) < 4 {
+			continue
+		}
+		if key == "" || seen[key] {
+			continue
+		}
+		r.Confidence = "review"
+		r.Notes = append(r.Notes, "added from full-image OCR fallback")
+		primary = append(primary, r)
+		seen[key] = true
+		log.Printf("VS OCR supplemental full-image record: %s -> %d", r.MemberName, r.Points)
+	}
+	return primary
+}
+
+// cleanVSRowName applies stricter name cleaning for VS row OCR output, removing
+// OCR artefacts that often appear at the start of a line.
+func cleanVSRowName(name string) string {
+	name = cleanPlayerName(name)
+	name = regexp.MustCompile(`\s+`).ReplaceAllString(strings.TrimSpace(name), " ")
+	name = strings.Trim(name, " .:-_|[]()")
+	parts := strings.Fields(name)
+	for len(parts) > 0 {
+		token := strings.Trim(parts[0], " .:-_|[]()")
+		lower := strings.ToLower(token)
+		if token == "" || lower == "i" || lower == "l" || lower == "j" || lower == "at" || lower == "ah" {
+			parts = parts[1:]
+			continue
+		}
+		break
+	}
+	name = strings.Join(parts, " ")
+	name = strings.Trim(name, " .:-_|[]()")
+	return name
+}
+
 // Extract VS points by segmenting image into rows and OCR each row independently
-func extractVSPointsByRows(img image.Image, attrs *ScreenshotAttributes) ([]struct {
-	MemberName string `json:"member_name"`
-	Points     int64  `json:"points"`
-}, error) {
+func extractVSPointsByRows(img image.Image, attrs *ScreenshotAttributes) ([]VSOCRRecord, error) {
 	bounds := img.Bounds()
 	imgW := bounds.Dx()
-	dataRegion := attrs.DataRegion
+	dataRegion := getVSDataRegion(attrs)
+	if dataRegion == nil {
+		dataRegion = attrs.DataRegion
+	}
 
 	// Convert full image to grayscale once — reused for edge analysis in every row.
 	grayFull := convertToGrayscale(img)
 
-	// Use separator-line scanning to find exact row boundaries instead of the
-	// estimated rowHeight, which can misalign when rows vary in height.
+	// Use VS-specific row boundary detection that recognises ranking card colours.
 	const minRowH = 30
-	rowBounds := findRowBoundaries(grayFull, dataRegion.Top, dataRegion.Bottom, minRowH)
+	rowBounds := findVSRowBoundaries(img, grayFull, dataRegion, minRowH)
 
 	log.Printf("VS OCR: edge detection found %d rows in data region (was estimating %d)", len(rowBounds), attrs.EstimatedRows)
 
-	records := []struct {
-		MemberName string `json:"member_name"`
-		Points     int64  `json:"points"`
-	}{}
+	var rows []vsRowOCRResult
+	var previousAcceptedPoints int64
+	var previousAcceptedCandidates []vsPointsCandidate
 
 	for i, rb := range rowBounds {
 		rowTop, rowBottom := rb[0], rb[1]
@@ -8083,32 +8847,45 @@ func extractVSPointsByRows(img image.Image, attrs *ScreenshotAttributes) ([]stru
 		//
 		//  |<-- avatar+rank -->|<---- name (top) / alliance (bottom) --->|<-- points -->|
 		//
-		// detectAvatarEndX measures the Sobel edge density across left-to-right column
-		// slices: avatar art has high density, the text background is near-zero.
-		// A hard cap at 40% prevents the detector from eating into the name column.
 		nameStartX := detectAvatarEndX(grayFull, rowTop, rowBottom, imgW*40/100)
-
-		nameEndX := imgW * 70 / 100
-		pointsStartX := imgW * 70 / 100
-		if nameStartX >= nameEndX {
-			nameStartX = imgW * 28 / 100 // safety fallback to fixed column
+		if nameStartX < imgW*33/100 {
+			nameStartX = imgW * 33 / 100
 		}
 
-		nameTopH := rowH * 55 / 100 // top 55% of the row contains the player name
+		// Dynamically detect the left edge of the digit column.
+		pointsStartX := findVSPointsColumnStart(grayFull, rowTop, rowBottom, imgW)
+		if pointsStartX < imgW*68/100 {
+			log.Printf("Row %d: skipping likely partial row (points column starts too far left at x=%d)", i+1, pointsStartX)
+			continue
+		}
+		nameEndX := pointsStartX - imgW*3/100
+		if nameStartX >= nameEndX {
+			nameStartX = imgW * 28 / 100
+		}
+		if nameEndX <= nameStartX {
+			nameEndX = imgW * 70 / 100
+			pointsStartX = imgW * 70 / 100
+		}
 
-		// Extract name region: [nameStartX..nameEndX] × [rowTop..rowTop+nameTopH]
+		nameCropY := rowTop + rowH*18/100
+		nameTopH := rowH * 34 / 100 // tight band around the player name
+
+		// Extract name region.
 		nameImg := image.NewRGBA(image.Rect(0, 0, nameEndX-nameStartX, nameTopH))
-		draw.Draw(nameImg, nameImg.Bounds(), img, image.Point{nameStartX, rowTop}, draw.Src)
+		draw.Draw(nameImg, nameImg.Bounds(), img, image.Point{nameStartX, nameCropY}, draw.Src)
 
-		// Extract points region: [70%..100%] × full row height
-		pointsImg := image.NewRGBA(image.Rect(0, 0, imgW-pointsStartX, rowH))
+		// Extract points region from the detected digit cluster.
+		pointsEndX := imgW * 98 / 100
+		if pointsEndX <= pointsStartX {
+			pointsEndX = imgW
+		}
+		pointsImg := image.NewRGBA(image.Rect(0, 0, pointsEndX-pointsStartX, rowH))
 		draw.Draw(pointsImg, pointsImg.Bounds(), img, image.Point{pointsStartX, rowTop}, draw.Src)
+		saveVSOCRDebugCrop("name", i+1, nameImg)
+		saveVSOCRDebugCrop("points", i+1, pointsImg)
 
 		scaledName := scaleImage(nameImg, 3)
 		grayName := convertToGrayscale(scaledName)
-
-		scaledPoints := scaleImage(pointsImg, 3)
-		grayPoints := convertToGrayscale(scaledPoints)
 
 		// OCR name segment
 		var nameBuf bytes.Buffer
@@ -8118,67 +8895,83 @@ func extractVSPointsByRows(img image.Image, attrs *ScreenshotAttributes) ([]stru
 		}
 
 		nameClient := gosseract.NewClient()
-		defer nameClient.Close()
-		nameClient.SetImageFromBytes(nameBuf.Bytes())
-		nameClient.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
-		nameText, err := nameClient.Text()
+		nameText, err := cachedTesseractText(nameClient, nameBuf.Bytes(), gosseract.PSM_SINGLE_LINE, "")
+		nameClient.Close()
 		if err != nil || len(strings.TrimSpace(nameText)) == 0 {
 			continue // empty row
 		}
 
-		// OCR points segment — digits only
-		var pointsBuf bytes.Buffer
-		if err := png.Encode(&pointsBuf, grayPoints); err != nil {
-			log.Printf("Row %d: Failed to encode points segment: %v", i+1, err)
-			continue
-		}
-
-		pointsClient := gosseract.NewClient()
-		defer pointsClient.Close()
-		pointsClient.SetImageFromBytes(pointsBuf.Bytes())
-		pointsClient.SetVariable("tessedit_char_whitelist", "0123456789,")
-		pointsClient.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
-		pointsText, err := pointsClient.Text()
-		if err != nil || len(strings.TrimSpace(pointsText)) == 0 {
+		// OCR points segment — multi-variant voting.
+		points, pointsText, pointCandidates, ok := ocrVSPointsValue(pointsImg)
+		if !ok {
 			log.Printf("Row %d: Name='%s', but no points found", i+1, strings.TrimSpace(nameText))
 			continue
 		}
+		points, pointsText = adjustVSPointsByOrder(points, pointsText, pointCandidates, previousAcceptedPoints)
 
 		name := strings.TrimSpace(nameText)
-		name = cleanPlayerName(name)
+		name = cleanVSRowName(name)
 
-		nonDigitRe := regexp.MustCompile(`[^0-9]`)
-		pointsStr := nonDigitRe.ReplaceAllString(strings.TrimSpace(pointsText), "")
-
-		points, err := strconv.ParseInt(pointsStr, 10, 64)
-		if err != nil {
-			log.Printf("Row %d: Failed to parse points '%s' (raw: '%s'): %v", i+1, pointsStr, strings.TrimSpace(pointsText), err)
+		if len(name) < 3 || isVSUILabel(name) || points < 10000 {
 			continue
 		}
 
-		if points < 1000 { // skip header row / near-zero noise
-			continue
+		// Forward revision: if this row's accepted points are much lower than the
+		// previous row, check whether a lower candidate of the previous row would
+		// have been more consistent.
+		notes := []string{}
+		if len(rows) > 0 && previousAcceptedPoints > 0 && points > 0 && previousAcceptedPoints > points*220/100 {
+			var bestRevision *vsPointsCandidate
+			for ci := range previousAcceptedCandidates {
+				c := &previousAcceptedCandidates[ci]
+				if c.Value >= previousAcceptedPoints {
+					continue
+				}
+				if c.Value < points*85/100 || c.Value > points*130/100 {
+					continue
+				}
+				if bestRevision == nil ||
+					absInt64(c.Value-points) < absInt64(bestRevision.Value-points) ||
+					(absInt64(c.Value-points) == absInt64(bestRevision.Value-points) && c.Score > bestRevision.Score) {
+					bestRevision = c
+				}
+			}
+			if bestRevision != nil {
+				lastIdx := len(rows) - 1
+				log.Printf("VS points OCR forward adjustment: revised previous row %q from %d to %d (next row made lower candidate plausible)",
+					rows[lastIdx].MemberName, rows[lastIdx].Points, bestRevision.Value)
+				rows[lastIdx].Points = bestRevision.Value
+				rows[lastIdx].RawPoints = bestRevision.Raw
+				rows[lastIdx].Notes = append(rows[lastIdx].Notes, "points adjusted: next row made lower candidate plausible")
+				previousAcceptedPoints = bestRevision.Value
+			}
 		}
 
-		log.Printf("Row %d: Name='%s', Points=%d", i+1, name, points)
+		log.Printf("Row %d: Name='%s', Points=%d (raw OCR: %q, x=%d)", i+1, name, points, pointsText, pointsStartX)
 
-		records = append(records, struct {
-			MemberName string `json:"member_name"`
-			Points     int64  `json:"points"`
-		}{
+		if len(pointCandidates) > 1 {
+			notes = append(notes, "multiple point candidates")
+		}
+		rows = append(rows, vsRowOCRResult{
 			MemberName: name,
 			Points:     points,
+			RawPoints:  pointsText,
+			Candidates: pointCandidates,
+			Notes:      notes,
 		})
+		previousAcceptedPoints = points
+		previousAcceptedCandidates = pointCandidates
 	}
 
-	return records, nil
+	rows = reconcileVSPointCandidates(rows)
+	if len(rows) < 5 {
+		log.Printf("VS OCR quality warning: only %d usable rows found; screenshot may be cropped, blurred, or partially obscured", len(rows))
+	}
+	return finalizeVSOCRRecords(rows), nil
 }
 
 // Fallback: Extract VS points from full image (original method)
-func extractVSPointsFullImage(imageData []byte, attrs *ScreenshotAttributes) ([]struct {
-	MemberName string `json:"member_name"`
-	Points     int64  `json:"points"`
-}, error) {
+func extractVSPointsFullImage(imageData []byte, attrs *ScreenshotAttributes) ([]VSOCRRecord, error) {
 	// Preprocess image to filter and enhance relevant regions
 	processedData, err := preprocessImageForOCR(imageData)
 	if err != nil {
@@ -8220,8 +9013,17 @@ func extractVSPointsFullImage(imageData []byte, attrs *ScreenshotAttributes) ([]
 	// Log the extracted text for debugging
 	log.Printf("OCR extracted text:\n%s\n---END OCR---", text)
 
-	// Parse the OCR text for VS points
-	records := parseVSPointsText(text)
+	// Parse the OCR text for VS points and wrap into VSOCRRecord.
+	parsed := parseVSPointsText(text)
+	records := make([]VSOCRRecord, 0, len(parsed))
+	for _, r := range parsed {
+		records = append(records, VSOCRRecord{
+			MemberName: r.MemberName,
+			Points:     r.Points,
+			Confidence: "review",
+			Notes:      []string{"full-image OCR fallback"},
+		})
+	}
 
 	return records, nil
 }
@@ -8490,10 +9292,7 @@ func parseVSPointsText(text string) []struct {
 
 // HTTP handler to process VS points screenshot
 func processVSPointsScreenshot(w http.ResponseWriter, r *http.Request) {
-	var records []struct {
-		MemberName string `json:"member_name"`
-		Points     int64  `json:"points"`
-	}
+	var records []VSOCRRecord
 	var detectedDay string
 	var weekDate string
 
@@ -8564,10 +9363,17 @@ func processVSPointsScreenshot(w http.ResponseWriter, r *http.Request) {
 
 		if request.Text != "" {
 			// Parse raw text
-			records = parseVSPointsText(request.Text)
+			parsed := parseVSPointsText(request.Text)
+			records = make([]VSOCRRecord, 0, len(parsed))
+			for _, r := range parsed {
+				records = append(records, VSOCRRecord{MemberName: r.MemberName, Points: r.Points})
+			}
 			detectedDay = detectSelectedDay(request.Text)
 		} else {
-			records = request.Records
+			records = make([]VSOCRRecord, 0, len(request.Records))
+			for _, r := range request.Records {
+				records = append(records, VSOCRRecord{MemberName: r.MemberName, Points: r.Points})
+			}
 		}
 
 		// Use provided day if available, otherwise use detected day
@@ -8630,8 +9436,18 @@ func processVSPointsScreenshot(w http.ResponseWriter, r *http.Request) {
 	successCount := 0
 	notFoundMembers := []string{}
 	updatedMembers := []string{}
+	reviewRows := []map[string]interface{}{}
 
 	for _, record := range records {
+		// Supplemental full-image records are noisier — require a higher fuzzy threshold.
+		fuzzyThreshold := 70
+		for _, note := range record.Notes {
+			if strings.Contains(note, "full-image OCR fallback") || strings.Contains(note, "added from full-image OCR fallback") {
+				fuzzyThreshold = 85
+				break
+			}
+		}
+
 		// Try to find member by exact name match first
 		var memberID int
 		var memberName string
@@ -8671,15 +9487,43 @@ func processVSPointsScreenshot(w http.ResponseWriter, r *http.Request) {
 			}
 			rows.Close()
 
-			// Use fuzzy match if similarity is high enough (70%+)
-			if bestScore >= 70 {
+			// Use fuzzy match if similarity is high enough.
+			if bestScore >= fuzzyThreshold {
 				memberID = bestID
 				memberName = bestMatch
 				log.Printf("Fuzzy matched '%s' to '%s' (similarity: %d%%)", record.MemberName, bestMatch, bestScore)
+				reviewRows = append(reviewRows, map[string]interface{}{
+					"member_name":      record.MemberName,
+					"matched_name":     bestMatch,
+					"match_confidence": bestScore,
+					"points":           record.Points,
+					"status":           "fuzzy_match",
+					"notes":            record.Notes,
+				})
 			} else {
 				notFoundMembers = append(notFoundMembers, record.MemberName)
+				reviewRows = append(reviewRows, map[string]interface{}{
+					"member_name":      record.MemberName,
+					"match_confidence": bestScore,
+					"points":           record.Points,
+					"status":           "not_found",
+					"required_match":   fuzzyThreshold,
+					"notes":            record.Notes,
+				})
 				continue
 			}
+		}
+
+		if record.Confidence == "review" || len(record.Notes) > 0 {
+			reviewRows = append(reviewRows, map[string]interface{}{
+				"member_name":      record.MemberName,
+				"matched_name":     memberName,
+				"points":           record.Points,
+				"status":           record.Confidence,
+				"notes":            record.Notes,
+				"raw_points":       record.RawPoints,
+				"point_candidates": record.PointCandidates,
+			})
 		}
 
 		// Upsert VS points for this member
@@ -8728,6 +9572,9 @@ func processVSPointsScreenshot(w http.ResponseWriter, r *http.Request) {
 	if len(notFoundMembers) > 0 {
 		response["not_found_members"] = notFoundMembers
 		response["warning"] = fmt.Sprintf("%d members could not be matched to the database", len(notFoundMembers))
+	}
+	if len(reviewRows) > 0 {
+		response["ocr_review"] = reviewRows
 	}
 
 	w.Header().Set("Content-Type", "application/json")
