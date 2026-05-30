@@ -7,7 +7,8 @@
     "test": "playwright test",
     "test:headed": "playwright test --headed",
     "test:app": "playwright test tests/app.spec.js",
-    "report": "playwright show-report report"
+    "report": "playwright show-report report",
+    "install-hooks": "node -e \"const fs=require('fs'),path=require('path'),src=path.resolve('..','scripts','pre-push'),dst=path.resolve('..', '.git','hooks','pre-push');fs.copyFileSync(src,dst);fs.chmodSync(dst,'755');console.log('pre-push hook installed.');\""
   },
   "keywords": [],
   "author": "",

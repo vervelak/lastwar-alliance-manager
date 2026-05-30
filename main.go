@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -995,6 +996,8 @@ func initDB() error {
 		password TEXT NOT NULL,
 		member_id INTEGER,
 		is_admin BOOLEAN DEFAULT 0,
+		active BOOLEAN NOT NULL DEFAULT 1,
+		must_change_password BOOLEAN NOT NULL DEFAULT 0,
 		FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
 	);`
 
@@ -1605,35 +1608,6 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 		log.Println("Database migration: Added alliance_short_name column to settings table")
 	}
 
-	// Migrate users table to add must_change_password column
-	var mustChangePwdExists bool
-	err = db.QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'must_change_password'`).Scan(&mustChangePwdExists)
-	if err != nil {
-		return err
-	}
-	if !mustChangePwdExists {
-		_, err = db.Exec(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0`)
-		if err != nil {
-			return err
-		}
-		// Flag existing admin accounts that still have the default password
-		rows, qErr := db.Query(`SELECT id, password FROM users WHERE username = 'admin' AND is_admin = 1`)
-		if qErr == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var uid int
-				var hash string
-				if rows.Scan(&uid, &hash) == nil {
-					if bcrypt.CompareHashAndPassword([]byte(hash), []byte("admin123")) == nil {
-						db.Exec(`UPDATE users SET must_change_password = 1 WHERE id = ?`, uid)
-						log.Println("Flagged default admin account for mandatory password change")
-					}
-				}
-			}
-		}
-		log.Println("Database migration: Added must_change_password column to users table")
-	}
-
 	// Create default admin user if no users exist
 	var userCount int
 	err = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&userCount)
@@ -1694,6 +1668,35 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 			return err
 		}
 		log.Println("Database migration: Added active column to users table")
+	}
+
+	// Migrate users table to add must_change_password column
+	var mustChangePwdExists bool
+	err = db.QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'must_change_password'`).Scan(&mustChangePwdExists)
+	if err != nil {
+		return err
+	}
+	if !mustChangePwdExists {
+		_, err = db.Exec(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0`)
+		if err != nil {
+			return err
+		}
+		// Flag existing admin accounts that still have the default password
+		rows, qErr := db.Query(`SELECT id, password FROM users WHERE username = 'admin' AND is_admin = 1`)
+		if qErr == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var uid int
+				var hash string
+				if rows.Scan(&uid, &hash) == nil {
+					if bcrypt.CompareHashAndPassword([]byte(hash), []byte("admin123")) == nil {
+						db.Exec(`UPDATE users SET must_change_password = 1 WHERE id = ?`, uid)
+						log.Println("Flagged default admin account for mandatory password change")
+					}
+				}
+			}
+		}
+		log.Println("Database migration: Added must_change_password column to users table")
 	}
 
 	// Migrate train_schedules to add name snapshot columns (preserved even after member is deleted)
@@ -1864,6 +1867,23 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 		attack_count INTEGER,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(event_id, rank_in_event)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// tech_donations: daily & weekly donation leaderboard records.
+	// week_date and amount column names kept for backward compat with luckyDraw query.
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS tech_donations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		member_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+		name_snapshot TEXT NOT NULL,
+		donation_type TEXT NOT NULL DEFAULT 'weekly',
+		week_date TEXT NOT NULL,
+		amount INTEGER NOT NULL DEFAULT 0,
+		rank_in_snapshot INTEGER NOT NULL DEFAULT 0,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	)`)
 	if err != nil {
 		return err
@@ -6266,24 +6286,23 @@ func generateConductorMessages(w http.ResponseWriter, r *http.Request) {
 // R4/R5/Admin middleware - checks if user has R4, R5 rank or is admin
 func r4r5Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		session, _ := store.Get(r, "session-name")
+		session, _ := store.Get(r, "session")
+
+		// Admin users always have full access regardless of member linkage
+		if isAdmin, ok := session.Values["is_admin"].(bool); ok && isAdmin {
+			next(w, r)
+			return
+		}
+
 		memberID, ok := session.Values["member_id"].(int)
 		if !ok {
 			http.Error(w, "Not authenticated", http.StatusUnauthorized)
 			return
 		}
 
-		// Check if user is admin
-		var isAdmin bool
-		err := db.QueryRow("SELECT is_admin FROM users WHERE member_id = ?", memberID).Scan(&isAdmin)
-		if err == nil && isAdmin {
-			next(w, r)
-			return
-		}
-
 		// Get member rank
 		var rank string
-		err = db.QueryRow("SELECT rank FROM members WHERE id = ? AND deleted_at IS NULL", memberID).Scan(&rank)
+		err := db.QueryRow("SELECT rank FROM members WHERE id = ? AND deleted_at IS NULL", memberID).Scan(&rank)
 		if err != nil {
 			http.Error(w, "Member not found", http.StatusNotFound)
 			return
@@ -11147,7 +11166,7 @@ func mgDebugInit(img image.Image) {
 		mgDebug = nil
 		return
 	}
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o755) // #nosec G703 -- dir is from MG_DEBUG_DIR env var, not user input
 	mgDebugSeq++
 	mgDebug = &mgDebugContext{
 		dir:    dir,
@@ -12192,6 +12211,755 @@ func parseDamageValue(numStr, unit string) int64 {
 	return int64(val)
 }
 
+// ─── Donations ────────────────────────────────────────────────────────────────
+
+// DonationRecord is a stored row from tech_donations joined with member info.
+type DonationRecord struct {
+	ID             int    `json:"id"`
+	MemberID       *int   `json:"member_id,omitempty"`
+	MemberName     string `json:"member_name"`
+	MemberRank     string `json:"member_rank"`
+	NameSnapshot   string `json:"name_snapshot"`
+	DonationType   string `json:"donation_type"`
+	WeekDate       string `json:"week_date"`
+	Amount         int    `json:"amount"`
+	RankInSnapshot int    `json:"rank_in_snapshot"`
+	CreatedAt      string `json:"created_at,omitempty"`
+}
+
+// DonationOCREntry is a single row returned from OCR processing.
+type DonationOCREntry struct {
+	RankInSnapshot  int    `json:"rank_in_snapshot"`
+	NameSnapshot    string `json:"name_snapshot"`
+	Points          int    `json:"points"`
+	PointsCropB64   string `json:"points_crop_b64,omitempty"` // base64 PNG of points region; only when points==0
+	NameCropB64     string `json:"name_crop_b64,omitempty"`   // base64 PNG of name region; only when OCR uncertain
+	ImgIdx          int    `json:"img_idx"`                   // which uploaded screenshot (0-based)
+	RegionY1        int    `json:"region_y1"`                 // row top pixel in original image
+	RegionY2        int    `json:"region_y2"`                 // row bottom pixel in original image
+	ImgWidth        int    `json:"img_width"`                 // original image dimensions (for canvas scaling)
+	ImgHeight       int    `json:"img_height"`
+	MemberID        *int   `json:"member_id,omitempty"`
+	MemberName      string `json:"member_name"`
+	MemberRank      string `json:"member_rank"`
+	MatchConfidence int    `json:"match_confidence"`
+	MatchType       string `json:"match_type"` // "exact","nickname","fuzzy","none"
+}
+
+// DonationOCRResult is the response from processDonationScreenshots.
+type DonationOCRResult struct {
+	DonationType string             `json:"donation_type"`
+	RecordDate   string             `json:"record_date"`
+	Entries      []DonationOCREntry `json:"entries"`
+	TotalImages  int                `json:"total_images"`
+	TotalRows    int                `json:"total_rows"`
+}
+
+// isRowGreenTinted detects the "own rank" pinned row at the bottom of donation
+// leaderboard screenshots. That row has a distinct green background.
+// We sample the rank-number area (x 2–13% of image width) which is plain
+// background colour, away from any avatar or text content.
+func isRowGreenTinted(img image.Image, rowTop, rowBottom, imgW int) bool {
+	x1 := imgW * 2 / 100
+	x2 := imgW * 13 / 100
+	y1 := rowTop + (rowBottom-rowTop)*20/100
+	y2 := rowTop + (rowBottom-rowTop)*80/100
+	if x2 <= x1 || y2 <= y1 {
+		return false
+	}
+	var sumR, sumG, sumB, count int64
+	for y := y1; y < y2; y++ {
+		for x := x1; x < x2; x++ {
+			r32, g32, b32, _ := img.At(x, y).RGBA()
+			sumR += int64(r32 >> 8)
+			sumG += int64(g32 >> 8)
+			sumB += int64(b32 >> 8)
+			count++
+		}
+	}
+	if count == 0 {
+		return false
+	}
+	avgR, avgG, avgB := sumR/count, sumG/count, sumB/count
+	return avgG > avgR+15 && avgG > avgB+10
+}
+
+// adaptiveGrayForOCR converts a cropped image region to grayscale, then
+// inverts it when the background is dark (avg brightness < 128).
+// Tesseract performs best with dark text on a light background.  Donation
+// screenshots use white text on a dark navy background, so inversion is needed.
+func adaptiveGrayForOCR(img image.Image) *image.Gray {
+	gray := convertToGrayscale(img)
+	bounds := gray.Bounds()
+	var total int64
+	count := int64(bounds.Dx() * bounds.Dy())
+	if count == 0 {
+		return gray
+	}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			total += int64(gray.GrayAt(x, y).Y)
+		}
+	}
+	if total/count < 128 { // dark background → invert
+		inverted := image.NewGray(bounds)
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				inverted.SetGray(x, y, color.Gray{Y: 255 - gray.GrayAt(x, y).Y})
+			}
+		}
+		return inverted
+	}
+	return gray
+}
+
+// binaryThresholdForOCR converts to grayscale, optionally inverts (dark→light),
+// then applies a hard binary threshold.  This removes JPEG anti-aliasing blur
+// that can cause Tesseract to mis-segment bold condensed game fonts.
+// threshold=0 → use Otsu-style midpoint between darkest and lightest pixel.
+func binaryThresholdForOCR(img image.Image, threshold uint8) *image.Gray {
+	gray := adaptiveGrayForOCR(img)
+	bounds := gray.Bounds()
+	if threshold == 0 {
+		// Midpoint between min and max observed brightness.
+		min8, max8 := uint8(255), uint8(0)
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				v := gray.GrayAt(x, y).Y
+				if v < min8 {
+					min8 = v
+				}
+				if v > max8 {
+					max8 = v
+				}
+			}
+		}
+		threshold = min8 + (max8-min8)/2
+	}
+	out := image.NewGray(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if gray.GrayAt(x, y).Y > threshold {
+				out.SetGray(x, y, color.Gray{Y: 255})
+			} else {
+				out.SetGray(x, y, color.Gray{Y: 0})
+			}
+		}
+	}
+	return out
+}
+
+// findDonationRows detects row boundaries in a donation leaderboard screenshot
+// by analysing per-row colour variance in the avatar column (x=13–30% of width).
+// Each row contains a colourful circular avatar; the gaps between rows are a
+// plain dark background, so colour variance drops sharply at row boundaries.
+// Falls back to fixed equal-division if the variance signal yields < 3 rows.
+func findDonationRows(img image.Image, dataTop, dataBottom int) [][2]int {
+	const minRowH = 40
+	bounds := img.Bounds()
+	imgW := bounds.Dx()
+	n := dataBottom - dataTop
+	if n < minRowH {
+		return nil
+	}
+
+	avX1 := imgW * 13 / 100
+	avX2 := imgW * 30 / 100
+	if avX2 <= avX1 {
+		avX2 = avX1 + 1
+	}
+	width := float64(avX2 - avX1)
+
+	// Per-row colour variance in the avatar column
+	varRow := make([]float64, n)
+	for y := dataTop; y < dataBottom; y++ {
+		var sR, sG, sB, sR2, sG2, sB2 float64
+		for x := avX1; x < avX2; x++ {
+			r32, g32, b32, _ := img.At(x, y).RGBA()
+			rf, gf, bf := float64(r32>>8), float64(g32>>8), float64(b32>>8)
+			sR += rf
+			sR2 += rf * rf
+			sG += gf
+			sG2 += gf * gf
+			sB += bf
+			sB2 += bf * bf
+		}
+		vR := sR2/width - (sR/width)*(sR/width)
+		vG := sG2/width - (sG/width)*(sG/width)
+		vB := sB2/width - (sB/width)*(sB/width)
+		varRow[y-dataTop] = (vR + vG + vB) / 3
+	}
+
+	// Smooth with a 7-pixel sliding-window average (3 passes)
+	smooth := make([]float64, n)
+	copy(smooth, varRow)
+	for pass := 0; pass < 3; pass++ {
+		tmp := make([]float64, n)
+		copy(tmp, smooth)
+		for i := 3; i < n-3; i++ {
+			smooth[i] = (tmp[i-3] + tmp[i-2] + tmp[i-1] + tmp[i] + tmp[i+1] + tmp[i+2] + tmp[i+3]) / 7
+		}
+	}
+
+	// Adaptive threshold: 30th percentile of the smoothed signal.
+	// Rows with avatar content are above this; separators/background are below.
+	sorted := make([]float64, n)
+	copy(sorted, smooth)
+	sort.Float64s(sorted)
+	threshold := sorted[n*30/100]
+
+	// Collect contiguous above-threshold bands as row regions.
+	var rows [][2]int
+	inRow := false
+	rowStart := 0
+	for i, v := range smooth {
+		if v > threshold && !inRow {
+			inRow = true
+			rowStart = dataTop + i
+		} else if v <= threshold && inRow {
+			if h := (dataTop + i) - rowStart; h >= minRowH {
+				rows = append(rows, [2]int{rowStart, dataTop + i})
+			}
+			inRow = false
+		}
+	}
+	if inRow {
+		if h := dataBottom - rowStart; h >= minRowH {
+			rows = append(rows, [2]int{rowStart, dataBottom})
+		}
+	}
+
+	// Merge adjacent segments separated by a tiny gap (≤ 15 px) that were
+	// split by a momentary dip in variance within an avatar.
+	if len(rows) >= 2 {
+		merged := [][2]int{rows[0]}
+		for _, r := range rows[1:] {
+			prev := &merged[len(merged)-1]
+			if r[0]-prev[1] <= 15 {
+				prev[1] = r[1]
+			} else {
+				merged = append(merged, r)
+			}
+		}
+		rows = merged
+	}
+
+	log.Printf("donation rows: data y=%d–%d threshold=%.1f → %d row bands",
+		dataTop, dataBottom, threshold, len(rows))
+
+	// Fallback: variance signal gave too few rows → equal-height division.
+	if len(rows) < 3 {
+		log.Printf("donation rows: fallback to fixed division (8 rows)")
+		rowH := n / 8
+		if rowH < minRowH {
+			rowH = minRowH
+		}
+		rows = rows[:0]
+		for t := dataTop; t+rowH <= dataBottom; t += rowH {
+			rows = append(rows, [2]int{t, t + rowH})
+		}
+	} else {
+		// Expand avatar-detected bands to cover the full card region.
+		// Avatar detection gives a narrow band (avatar image area only).
+		// Points numbers can sit near the bottom of each card, outside that
+		// narrow band.  Expand each band: top → midpoint to prev band end,
+		// bottom → midpoint to next band start, clamped to dataTop/dataBottom.
+		expanded := make([][2]int, len(rows))
+		for i, b := range rows {
+			top := dataTop
+			if i > 0 {
+				top = (rows[i-1][1] + b[0]) / 2
+			}
+			bottom := dataBottom
+			if i < len(rows)-1 {
+				bottom = (b[1] + rows[i+1][0]) / 2
+			}
+			expanded[i] = [2]int{top, bottom}
+		}
+		rows = expanded
+	}
+
+	return rows
+}
+
+// ocrNormalisePoints replaces common OCR confusions in digit-only fields and
+// returns the first contiguous digit sequence found.  This handles:
+//   - O/o → 0  (letter O vs zero)
+//   - I/l/i → 1  (uppercase I, lowercase L/i vs one)
+//   - S/s → 5, B → 8  (shape similarity in game fonts)
+//   - Trailing noise like "|" from card borders (discarded)
+func ocrNormalisePoints(raw string) int {
+	mapped := strings.Map(func(r rune) rune {
+		switch r {
+		case 'O', 'o':
+			return '0'
+		case 'I', 'l', 'i':
+			return '1'
+		case 'S', 's':
+			return '5'
+		case 'B':
+			return '8'
+		default:
+			if r >= '0' && r <= '9' {
+				return r
+			}
+			return -1 // discard spaces, |, punctuation, etc.
+		}
+	}, strings.TrimSpace(raw))
+	// Take only the first contiguous digit run (guards against trailing noise).
+	first := regexp.MustCompile(`\d+`).FindString(mapped)
+	if first == "" {
+		return 0
+	}
+	v, _ := strconv.Atoi(first)
+	return v
+}
+
+// extractDonationsByRows parses a donation leaderboard screenshot.
+//
+// Donation screenshots (STRENGTH RANKING → Donation tab) have this layout:
+//
+//	y  0–22% : title + main-tabs + daily/weekly sub-tabs + column headers
+//	y 22–93% : row cards (7 data rows + 1 pinned "own rank" row with green BG)
+//	y 93–100%: navigation buttons
+//
+// Row detection is performed by analysing colour variance in the avatar column
+// (x=13–30% of width).  Image pre-processing auto-inverts dark-background crops
+// so Tesseract always receives dark-on-light text.
+//
+// Horizontal layout (% of image width):
+//
+//	 1–16%  : rank number badge
+//	16–30%  : avatar photo          — skipped
+//	30–38%  : R1-R5 rank shield     — skipped
+//	38–84%  : commander name        (top 65% of row height)
+//	84–99%  : donation points integer
+func extractDonationsByRows(imageData []byte, imgIdx int) []DonationOCREntry {
+	img, _, err := image.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		log.Printf("donation OCR: decode failed: %v", err)
+		return nil
+	}
+
+	bounds := img.Bounds()
+	imgW := bounds.Dx()
+	imgH := bounds.Dy()
+
+	dataTop := imgH * 22 / 100
+	dataBottom := imgH * 93 / 100
+
+	rowBounds := findDonationRows(img, dataTop, dataBottom)
+	log.Printf("donation OCR: image %dx%d, %d rows to process", imgW, imgH, len(rowBounds))
+
+	var entries []DonationOCREntry
+	rankCounter := 1
+
+	for i, rb := range rowBounds {
+		rowTop, rowBottom := rb[0], rb[1]
+		rowH := rowBottom - rowTop
+
+		if isRowGreenTinted(img, rowTop, rowBottom, imgW) {
+			log.Printf("donation OCR: row %d y=%d-%d: skipped (pinned/green)", i+1, rowTop, rowBottom)
+			continue
+		}
+
+		rankX1, rankX2 := imgW*1/100, imgW*16/100
+		nameX1, nameX2 := imgW*35/100, imgW*76/100
+		nameH := rowH * 65 / 100
+		ptX1, ptX2 := imgW*76/100, imgW*99/100
+
+		// ── Rank ──────────────────────────────────────────────────────────
+		rankCrop := image.NewRGBA(image.Rect(0, 0, rankX2-rankX1, rowH))
+		draw.Draw(rankCrop, rankCrop.Bounds(), img, image.Point{rankX1, rowTop}, draw.Src)
+		var rankBuf bytes.Buffer
+		png.Encode(&rankBuf, adaptiveGrayForOCR(scaleImage(rankCrop, 3)))
+		rankClient := gosseract.NewClient()
+		rankClient.SetImageFromBytes(rankBuf.Bytes())
+		rankClient.SetVariable("tessedit_char_whitelist", "0123456789")
+		rankClient.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
+		rankText, _ := rankClient.Text()
+		rankClient.Close()
+		parsedRank := rankCounter
+		if n, err2 := strconv.Atoi(strings.TrimSpace(rankText)); err2 == nil && n >= 1 && n <= 200 {
+			parsedRank = n
+		}
+
+		// ── Name ──────────────────────────────────────────────────────────
+		nameCrop := image.NewRGBA(image.Rect(0, 0, nameX2-nameX1, nameH))
+		draw.Draw(nameCrop, nameCrop.Bounds(), img, image.Point{nameX1, rowTop}, draw.Src)
+		var nameBuf bytes.Buffer
+		png.Encode(&nameBuf, adaptiveGrayForOCR(scaleImage(nameCrop, 3)))
+		nameClient := gosseract.NewClient()
+		nameClient.SetImageFromBytes(nameBuf.Bytes())
+		nameClient.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
+		nameText, _ := nameClient.Text()
+		nameClient.Close()
+		name := cleanPlayerName(strings.TrimSpace(nameText))
+		// Strip leading badge-artifact chars: the R3/R4/R5 shield icon edge bleeds
+		// into the name zone, producing noise like "i] ", ")I ", or "} " before the name.
+		// nameCertain tracks whether the OCR result looks trustworthy.
+		nameCertain := true
+		if parts := strings.SplitN(name, " ", 2); len(parts) == 2 {
+			firstWord := parts[0]
+			if strings.ContainsAny(firstWord, "[](){}<>|\\/@#:;") {
+				name = strings.TrimSpace(parts[1])
+				nameCertain = false
+			} else if len([]rune(firstWord)) <= 2 {
+				// Single- or double-letter prefix like "L ", "I ", "Li " is likely a badge fragment.
+				nameCertain = false
+			}
+		}
+		if len(name) < 2 {
+			log.Printf("donation OCR: row %d: rank=%d name too short (raw=%q)", i+1, parsedRank, nameText)
+			continue
+		}
+
+		// ── Points ────────────────────────────────────────────────────────
+		ptCrop := image.NewRGBA(image.Rect(0, 0, ptX2-ptX1, rowH))
+		draw.Draw(ptCrop, ptCrop.Bounds(), img, image.Point{ptX1, rowTop}, draw.Src)
+		var ptBuf bytes.Buffer
+		png.Encode(&ptBuf, binaryThresholdForOCR(scaleImage(ptCrop, 3), 0))
+		// Write to a temp file so gosseract can load it via file path (avoids
+		// in-memory PNG decoding differences between leptonica and Go's image/png).
+		ptTmpPath := fmt.Sprintf("/tmp/don_pts_%d_%d.png", imgIdx, i)
+		_ = os.WriteFile(ptTmpPath, ptBuf.Bytes(), 0o600)
+		ptClient := gosseract.NewClient()
+		ptClient.SetImage(ptTmpPath)
+		// PSM must be set as a variable (not SetPageSegMode) because gosseract's
+		// lazy init re-calls C.Init() which resets PSM to PSM_AUTO (3), losing
+		// any SetPageSegMode call made before Text(). Variables are applied AFTER
+		// C.Init() via setVariablesToInitializedAPI(), so they survive re-init.
+		ptClient.SetVariable("tessedit_pageseg_mode", "13") // PSM_RAW_LINE – bypasses text-detection heuristics that fail on bold game fonts
+		ptClient.SetWhitelist("0123456789")
+		ptText, _ := ptClient.Text()
+		ptClient.Close()
+		os.Remove(ptTmpPath) // clean up temp file
+		points := ocrNormalisePoints(ptText)
+
+		// Capture crops for uncertain OCR results so the user can verify in the
+		// confirm dialog. Clicking a crop opens the full screenshot with the row
+		// highlighted (handled client-side using ImgIdx + RegionY1/Y2).
+		var ptCropB64 string
+		if points == 0 {
+			var origBuf bytes.Buffer
+			png.Encode(&origBuf, scaleImage(ptCrop, 2))
+			ptCropB64 = base64.StdEncoding.EncodeToString(origBuf.Bytes())
+		}
+		var nmCropB64 string
+		if !nameCertain {
+			var nb bytes.Buffer
+			png.Encode(&nb, scaleImage(nameCrop, 2))
+			nmCropB64 = base64.StdEncoding.EncodeToString(nb.Bytes())
+		}
+
+		log.Printf("donation OCR: row %d rank=%d name=%q points=%d (rawRank=%q rawPts=%q)",
+			i+1, parsedRank, name, points, rankText, ptText)
+		rankCounter = parsedRank + 1
+		entries = append(entries, DonationOCREntry{
+			RankInSnapshot: parsedRank,
+			NameSnapshot:   name,
+			Points:         points,
+			PointsCropB64:  ptCropB64,
+			NameCropB64:    nmCropB64,
+			ImgIdx:         imgIdx,
+			RegionY1:       rowTop,
+			RegionY2:       rowBottom,
+			ImgWidth:       imgW,
+			ImgHeight:      imgH,
+		})
+	}
+	return entries
+}
+
+// mergeDonationEntries deduplicates OCR results from multiple screenshots.
+// When the same player appears in several scrolled shots, the entry with
+// the lower rank number (higher position) is kept.
+func mergeDonationEntries(all []DonationOCREntry) []DonationOCREntry {
+	seen := make(map[string]int) // normalised name → result index
+	var result []DonationOCREntry
+	for _, e := range all {
+		key := mgOcrNormForCompare(e.NameSnapshot)
+		if idx, exists := seen[key]; exists {
+			if e.RankInSnapshot < result[idx].RankInSnapshot {
+				result[idx] = e
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, e)
+	}
+	return result
+}
+
+// matchDonationEntry tries to match an OCR entry to an existing DB member.
+// It reuses the same exact → nickname → fuzzy strategy as MG.
+func matchDonationEntry(e *DonationOCREntry, members []Member) {
+	name := strings.TrimSpace(e.NameSnapshot)
+	if name == "" {
+		e.MatchType = "none"
+		return
+	}
+	lower := strings.ToLower(name)
+
+	for _, m := range members {
+		if strings.ToLower(m.Name) == lower {
+			id := m.ID
+			e.MemberID, e.MemberName, e.MemberRank = &id, m.Name, m.Rank
+			e.MatchConfidence, e.MatchType = 100, "exact"
+			return
+		}
+	}
+	for _, m := range members {
+		if m.Nickname != nil && strings.ToLower(*m.Nickname) == lower {
+			id := m.ID
+			e.MemberID, e.MemberName, e.MemberRank = &id, m.Name, m.Rank
+			e.MatchConfidence, e.MatchType = 95, "nickname"
+			return
+		}
+	}
+
+	ocrNorm := mgOcrNormForCompare(name)
+	bestScore := 0
+	bestIdx := -1
+	for i, m := range members {
+		sim := mgSimilarityNorm(ocrNorm, mgOcrNormForCompare(m.Name))
+		if len(ocrNorm) > 3 {
+			if s2 := mgSimilarityNorm(ocrNorm[1:], mgOcrNormForCompare(m.Name)); s2 > sim {
+				sim = s2
+			}
+		}
+		if m.Nickname != nil && *m.Nickname != "" {
+			if s := mgSimilarityNorm(ocrNorm, mgOcrNormForCompare(*m.Nickname)); s > sim {
+				sim = s
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		id := members[bestIdx].ID
+		e.MemberID, e.MemberName, e.MemberRank = &id, members[bestIdx].Name, members[bestIdx].Rank
+		e.MatchConfidence, e.MatchType = bestScore, "fuzzy"
+		return
+	}
+	e.MatchType = "none"
+}
+
+// processDonationScreenshots — POST /api/donations/process-screenshots
+// Accepts multipart form with:
+//   - images[]  : one or more screenshot files
+//   - donation_type : "daily" | "weekly"
+//   - record_date   : YYYY-MM-DD
+//
+// Returns DonationOCRResult for the frontend confirm step.
+func processDonationScreenshots(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(50 << 20); err != nil {
+		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+		return
+	}
+
+	donationType := r.FormValue("donation_type")
+	if donationType != "daily" && donationType != "weekly" {
+		donationType = "weekly"
+	}
+	recordDate := r.FormValue("record_date")
+	if _, err := time.Parse("2006-01-02", recordDate); err != nil {
+		recordDate = time.Now().Format("2006-01-02")
+	}
+
+	files := r.MultipartForm.File["images"]
+	if len(files) == 0 {
+		http.Error(w, "No images uploaded", http.StatusBadRequest)
+		return
+	}
+
+	members, err := loadAllMembers()
+	if err != nil {
+		http.Error(w, "Failed to load members", http.StatusInternalServerError)
+		return
+	}
+
+	var allEntries []DonationOCREntry
+	imgCount := 0
+	for _, fh := range files {
+		f, err := fh.Open()
+		if err != nil {
+			log.Printf("donation OCR: open %q: %v", fh.Filename, err) // #nosec G706 -- %q prevents log injection
+			continue
+		}
+		data, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			log.Printf("donation OCR: read %q: %v", fh.Filename, err) // #nosec G706 -- %q prevents log injection
+			continue
+		}
+		rows := extractDonationsByRows(data, imgCount)
+		imgCount++
+		log.Printf("donation OCR: %q → %d rows", fh.Filename, len(rows)) // #nosec G706 -- %q prevents log injection
+		allEntries = append(allEntries, rows...)
+	}
+
+	merged := mergeDonationEntries(allEntries)
+	for i := range merged {
+		matchDonationEntry(&merged[i], members)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].RankInSnapshot == merged[j].RankInSnapshot {
+			return merged[i].NameSnapshot < merged[j].NameSnapshot
+		}
+		return merged[i].RankInSnapshot < merged[j].RankInSnapshot
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(DonationOCRResult{
+		DonationType: donationType,
+		RecordDate:   recordDate,
+		Entries:      merged,
+		TotalImages:  len(files),
+		TotalRows:    len(merged),
+	})
+}
+
+// getDonationRecords — GET /api/donations?type=daily|weekly&date=YYYY-MM-DD
+func getDonationRecords(w http.ResponseWriter, r *http.Request) {
+	donationType := r.URL.Query().Get("type")
+	if donationType != "daily" && donationType != "weekly" {
+		donationType = "weekly"
+	}
+	dateParam := r.URL.Query().Get("date")
+	if _, err := time.Parse("2006-01-02", dateParam); err != nil {
+		dateParam = time.Now().Format("2006-01-02")
+	}
+
+	rows, err := db.Query(`
+		SELECT d.id,
+		       d.member_id,
+		       COALESCE(m.name, '') AS member_name,
+		       COALESCE(m.rank, '') AS member_rank,
+		       d.name_snapshot, d.donation_type, d.week_date, d.amount,
+		       COALESCE(d.rank_in_snapshot, 0),
+		       d.created_at
+		FROM tech_donations d
+		LEFT JOIN members m ON m.id = d.member_id
+		WHERE d.donation_type = ? AND d.week_date = ?
+		ORDER BY d.amount DESC, d.rank_in_snapshot ASC`,
+		donationType, dateParam)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var records []DonationRecord
+	for rows.Next() {
+		var rec DonationRecord
+		var memberID sql.NullInt64
+		if err := rows.Scan(&rec.ID, &memberID, &rec.MemberName, &rec.MemberRank,
+			&rec.NameSnapshot, &rec.DonationType, &rec.WeekDate, &rec.Amount,
+			&rec.RankInSnapshot, &rec.CreatedAt); err != nil {
+			continue
+		}
+		if memberID.Valid {
+			id := int(memberID.Int64)
+			rec.MemberID = &id
+		}
+		records = append(records, rec)
+	}
+	if records == nil {
+		records = []DonationRecord{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(records)
+}
+
+// saveDonationRecords — POST /api/donations
+// Body: { donation_type, record_date, entries:[{name_snapshot,points,member_id?,rank_in_snapshot}] }
+// Replaces all existing records for (donation_type, record_date) atomically.
+func saveDonationRecords(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DonationType string             `json:"donation_type"`
+		RecordDate   string             `json:"record_date"`
+		Entries      []DonationOCREntry `json:"entries"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.DonationType != "daily" && req.DonationType != "weekly" {
+		http.Error(w, "Invalid donation_type", http.StatusBadRequest)
+		return
+	}
+	if _, err := time.Parse("2006-01-02", req.RecordDate); err != nil {
+		http.Error(w, "record_date must be YYYY-MM-DD", http.StatusBadRequest)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM tech_donations WHERE donation_type = ? AND week_date = ?",
+		req.DonationType, req.RecordDate); err != nil {
+		tx.Rollback()
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	saved := 0
+	for i, e := range req.Entries {
+		if strings.TrimSpace(e.NameSnapshot) == "" {
+			continue
+		}
+		var memberID interface{} = nil
+		if e.MemberID != nil {
+			memberID = *e.MemberID
+		}
+		rankPos := e.RankInSnapshot
+		if rankPos <= 0 {
+			rankPos = i + 1
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO tech_donations (member_id, name_snapshot, donation_type, week_date, amount, rank_in_snapshot)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			memberID, strings.TrimSpace(e.NameSnapshot), req.DonationType, req.RecordDate, e.Points, rankPos,
+		); err != nil {
+			log.Printf("donation save: entry %q: %v", e.NameSnapshot, err)
+			continue
+		}
+		saved++
+	}
+
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"saved":         saved,
+		"donation_type": req.DonationType,
+		"record_date":   req.RecordDate,
+	})
+}
+
+// deleteDonationRecord — DELETE /api/donations/{id}
+func deleteDonationRecord(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil || id <= 0 {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	if _, err := db.Exec("DELETE FROM tech_donations WHERE id = ?", id); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func main() {
 	// Initialize session store first
 	initSessionStore()
@@ -12202,6 +12970,13 @@ func main() {
 	defer db.Close()
 
 	router := mux.NewRouter()
+
+	// Health check (public, no auth required)
+	router.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}).Methods("GET")
 
 	// Auth routes (public)
 	router.HandleFunc("/api/login", login).Methods("POST")
@@ -12315,6 +13090,12 @@ func main() {
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(rankManagementMiddleware(deleteMarshalGuardEvent))).Methods("DELETE")
 	router.HandleFunc("/api/marshal-guard/{id}/participants/{pid}", authMiddleware(rankManagementMiddleware(updateMarshalGuardParticipant))).Methods("PUT")
 
+	// Donations routes (protected)
+	router.HandleFunc("/api/donations", authMiddleware(getDonationRecords)).Methods("GET")
+	router.HandleFunc("/api/donations", authMiddleware(r3PlusMiddleware(saveDonationRecords))).Methods("POST")
+	router.HandleFunc("/api/donations/process-screenshots", authMiddleware(r3PlusMiddleware(processDonationScreenshots))).Methods("POST")
+	router.HandleFunc("/api/donations/{id}", authMiddleware(r3PlusMiddleware(deleteDonationRecord))).Methods("DELETE")
+
 	// Health check endpoints (no auth)
 	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -12336,5 +13117,12 @@ func main() {
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./static")))
 
 	log.Println("Server starting on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", requestLoggingMiddleware(router)))
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      requestLoggingMiddleware(router),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# pre-push hook — mirrors the CI pipeline using Docker.
+# Runs automatically before `git push`. Exit non-zero to abort the push.
+#
+# What it checks (matching .github/workflows/ci.yml):
+#   1. Docker build  — verifies the app compiles (same as CI "Go Build" + "Docker Build")
+#   2. Lint & security — go vet, gofmt, gosec, govulncheck (same as CI "Go Build & Lint")
+#   3. Playwright    — regression tests against the running container (same as CI "Playwright E2E")
+#
+# Requirements: docker, docker compose, node/npm, playwright installed in playwright-tests/
+#
+# To skip in an emergency:  git push --no-verify
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PW_DIR="$REPO_ROOT/playwright-tests"
+CONTAINER_NAME="lastwar-alliance"
+SESSION_KEY="${SESSION_KEY:-ci-test-session-key-at-least-32-bytes-long}"
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+pass() { echo -e "${GREEN}[pre-push] ✓ $*${NC}"; }
+fail() { echo -e "${RED}[pre-push] ✗ $*${NC}"; }
+info() { echo -e "${YELLOW}[pre-push] → $*${NC}"; }
+
+# ── 1. Docker build ───────────────────────────────────────────────────────────
+info "Building Docker image (Go compile check)…"
+cd "$REPO_ROOT"
+if ! docker compose build lastwar; then
+  fail "Docker build failed — fix compile errors before pushing."
+  exit 1
+fi
+pass "Docker build succeeded."
+
+# ── 2. Go lint & security checks ─────────────────────────────────────────────
+info "Running Go lint and security checks…"
+cd "$REPO_ROOT"
+
+# Reuse the builder stage already in Docker's layer cache from step 1 (fast)
+docker build --target builder -t lastwar-lint:latest . >/dev/null 2>&1 || {
+  fail "Could not prepare lint image."
+  exit 1
+}
+
+LINT_EXIT=0
+MSYS_NO_PATHCONV=1 docker run --rm \
+  -v "${REPO_ROOT}:/app" \
+  -v "lastwar-gotools:/root/go" \
+  -w /app \
+  -e CGO_ENABLED=1 \
+  -e GOPATH=/root/go \
+  lastwar-lint:latest \
+  sh -c '
+    export PATH="$PATH:/root/go/bin"
+
+    printf "[lint] go vet\n"
+    go vet ./...
+
+    printf "[lint] gofmt\n"
+    unformatted=$(gofmt -l .)
+    if [ -n "$unformatted" ]; then
+      echo "Files not gofmt-formatted:"
+      echo "$unformatted"
+      exit 1
+    fi
+
+    printf "[lint] gosec\n"
+    command -v gosec >/dev/null 2>&1 || go install github.com/securego/gosec/v2/cmd/gosec@latest
+    # Excluded: G104 (unhandled err — HTTP handler pattern), G115 (RGBA uint8(c>>8) — always safe),
+    #           G201 (SQL fmt.Sprintf — dayColumn is whitelist-validated), G301/G304 (output paths)
+    gosec -exclude=G104,G115,G201,G301,G304 -exclude-dir=mg_segment ./...
+
+    printf "[lint] govulncheck\n"
+    command -v govulncheck >/dev/null 2>&1 || go install golang.org/x/vuln/cmd/govulncheck@latest
+    govulncheck ./...
+  ' || LINT_EXIT=$?
+
+if [ "$LINT_EXIT" -ne 0 ]; then
+  fail "Lint/security checks failed (exit $LINT_EXIT). Push aborted."
+  echo -e "${YELLOW}[pre-push] Fix the issues above, or use 'git push --no-verify' to bypass.${NC}"
+  exit 1
+fi
+pass "Lint and security checks passed."
+
+# ── 3. Start container ────────────────────────────────────────────────────────
+info "Starting container…"
+docker compose up -d lastwar
+
+# Wait up to 30 s for the app to be ready
+for i in $(seq 1 30); do
+  if curl -sf http://localhost:8080/api/health >/dev/null 2>&1 || \
+     curl -sf http://localhost:8080/login.html  >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+# Confirm it's actually up
+if ! curl -sf http://localhost:8080/login.html >/dev/null 2>&1; then
+  fail "Container did not become ready within 30 s."
+  docker compose logs --tail=50 lastwar
+  docker compose down
+  exit 1
+fi
+pass "Container is ready."
+
+# ── 4. Playwright regression suite ───────────────────────────────────────────
+info "Running Playwright regression tests…"
+cd "$PW_DIR"
+
+# Ensure dependencies are installed (fast no-op if already done)
+npm ci --silent 2>/dev/null || true
+
+# Run all spec files except those that require machine-local assets
+# (mg-ocr.spec.js, vs-ocr.spec.js, mg-ui-review.spec.js need screenshot files
+#  in ~/Downloads; mg-ui-review also triggers heavy 12-image OCR that can OOM
+#  the container and cause cascading failures)
+PW_EXIT=0
+find tests -maxdepth 1 -name '*.spec.js' \
+  ! -name 'mg-ocr.spec.js' \
+  ! -name 'vs-ocr.spec.js' \
+  ! -name 'mg-ui-review.spec.js' \
+  -print0 | \
+xargs -0 npx playwright test \
+  --reporter=list \
+  --project=chromium \
+  --ignore-snapshots \
+  2>&1 || PW_EXIT=$?
+
+# ── 5. Tear down ─────────────────────────────────────────────────────────────
+info "Stopping container…"
+cd "$REPO_ROOT"
+docker compose stop lastwar
+
+if [ "$PW_EXIT" -ne 0 ]; then
+  fail "Playwright tests failed (exit $PW_EXIT). Push aborted."
+  echo -e "${YELLOW}[pre-push] Review the output above or run:${NC}"
+  echo "  cd playwright-tests && npx playwright show-report"
+  echo "  Use 'git push --no-verify' to bypass (not recommended)."
+  exit 1
+fi
+
+pass "All checks passed. Proceeding with push."
+exit 0

@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 
 const BASE = 'http://localhost:8080';
-const DOWNLOADS = path.join(process.env.USERPROFILE, 'Downloads');
+const DOWNLOADS = path.join(process.env.USERPROFILE || process.env.HOME || '', 'Downloads');
 const SS = path.join(__dirname, 'screenshots');
 if (!fs.existsSync(SS)) fs.mkdirSync(SS, { recursive: true });
 

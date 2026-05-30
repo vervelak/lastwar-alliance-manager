@@ -59,7 +59,7 @@ playwright-tests/node_modules/
 
 # Test / temp projects
 ocr_test/
-scripts/
+# scripts/ is intentionally tracked (contains shared git hooks)
 
 # Images (screenshots, debug output)
 *.png
