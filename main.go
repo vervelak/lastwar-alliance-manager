@@ -7663,9 +7663,16 @@ func extractPowerByRows(img image.Image, attrs *ScreenshotAttributes) ([]struct 
 	return records, nil
 }
 
+// germanDiacriticReplacer folds German diacritics and ß for name matching.
+var germanDiacriticReplacer = strings.NewReplacer(
+	"ä", "a", "ö", "o", "ü", "u", "ß", "ss",
+	"Ä", "a", "Ö", "o", "Ü", "u",
+)
+
 // Normalize name for matching (remove common prefixes, spaces, special chars)
 func normalizeName(name string) string {
 	name = strings.ToLower(name)
+	name = germanDiacriticReplacer.Replace(name)
 	// Remove common prefixes
 	name = strings.TrimPrefix(name, "the ")
 	name = strings.TrimPrefix(name, "a ")
@@ -7688,8 +7695,14 @@ func calculateSimilarity(s1, s2 string) int {
 		return 100
 	}
 
-	// If one contains the other after normalization, very high score
-	if strings.Contains(n1, n2) || strings.Contains(n2, n1) {
+	// If one contains the other after normalization, very high score.
+	// Require the shorter string to be at least 5 chars to avoid spurious
+	// matches like "kim" inside "kimberlyXyz".
+	shorterLen := len(n1)
+	if len(n2) < shorterLen {
+		shorterLen = len(n2)
+	}
+	if shorterLen >= 5 && (strings.Contains(n1, n2) || strings.Contains(n2, n1)) {
 		return 90
 	}
 
@@ -7708,6 +7721,59 @@ func calculateSimilarity(s1, s2 string) int {
 	similarity := ((maxLen - distance) * 100) / maxLen
 
 	return similarity
+}
+
+// dayPattern pairs a canonical English day name with OCR patterns that match it.
+type dayPattern struct {
+	Name     string
+	Patterns []string
+}
+
+// vsDayPatterns returns the day-name patterns used by VS-points detection,
+// including both English and German abbreviations/full names.
+func vsDayPatterns() []dayPattern {
+	return []dayPattern{
+		{"monday", []string{"monday", "mon.", "mon", "mo.", "mo", "montag"}},
+		{"tuesday", []string{"tuesday", "tues.", "tues", "tue", "di.", "di", "dienstag"}},
+		{"wednesday", []string{"wednesday", "wed.", "wed", "mi.", "mi", "mittwoch"}},
+		{"thursday", []string{"thursday", "thur.", "thur", "thu", "do.", "do", "donnerstag"}},
+		{"friday", []string{"friday", "fri.", "fri", "fr.", "fr", "freitag"}},
+		{"saturday", []string{"saturday", "sat.", "sat", "sa.", "sa", "samstag"}},
+	}
+}
+
+// isVSUILabel returns true when text looks like a VS screenshot UI label
+// (header row, column title, day abbreviation, alliance name) rather than
+// a player name. Used to discard leaked header rows from OCR results.
+func isVSUILabel(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	normalized := strings.Trim(lower, " .:-_|[]()")
+
+	exactLabels := []string{
+		"commander", "ranking", "rank", "points",
+		"kommandant", "rang", "punkte",
+		"mo", "di", "mi", "do", "fr", "sa",
+		"mon", "tue", "tues", "wed", "thu", "thur", "fri", "sat",
+	}
+	for _, label := range exactLabels {
+		if normalized == label {
+			return true
+		}
+	}
+
+	phraseLabels := []string{
+		"daily rank", "weekly rank", "your alliance",
+		"tagesrang", "tages-rang", "wochenrang", "wochen-rang", "deine allianz",
+		"rang kommandant", "kommandant punkte",
+		"ranking commander", "commander points", "ranking commander points",
+		"nova sapphire", "reset reapers",
+	}
+	for _, label := range phraseLabels {
+		if strings.Contains(lower, label) {
+			return true
+		}
+	}
+	return false
 }
 
 // Detect selected day tab by color (white/light background indicates selected tab)
@@ -7878,28 +7944,17 @@ func detectDayFromTabRegion(imageData []byte) string {
 
 	// Look for day names in the tab text
 	textLower := strings.ToLower(text)
-	days := []struct {
-		name     string
-		patterns []string
-	}{
-		{"monday", []string{"monday", "mon.", "mon"}},
-		{"tuesday", []string{"tuesday", "tues.", "tues", "tue"}},
-		{"wednesday", []string{"wednesday", "wed.", "wed"}},
-		{"thursday", []string{"thursday", "thur.", "thur", "thu"}},
-		{"friday", []string{"friday", "fri.", "fri"}},
-		{"saturday", []string{"saturday", "sat.", "sat"}},
-	}
 
 	// Find which day patterns appear in the text
 	// The selected tab usually appears first or more prominently
-	for _, day := range days {
-		for _, pattern := range day.patterns {
+	for _, day := range vsDayPatterns() {
+		for _, pattern := range day.Patterns {
 			if strings.Contains(textLower, pattern) {
 				// Check if this appears early in the text (likely the selected/highlighted tab)
 				idx := strings.Index(textLower, pattern)
 				if idx < 100 { // Within first 100 chars suggests it's prominent
-					log.Printf("Detected day '%s' from tab region (pattern: '%s' at position %d)", day.name, pattern, idx)
-					return day.name
+					log.Printf("Detected day '%s' from tab region (pattern: '%s' at position %d)", day.Name, pattern, idx)
+					return day.Name
 				}
 			}
 		}
@@ -7938,22 +7993,15 @@ func extractVSPointsDataFromImage(imageData []byte) (day string, records []struc
 	// known UI label (header row leaked in, alliance text, etc.)
 	rowResultsValid := err == nil && len(records) >= 3
 	if rowResultsValid {
-		uiLabels := []string{"commander", "ranking", "points", "nova sapphire", "reset reapers"}
 		for _, r := range records {
-			name := strings.ToLower(r.MemberName)
 			if strings.ContainsRune(r.MemberName, '\n') || strings.ContainsRune(r.MemberName, '\r') {
 				log.Printf("Row OCR quality check: name %q contains newline — discarding row results", r.MemberName)
 				rowResultsValid = false
 				break
 			}
-			for _, label := range uiLabels {
-				if strings.Contains(name, label) {
-					log.Printf("Row OCR quality check: name %q matches UI label %q — discarding row results", r.MemberName, label)
-					rowResultsValid = false
-					break
-				}
-			}
-			if !rowResultsValid {
+			if isVSUILabel(r.MemberName) {
+				log.Printf("Row OCR quality check: name %q matches UI label — discarding row results", r.MemberName)
+				rowResultsValid = false
 				break
 			}
 		}
@@ -8205,18 +8253,16 @@ func detectSelectedDay(text string) string {
 	textLower := strings.ToLower(text)
 
 	// Check for presence of day names and "Daily Rank" which indicates VS points screen
-	if !strings.Contains(textLower, "daily") && !strings.Contains(textLower, "rank") {
+	// Also accept German equivalents ("Tagesrang", "Rang").
+	if !strings.Contains(textLower, "daily") && !strings.Contains(textLower, "rank") &&
+		!strings.Contains(textLower, "tages") && !strings.Contains(textLower, "rang") {
 		return "" // Not a daily rank screen
 	}
 
 	// Count occurrences of each day name (the selected day often appears more prominently)
-	days := map[string][]string{
-		"monday":    {"monday", "mon.", "mon"},
-		"tuesday":   {"tuesday", "tues.", "tues"},
-		"wednesday": {"wednesday", "wed.", "wed"},
-		"thursday":  {"thursday", "thur.", "thur"},
-		"friday":    {"friday", "fri.", "fri"},
-		"saturday":  {"saturday", "sat.", "sat"},
+	days := map[string][]string{}
+	for _, dp := range vsDayPatterns() {
+		days[dp.Name] = dp.Patterns
 	}
 
 	dayScores := make(map[string]int)
@@ -8269,8 +8315,9 @@ func parseVSPointsText(text string) []struct {
 
 	lines := strings.Split(text, "\n")
 
-	// Number pattern: plain 6+ digits OR comma-formatted (19,291,992)
-	numPat := `([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{6,})`
+	// Number pattern: plain 6+ digits or grouped with English/German separators
+	// (19,291,992 or 19.291.992).
+	numPat := `([0-9]{1,3}(?:[,.][0-9]{3})+|[0-9]{6,})`
 
 	// Pattern 1: leading rank digit + name + optional alliance tag + number (all on one line)
 	rankPrefixPattern := regexp.MustCompile(`^[0-9]{1,3}\s+([A-Za-z][A-Za-z0-9_\s]+?)\s+(?:\[[^\]]*\][^0-9]*)?\s*` + numPat)
@@ -8311,12 +8358,8 @@ func parseVSPointsText(text string) []struct {
 		if !regexp.MustCompile(`^[A-Za-z]`).MatchString(line) {
 			return false
 		}
-		lower := strings.ToLower(line)
-		for _, skip := range []string{"ranking", "commander", "points", "daily rank",
-			"weekly rank", "your alliance", "nova sapphire", "reset reapers"} {
-			if strings.Contains(lower, skip) {
-				return false
-			}
+		if isVSUILabel(line) {
+			return false
 		}
 		return true
 	}
@@ -8325,7 +8368,7 @@ func parseVSPointsText(text string) []struct {
 	whitespaceRe := regexp.MustCompile(`\s+`)
 	nonDigitRe := regexp.MustCompile(`[^0-9]`)
 	skipLineRe := regexp.MustCompile(`^[0-9]{1,3}\.?$`)
-	dayRe := regexp.MustCompile(`^(mon|tues|wed|thur|fri|sat|sun)\.?$`)
+	dayRe := regexp.MustCompile(`^(mon|mo|tues|tue|di|wed|mi|thur|thu|do|fri|fr|sat|sa|sun|so)\.?$`)
 
 	// Track seen names to avoid duplicates
 	seenNames := make(map[string]bool)
@@ -8350,10 +8393,7 @@ func parseVSPointsText(text string) []struct {
 			continue
 		}
 		lowerLine := strings.ToLower(line)
-		if strings.Contains(lowerLine, "ranking") || strings.Contains(lowerLine, "commander") ||
-			strings.Contains(lowerLine, "points") || strings.Contains(lowerLine, "daily rank") ||
-			strings.Contains(lowerLine, "weekly rank") || strings.Contains(lowerLine, "your alliance") ||
-			dayRe.MatchString(lowerLine) {
+		if isVSUILabel(line) || dayRe.MatchString(lowerLine) {
 			continue
 		}
 
@@ -13116,9 +13156,14 @@ func main() {
 	// Serve static files
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./static")))
 
-	log.Println("Server starting on http://localhost:8080")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Server starting on http://localhost:%s", port)
 	srv := &http.Server{
-		Addr:         ":8080",
+		Addr:         ":" + port,
 		Handler:      requestLoggingMiddleware(router),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
