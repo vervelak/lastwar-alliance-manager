@@ -13160,8 +13160,11 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	if _, err := strconv.Atoi(port); err != nil {
+		log.Fatalf("Invalid PORT value: %q", port) // #nosec G706 — program exits immediately
+	}
 
-	log.Printf("Server starting on http://localhost:%s", port)
+	log.Printf("Server starting on http://localhost:%s", port) // #nosec G706 — port validated as numeric above
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      requestLoggingMiddleware(router),
