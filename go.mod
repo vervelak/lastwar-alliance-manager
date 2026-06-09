@@ -7,7 +7,7 @@ require (
 	github.com/gorilla/sessions v1.4.0
 	github.com/otiai10/gosseract/v2 v2.4.1
 	golang.org/x/crypto v0.52.0
-	modernc.org/sqlite v1.51.0
+	modernc.org/sqlite v1.52.0
 )
 
 require (
