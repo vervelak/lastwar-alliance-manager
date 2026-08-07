@@ -17,7 +17,7 @@ COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -o main .
 
 # Runtime stage
-FROM alpine:3.23
+FROM alpine:3.24
 
 # Install runtime dependencies:
 #   ca-certificates  - HTTPS support
