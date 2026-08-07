@@ -8482,7 +8482,7 @@ func ocrVSPointsValue(img image.Image) (int64, string, []vsPointsCandidate, bool
 			scoreByValue[value] += score
 			totalScore := scoreByValue[value] + seen[value]*3
 			if totalScore > best.Score {
-				best = vsPointsCandidate{Value: value, Raw: raw, Votes: seen[value], Score: totalScore}
+				best = vsPointsCandidate{Value: value, Raw: raw, Score: totalScore}
 			}
 		}
 	}
@@ -8943,7 +8943,6 @@ func extractVSPointsByRows(img image.Image, attrs *ScreenshotAttributes) ([]VSOC
 				rows[lastIdx].Points = bestRevision.Value
 				rows[lastIdx].RawPoints = bestRevision.Raw
 				rows[lastIdx].Notes = append(rows[lastIdx].Notes, "points adjusted: next row made lower candidate plausible")
-				previousAcceptedPoints = bestRevision.Value
 			}
 		}
 
