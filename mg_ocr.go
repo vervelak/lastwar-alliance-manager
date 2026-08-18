@@ -991,5 +991,110 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 		return result.Members[i].Rank < result.Members[j].Rank
 	})
 
+	// Fallback date extraction: the colour-segmentation heuristic above misses the
+	// datetime line on many screenshots. Recover it with a proportional center crop
+	// near the bottom of the mail body (same approach used by extractMGByMask).
+	if result.EventDate == "" {
+		result.EventDate = mgExtractEventDate(img, width, height)
+	}
+
+	// Fix dropped-decimal damage values (e.g. "152G" OCR'd instead of "1.52G") by
+	// detecting implausible outliers against nearby ranks.
+	mgFixDamageOutliers(result.Members)
+
+	// The MVP (top card) always out-damages every listed member. If the extracted
+	// top damage is below the highest member damage, the top card was misread —
+	// discard it rather than report a wrong value.
+	if result.TopPlayerDmgInt > 0 {
+		maxMember := int64(0)
+		for _, m := range result.Members {
+			if m.DamageInt > maxMember {
+				maxMember = m.DamageInt
+			}
+		}
+		if maxMember > 0 && result.TopPlayerDmgInt < maxMember {
+			log.Printf("mg_ocr: top card implausible (%d < max member %d), discarding", result.TopPlayerDmgInt, maxMember)
+			result.TopPlayerName = ""
+			result.TopPlayerDmgStr = ""
+			result.TopPlayerDmgInt = 0
+		}
+	}
+
 	return result, nil
+}
+
+// mgExtractEventDate extracts the event date from the full MG mail screenshot
+// using a proportional center crop near the bottom of the mail body.
+func mgExtractEventDate(img image.Image, width, height int) string {
+	x0 := int(float64(width) * 0.15)
+	x1 := int(float64(width) * 0.85)
+	y0 := int(float64(height) * 0.88)
+	y1 := int(float64(height) * 0.91)
+	if y1-y0 < 8 {
+		y1 = y0 + 8
+	}
+	if x1 <= x0 || y1 <= y0 || y1 > height || x1 > width {
+		return ""
+	}
+	rect := mgRect{x0: x0, y0: y0, x1: x1, y1: y1}
+	dateRe := regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
+	for _, mode := range []int{0, 1, 2} {
+		data, err := mgCropAndBinarize(img, rect, mode)
+		if err != nil {
+			continue
+		}
+		raw, err := mgRunOCR(data, gosseract.PSM_SINGLE_LINE, "")
+		if err != nil {
+			continue
+		}
+		log.Printf("mg_ocr: date fallback mode=%d raw OCR: %q", mode, raw)
+		if m := dateRe.FindStringSubmatch(raw); m != nil {
+			y, _ := strconv.Atoi(m[1])
+			mo, _ := strconv.Atoi(m[2])
+			d, _ := strconv.Atoi(m[3])
+			if y >= 2000 && y <= 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31 {
+				return fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
+			}
+		}
+	}
+	return ""
+}
+
+// mgFixDamageOutliers repairs damage values whose decimal point was dropped by
+// OCR (e.g. "152G" read from "1.52G"). A dropped decimal makes the value ~100×
+// (or ~1000×) the neighbouring ranks, so we divide it back when it is a clear
+// outlier against nearby valid values.
+func mgFixDamageOutliers(members []mgMemberOCR) {
+	for i := range members {
+		if !members[i].DamageOK || members[i].DamageInt <= 0 {
+			continue
+		}
+		var refs []int64
+		for j := range members {
+			if j == i || !members[j].DamageOK || members[j].DamageInt <= 0 {
+				continue
+			}
+			if absInt64(int64(members[j].Rank-members[i].Rank)) <= 5 {
+				refs = append(refs, members[j].DamageInt)
+			}
+		}
+		if len(refs) == 0 {
+			continue
+		}
+		sort.Slice(refs, func(a, b int) bool { return refs[a] < refs[b] })
+		median := refs[len(refs)/2]
+		if median <= 0 {
+			continue
+		}
+		v := members[i].DamageInt
+		for v >= median*50 {
+			v /= 100
+		}
+		if v != members[i].DamageInt {
+			log.Printf("mg_ocr: damage outlier repair rank %d: %d -> %d", members[i].Rank, members[i].DamageInt, v)
+			members[i].DamageInt = v
+			members[i].DamageStr = mgFormatDamageStr(v)
+			members[i].DamageOK = true
+		}
+	}
 }

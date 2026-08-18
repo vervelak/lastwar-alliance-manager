@@ -7553,6 +7553,9 @@ func parsePowerRankingsText(text string) []struct {
 			name := strings.TrimSpace(matches[1])
 			// Clean up extra whitespace in names
 			name = regexp.MustCompile(`\s+`).ReplaceAllString(name, " ")
+			// Strip rank-badge glyphs that OCR misreads into the start of a name
+			// (e.g. "Ra Mochinas", "Re ryukyuki", "oy cS RS kili").
+			name = stripPowerRankBadge(name)
 
 			powerStr := strings.ReplaceAll(matches[2], ",", "")
 			powerStr = strings.ReplaceAll(powerStr, " ", "")
@@ -7592,7 +7595,53 @@ func parsePowerRankingsText(text string) []struct {
 		}
 	}
 
-	return records
+	return stripPowerTrailingPins(records)
+}
+
+// stripPowerRankBadge removes OCR misreads of the rank badge (R1–R5) that leak
+// into the start of a player name. The badge renders as short 2-char tokens
+// ("Ra", "Re", "Ri", "Ly", "RI", "oy cS RS") immediately before the real name.
+func stripPowerRankBadge(name string) string {
+	fields := strings.Fields(name)
+	stripped := 0
+	for len(fields) > 1 && stripped < 3 {
+		if len(fields[0]) == 2 {
+			fields = fields[1:]
+			stripped++
+			continue
+		}
+		break
+	}
+	// Only keep the stripped result when a plausible (>=3 char) name token remains.
+	if len(fields) > 0 && len(fields[0]) >= 3 {
+		return strings.Join(fields, " ")
+	}
+	return name
+}
+
+// stripPowerTrailingPins drops records that break the strictly-descending power
+// ordering. The pinned "you" row (the viewer's own rank) is always rendered at
+// the bottom of every screenshot with the same high power value, so it appears
+// as a trailing record whose power is greater than the rank above it.
+func stripPowerTrailingPins(records []struct {
+	MemberName string `json:"member_name"`
+	Power      int64  `json:"power"`
+}) []struct {
+	MemberName string `json:"member_name"`
+	Power      int64  `json:"power"`
+} {
+	out := make([]struct {
+		MemberName string `json:"member_name"`
+		Power      int64  `json:"power"`
+	}, 0, len(records))
+	for _, r := range records {
+		if len(out) > 0 && r.Power > out[len(out)-1].Power {
+			log.Printf("Power OCR: dropping out-of-order record %s=%d (pinned 'you' row or OCR misread)", r.MemberName, r.Power)
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // extractPowerByRows segments the power rankings screenshot into individual rows
@@ -8772,8 +8821,12 @@ func mergeVSRecordsByName(primary []VSOCRRecord, supplemental []VSOCRRecord) []V
 		return primary
 	}
 	seen := map[string]bool{}
+	seenPoints := map[int64]bool{}
 	for _, r := range primary {
 		seen[normalizeName(r.MemberName)] = true
+		if r.Points > 0 {
+			seenPoints[r.Points] = true
+		}
 	}
 	for _, r := range supplemental {
 		r.MemberName = cleanVSRowName(r.MemberName)
@@ -8784,10 +8837,19 @@ func mergeVSRecordsByName(primary []VSOCRRecord, supplemental []VSOCRRecord) []V
 		if key == "" || seen[key] {
 			continue
 		}
+		// Each rank in a single screenshot has a unique points value. A repeated
+		// value means the full-image fallback re-read an already-extracted row
+		// under a mis-OCR'd alias name — skip it.
+		if r.Points > 0 && seenPoints[r.Points] {
+			continue
+		}
 		r.Confidence = "review"
 		r.Notes = append(r.Notes, "added from full-image OCR fallback")
 		primary = append(primary, r)
 		seen[key] = true
+		if r.Points > 0 {
+			seenPoints[r.Points] = true
+		}
 		log.Printf("VS OCR supplemental full-image record: %s -> %d", r.MemberName, r.Points)
 	}
 	return primary
