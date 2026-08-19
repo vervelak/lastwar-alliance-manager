@@ -7750,6 +7750,376 @@ func repairPowerSingleDigit(power, prev, next, prior int64) (int64, bool) {
 	return best, true
 }
 
+// ── Desert Storm ─────────────────────────────────────────────────────────────
+
+// DSOCRRecord is a single Desert Storm ranking row extracted from a screenshot.
+type DSOCRRecord struct {
+	MemberName  string `json:"member_name"`
+	AllianceTag string `json:"alliance_tag"`
+	Damage      int64  `json:"damage"`
+}
+
+// dsHeaderNoise lists substrings that mark Desert Storm UI header/decoration
+// lines and must be dropped before name/damage parsing.
+var dsHeaderNoise = []string{
+	"desert", "storm", "battle", "result", "individual", "point",
+	"ranking", "commander", "wave", "report", "congrat", "defend",
+	"stronghold", "suppl",
+}
+
+func dsContainsNoise(line string) bool {
+	lower := strings.ToLower(line)
+	for _, n := range dsHeaderNoise {
+		if strings.Contains(lower, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// dsIsDigits reports whether s contains only ASCII digits.
+func dsIsDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseDSNumber recognises a standalone damage line. DS damage can be "0"
+// (bottom ranks) up to ~10 digits. A candidate must already be digit-dominant
+// before any correction, so player-name lines (mostly letters) are never
+// mistaken for numbers; common OCR letter misreads are then corrected.
+func parseDSNumber(line string) (int64, bool) {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return 0, false
+	}
+	s = strings.TrimRight(s, ".,;:|")
+	s = strings.ReplaceAll(s, ",", "")
+	s = strings.ReplaceAll(s, " ", "")
+	if s == "" {
+		return 0, false
+	}
+	digits := 0
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			digits++
+		}
+	}
+	if digits == 0 || digits < len(s)-digits {
+		return 0, false
+	}
+	s = strings.NewReplacer(
+		"O", "0", "o", "0", "S", "5", "s", "5", "l", "1", "I", "1",
+		"Z", "2", "B", "8", "b", "6", "G", "6", "g", "9", "e", "6",
+	).Replace(s)
+	s = regexp.MustCompile(`[^0-9]`).ReplaceAllString(s, "")
+	if s == "" || len(s) > 10 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseDesertStormText parses OCR text from the (left-column-trimmed) Desert
+// Storm data region. The ranking list renders "[TAG]Name" with the damage
+// number beneath it, so the parser pairs a name line with a following number
+// line. It also tolerates OCR joining them into a single "name number" line
+// when the trailing number is large (5+ digits — player names never end in
+// more than 4 digits).
+func parseDesertStormText(text string) ([]DSOCRRecord, string) {
+	var records []DSOCRRecord
+	eventDate := ""
+	knownTag := getAllianceShortName()
+
+	dateRe := regexp.MustCompile(`(\d{4})[-/](\d{1,2})[-/](\d{1,2})`)
+	sameLineRe := regexp.MustCompile(`^(.+?)\s+(\d{5,10})\s*[.,]?$`)
+
+	var pendingName, pendingTag string
+	emit := func() {
+		if pendingName != "" {
+			records = append(records, DSOCRRecord{MemberName: pendingName, AllianceTag: pendingTag, Damage: 0})
+		}
+	}
+
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+
+		// Event date from the trailing timestamp ("2026-8-7 23:30:12").
+		if eventDate == "" {
+			if m := dateRe.FindStringSubmatch(line); m != nil {
+				eventDate = m[1] + "-" + m[2] + "-" + m[3]
+			}
+		}
+
+		// Skip timestamp and header/decoration lines.
+		if dateRe.MatchString(strings.TrimSpace(line)) && !strings.Contains(line, " ") {
+			continue
+		}
+		if strings.HasPrefix(line, "202") && strings.Contains(line, ":") {
+			continue
+		}
+		if dsContainsNoise(line) {
+			continue
+		}
+
+		// Same-line "name number" (large trailing number).
+		if m := sameLineRe.FindStringSubmatch(line); m != nil {
+			if num, ok := parseDSNumber(m[2]); ok {
+				tag, nameOnly := parsePlayerTag(m[1], knownTag)
+				nameOnly = strings.TrimSpace(nameOnly)
+				if len(nameOnly) >= 2 {
+					records = append(records, DSOCRRecord{MemberName: nameOnly, AllianceTag: tag, Damage: num})
+					pendingName, pendingTag = "", ""
+					continue
+				}
+			}
+		}
+
+		// Standalone number line → damage for the pending name.
+		if num, ok := parseDSNumber(line); ok {
+			if pendingName != "" {
+				records = append(records, DSOCRRecord{MemberName: pendingName, AllianceTag: pendingTag, Damage: num})
+				pendingName, pendingTag = "", ""
+			}
+			continue
+		}
+
+		// Otherwise treat as a name line (replaces any un-paired pending name,
+		// which happens with OCR garbage like "eitithel Pots" before the list).
+		tag, nameOnly := parsePlayerTag(line, knownTag)
+		nameOnly = strings.TrimSpace(nameOnly)
+		if len(nameOnly) >= 2 {
+			pendingName, pendingTag = nameOnly, tag
+		}
+	}
+	emit()
+
+	// Dedupe by name (keep first occurrence — the higher rank / damage).
+	seen := map[string]bool{}
+	out := records[:0]
+	for _, r := range records {
+		key := strings.ToLower(r.MemberName)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+
+	// Drop any trailing record that never got a damage value paired.
+	final := out[:0]
+	for _, r := range out {
+		if r.Damage > 0 || r.MemberName != "" {
+			final = append(final, r)
+		}
+	}
+	return final, eventDate
+}
+
+// parseDesertStormWords builds Desert Storm records from tesseract word boxes.
+// The ranking list left-aligns "[TAG]Name" with the damage number on the line
+// directly beneath it, both at ~10.5% of the crop width. Words left of that
+// column (rank-number/avatar artwork) and right of it (header/decoration/
+// timestamp) are noise, so grouping words into lines and classifying by the
+// alignment column plus digit content avoids the plain-text parser's misreads
+// (split damage numbers, leaked rank badges, joined "name number" lines).
+func parseDesertStormWords(boxes []gosseract.BoundingBox, cropWidth int) ([]DSOCRRecord, string) {
+	var records []DSOCRRecord
+	knownTag := getAllianceShortName()
+	dateRe := regexp.MustCompile(`(\d{4})[-/](\d{1,2})[-/](\d{1,2})`)
+	eventDate := ""
+
+	if cropWidth <= 0 {
+		cropWidth = 1
+	}
+	minListX := cropWidth * 95 / 1000
+	maxListX := cropWidth * 160 / 1000
+
+	type word struct {
+		text string
+		x, y int
+	}
+	var words []word
+	for _, b := range boxes {
+		s := strings.TrimSpace(b.Word)
+		if s == "" {
+			continue
+		}
+		if eventDate == "" {
+			if m := dateRe.FindStringSubmatch(s); m != nil {
+				eventDate = m[1] + "-" + m[2] + "-" + m[3]
+			}
+		}
+		if b.Box.Min.X < minListX && !dsIsDigits(s) {
+			// Left of the name/damage column: keep only pure-digit
+			// fragments (leading digits of a split damage number hidden
+			// under rank/avatar artwork). Drop rank badges and other noise.
+			continue
+		}
+		words = append(words, word{text: s, x: b.Box.Min.X, y: b.Box.Min.Y})
+	}
+
+	sort.SliceStable(words, func(i, j int) bool {
+		if words[i].y != words[j].y {
+			return words[i].y < words[j].y
+		}
+		return words[i].x < words[j].x
+	})
+
+	type line struct {
+		text string
+		x    int
+	}
+	// Group words into visual lines: names and damages sit ~104px apart
+	// vertically, while a multi-word name varies by only a few px.
+	var wordLines [][]word
+	for _, w := range words {
+		if len(wordLines) == 0 || w.y-wordLines[len(wordLines)-1][0].y > 40 {
+			wordLines = append(wordLines, []word{w})
+			continue
+		}
+		wordLines[len(wordLines)-1] = append(wordLines[len(wordLines)-1], w)
+	}
+	var lines []line
+	for _, ws := range wordLines {
+		// Order left-to-right so a split "[TAG] name" joins correctly even
+		// when OCR boxes sit at slightly different y.
+		sort.SliceStable(ws, func(i, j int) bool { return ws[i].x < ws[j].x })
+		var sb strings.Builder
+		for i, w := range ws {
+			if i > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString(w.text)
+		}
+		lines = append(lines, line{text: sb.String(), x: ws[0].x})
+	}
+
+	var pendingName, pendingTag string
+	for _, l := range lines {
+		if l.x > maxListX {
+			continue // header/decoration or right-side noise
+		}
+		if n, ok := parseDSNumber(l.text); ok {
+			if pendingName != "" {
+				records = append(records, DSOCRRecord{MemberName: pendingName, AllianceTag: pendingTag, Damage: n})
+				pendingName, pendingTag = "", ""
+			}
+			continue
+		}
+		tag, nameOnly := parsePlayerTag(l.text, knownTag)
+		nameOnly = strings.TrimSpace(nameOnly)
+		if len(nameOnly) >= 2 {
+			pendingName, pendingTag = nameOnly, tag
+		}
+	}
+
+	// Dedupe by name (first occurrence = higher rank/damage).
+	seen := map[string]bool{}
+	out := records[:0]
+	for _, r := range records {
+		key := strings.ToLower(r.MemberName)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+	return out, eventDate
+}
+
+// extractDesertStormDataFromImage OCRs a Desert Storm battle-results
+// screenshot. It crops to the data region, drops the left ~33% avatar/rank
+// artwork (which produces noise), and parses the left-aligned ranking list.
+// Returns records sorted by damage descending plus the detected event date.
+func extractDesertStormDataFromImage(imageData []byte) ([]DSOCRRecord, string, error) {
+	img, _, err := image.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to decode image: %v", err)
+	}
+
+	attrs := analyzeScreenshot(img)
+	if attrs.DataRegion == nil || attrs.Width <= 0 {
+		return nil, "", fmt.Errorf("could not analyze screenshot")
+	}
+
+	cropLeft := attrs.Width * 33 / 100
+	cropRight := attrs.Width
+	cropTop := attrs.DataRegion.Top
+	cropBottom := attrs.DataRegion.Bottom
+	if cropBottom > attrs.Height {
+		cropBottom = attrs.Height
+	}
+	if cropTop >= cropBottom || cropRight <= cropLeft {
+		return nil, "", fmt.Errorf("invalid crop region")
+	}
+
+	crop := image.NewRGBA(image.Rect(0, 0, cropRight-cropLeft, cropBottom-cropTop))
+	draw.Draw(crop, crop.Bounds(), img, image.Point{cropLeft, cropTop}, draw.Src)
+
+	gray := convertToGrayscale(scaleImage(crop, 2))
+	crop2xWidth := gray.Bounds().Dx()
+	data, err := encodePNGBytes(gray)
+	if err != nil {
+		return nil, "", err
+	}
+
+	client := gosseract.NewClient()
+	defer client.Close()
+	if err := client.SetImageFromBytes(data); err != nil {
+		return nil, "", fmt.Errorf("failed to load image: %v", err)
+	}
+
+	var records []DSOCRRecord
+	var eventDate string
+
+	// Primary path: word boxes carry spatial layout, so split damage numbers
+	// and leaked rank-badge noise can be filtered by position.
+	for _, mode := range []gosseract.PageSegMode{gosseract.PSM_AUTO, gosseract.PSM_SPARSE_TEXT, gosseract.PSM_SINGLE_BLOCK} {
+		client.SetPageSegMode(mode)
+		boxes, err := client.GetBoundingBoxes(gosseract.RIL_WORD)
+		if err != nil || len(boxes) == 0 {
+			continue
+		}
+		records, eventDate = parseDesertStormWords(boxes, crop2xWidth)
+		if len(records) > 0 {
+			break
+		}
+	}
+
+	// Fallback: plain text for older/quirky layouts where word boxes fail.
+	if len(records) == 0 {
+		for _, mode := range []gosseract.PageSegMode{gosseract.PSM_SINGLE_BLOCK, gosseract.PSM_AUTO, gosseract.PSM_SPARSE_TEXT} {
+			client.SetPageSegMode(mode)
+			if t, err := client.Text(); err == nil && len(strings.TrimSpace(t)) > 0 {
+				records, eventDate = parseDesertStormText(t)
+				if len(records) > 0 {
+					break
+				}
+			}
+		}
+	}
+
+	if len(records) == 0 {
+		return nil, eventDate, fmt.Errorf("no valid records found in Desert Storm screenshot")
+	}
+
+	sort.SliceStable(records, func(i, j int) bool { return records[i].Damage > records[j].Damage })
+	return records, eventDate, nil
+}
+
 // extractPowerByRows segments the power rankings screenshot into individual rows
 // using edge-based separator detection and OCRs each name+power cell separately.
 //
@@ -12073,6 +12443,14 @@ func loadAllMembers() ([]Member, error) {
 // parsePlayerTag extracts the alliance tag and plain player name from strings like
 // "[RSRP]Gargoland" or "[RSRPlJazzyopolis" (where ] was OCR'd as l, 1, | or I).
 // knownTag (from settings) is used for fuzzy bracket matching before standard parsing.
+// getAllianceShortName returns the uppercase alliance short name from settings,
+// used as the known tag hint for player-tag parsing.
+func getAllianceShortName() string {
+	var tag string
+	db.QueryRow(`SELECT COALESCE(alliance_short_name, '') FROM settings WHERE id = 1`).Scan(&tag)
+	return strings.ToUpper(strings.TrimSpace(tag))
+}
+
 func parsePlayerTag(name, knownTag string) (tag, nameOnly string) {
 	name = strings.TrimSpace(name)
 	// Prefer known-tag match with fuzzy closing bracket.
