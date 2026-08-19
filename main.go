@@ -7644,6 +7644,112 @@ func stripPowerTrailingPins(records []struct {
 	return out
 }
 
+// powerDigitConfusions maps a digit to the set of digits OCR commonly confuses
+// it with. Symmetric pairs are listed both ways.
+var powerDigitConfusions = map[byte][]byte{
+	'3': {'2'},
+	'2': {'3'},
+	'8': {'0', '3'},
+	'0': {'8'},
+	'1': {'7'},
+	'7': {'1'},
+	'5': {'6'},
+	'6': {'5'},
+}
+
+// repairPowerByOrder fixes records whose power breaks the strictly-descending
+// ranking order by trying single-digit substitutions from the confusion map.
+// Candidates must stay below the previous row, above the next row, and within
+// the realistic power range; the winner is chosen closest to the member's most
+// recent stored power (or smallest digit change when no prior exists).
+// Unrepairable violations (including the pinned "you" row) are dropped.
+func repairPowerByOrder(records []struct {
+	MemberName string `json:"member_name"`
+	Power      int64  `json:"power"`
+}, prior map[string]int64) []struct {
+	MemberName string `json:"member_name"`
+	Power      int64  `json:"power"`
+} {
+	if len(records) < 2 {
+		return records
+	}
+	out := make([]struct {
+		MemberName string `json:"member_name"`
+		Power      int64  `json:"power"`
+	}, 0, len(records))
+	out = append(out, records[0])
+	for i := 1; i < len(records); i++ {
+		cur := records[i]
+		prev := out[len(out)-1].Power
+		if cur.Power <= prev {
+			out = append(out, cur)
+			continue
+		}
+		next := int64(0)
+		if i+1 < len(records) {
+			next = records[i+1].Power
+		}
+		priorPower := prior[normalizeName(cur.MemberName)]
+		if fixed, ok := repairPowerSingleDigit(cur.Power, prev, next, priorPower); ok {
+			log.Printf("Power OCR order repair: %s %d -> %d (prev=%d)", cur.MemberName, cur.Power, fixed, prev)
+			cur.Power = fixed
+			out = append(out, cur)
+			continue
+		}
+		log.Printf("Power OCR: dropping unrepaired out-of-order record %s=%d", cur.MemberName, cur.Power)
+	}
+	return out
+}
+
+// repairPowerSingleDigit enumerates single-digit substitutions for a power
+// value that violate descending order and returns the best valid candidate.
+func repairPowerSingleDigit(power, prev, next, prior int64) (int64, bool) {
+	s := strconv.FormatInt(power, 10)
+	best := int64(0)
+	bestScore := int64(-1)
+	for i := 0; i < len(s); i++ {
+		for _, d := range powerDigitConfusions[s[i]] {
+			if d == s[i] {
+				continue
+			}
+			b := []byte(s)
+			b[i] = d
+			v, err := strconv.ParseInt(string(b), 10, 64)
+			if err != nil || v < 1000000 {
+				continue
+			}
+			if v >= prev {
+				continue
+			}
+			if next > 0 && v <= next {
+				continue
+			}
+			var score int64
+			if prior > 0 {
+				diff := v - prior
+				if diff < 0 {
+					diff = -diff
+				}
+				score = -diff // closer to prior = better
+			} else {
+				change := power - v
+				if change < 0 {
+					change = -change
+				}
+				score = -change // smaller digit change = better
+			}
+			if best == 0 || score > bestScore {
+				best = v
+				bestScore = score
+			}
+		}
+	}
+	if best == 0 {
+		return 0, false
+	}
+	return best, true
+}
+
 // extractPowerByRows segments the power rankings screenshot into individual rows
 // using edge-based separator detection and OCRs each name+power cell separately.
 //
@@ -7672,7 +7778,7 @@ func extractPowerByRows(img image.Image, attrs *ScreenshotAttributes) ([]struct 
 		Power      int64  `json:"power"`
 	}{}
 
-	nonDigitRe := regexp.MustCompile(`[^0-9]`)
+	prevPower := int64(0)
 
 	for i, rb := range rowBounds {
 		rowTop, rowBottom := rb[0], rb[1]
@@ -7700,8 +7806,6 @@ func extractPowerByRows(img image.Image, attrs *ScreenshotAttributes) ([]struct 
 
 		scaledName := scaleImage(nameImg, 3)
 		grayName := convertToGrayscale(scaledName)
-		scaledPower := scaleImage(powerImg, 3)
-		grayPower := convertToGrayscale(scaledPower)
 
 		var nameBuf bytes.Buffer
 		if err := png.Encode(&nameBuf, grayName); err != nil {
@@ -7717,35 +7821,21 @@ func extractPowerByRows(img image.Image, attrs *ScreenshotAttributes) ([]struct 
 			continue
 		}
 
-		var powerBuf bytes.Buffer
-		if err := png.Encode(&powerBuf, grayPower); err != nil {
-			log.Printf("Power row %d: encode power failed: %v", i+1, err)
-			continue
-		}
-		powerClient := gosseract.NewClient()
-		defer powerClient.Close()
-		powerClient.SetImageFromBytes(powerBuf.Bytes())
-		powerClient.SetVariable("tessedit_char_whitelist", "0123456789,")
-		powerClient.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
-		powerText, err := powerClient.Text()
-		if err != nil || len(strings.TrimSpace(powerText)) == 0 {
-			log.Printf("Power row %d: Name='%s', no power value found", i+1, strings.TrimSpace(nameText))
-			continue
-		}
-
 		name := cleanPlayerName(strings.TrimSpace(nameText))
 		if len(name) < 2 {
 			continue
 		}
 
-		powerStr := nonDigitRe.ReplaceAllString(strings.TrimSpace(powerText), "")
-		power, err := strconv.ParseInt(powerStr, 10, 64)
-		if err != nil || power < 1000000 { // power must be at least 1M
-			log.Printf("Power row %d: skipping invalid power '%s' for '%s'", i+1, powerStr, name)
+		// Multi-variant per-digit voting: a single 3-vs-2 style misread in one
+		// preprocessing variant doesn't win the value.
+		powerStr, power, ok := extractPowerVoted(powerImg, prevPower)
+		if !ok {
+			log.Printf("Power row %d: Name='%s', no power value found", i+1, name)
 			continue
 		}
 
-		log.Printf("Power row %d: Name='%s', Power=%d", i+1, name, power)
+		log.Printf("Power row %d: Name='%s', Power=%d (%s)", i+1, name, power, powerStr)
+		prevPower = power
 		records = append(records, struct {
 			MemberName string `json:"member_name"`
 			Power      int64  `json:"power"`
@@ -7753,6 +7843,312 @@ func extractPowerByRows(img image.Image, attrs *ScreenshotAttributes) ([]struct 
 	}
 
 	return records, nil
+}
+
+// powerNonDigitRe strips non-digits from OCR output.
+var powerNonDigitRe = regexp.MustCompile(`[^0-9]`)
+
+// extractPowerVoted reads a power cell crop with multiple preprocessing
+// variants and majority-votes per digit (right-aligned), so a single 3-vs-2
+// style misread in one variant doesn't win. Disputed digits are re-OCR'd from
+// per-symbol boxes before falling back to order-based tiebreaks.
+func extractPowerVoted(powerImg image.Image, prevPower int64) (string, int64, bool) {
+	variants := powerDigitVariants(powerImg)
+	if len(variants) == 0 {
+		return "", 0, false
+	}
+	digits, disputed := votePowerDigits(variants)
+	if len(disputed) > 0 {
+		if fixed, remaining := powerSymbolRecheck(powerImg, digits, disputed); len(remaining) < len(disputed) {
+			digits, disputed = fixed, remaining
+		}
+	}
+	if len(disputed) > 0 {
+		digits = powerOrderTiebreak(variants, digits, disputed, prevPower)
+	}
+	power, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil || power < 1000000 {
+		return "", 0, false
+	}
+	return digits, power, true
+}
+
+// powerDigitVariants OCRs a power cell crop under several scale/binarization
+// variants and returns the digit strings it produced (min 6 digits each).
+func powerDigitVariants(powerImg image.Image) []string {
+	gray := convertToGrayscale(powerImg)
+	var out []string
+	for _, scale := range []int{2, 3, 4} {
+		scaled := convertToGrayscale(scaleImage(gray, scale))
+		for _, bin := range []int{0, 2} {
+			proc := powerBinarize(scaled, bin)
+			data, err := encodePNGBytes(proc)
+			if err != nil {
+				continue
+			}
+			client := gosseract.NewClient()
+			if err := client.SetImageFromBytes(data); err != nil {
+				client.Close()
+				continue
+			}
+			client.SetVariable("tessedit_char_whitelist", "0123456789")
+			client.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
+			text, err := client.Text()
+			client.Close()
+			if err != nil {
+				continue
+			}
+			d := powerNonDigitRe.ReplaceAllString(text, "")
+			if len(d) >= 6 {
+				out = append(out, d)
+				log.Printf("Power OCR variant scale=%dx bin=%d: %s", scale, bin, d)
+			}
+		}
+	}
+	return out
+}
+
+// powerBinarize returns a processed copy of a gray crop. Mode 0 stretches
+// contrast; mode 2 inverts and hard-thresholds.
+func powerBinarize(img *image.Gray, mode int) *image.Gray {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	pixels := make([]uint8, w*h)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			pixels[y*w+x] = img.GrayAt(b.Min.X+x, b.Min.Y+y).Y
+		}
+	}
+	minV, maxV := uint8(255), uint8(0)
+	for _, g := range pixels {
+		if g < minV {
+			minV = g
+		}
+		if g > maxV {
+			maxV = g
+		}
+	}
+	span := int(maxV) - int(minV)
+	if span == 0 {
+		span = 1
+	}
+	out := image.NewGray(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			stretched := (int(pixels[y*w+x]) - int(minV)) * 255 / span
+			v := stretched
+			switch mode {
+			case 0:
+				v = (stretched-128)*5/2 + 128
+				if v < 0 {
+					v = 0
+				} else if v > 255 {
+					v = 255
+				}
+			case 2:
+				inv := 255 - stretched
+				if inv <= 32 {
+					v = 0
+				} else {
+					v = 255
+				}
+			}
+			out.SetGray(x, y, color.Gray{Y: uint8(v)})
+		}
+	}
+	return out
+}
+
+type powerColVotes struct {
+	digits map[byte]int
+	total  int
+}
+
+// powerColumnVotes right-aligns variant digit strings and tallies votes per column.
+func powerColumnVotes(variants []string) []powerColVotes {
+	maxLen := 0
+	for _, v := range variants {
+		if len(v) > maxLen {
+			maxLen = len(v)
+		}
+	}
+	cols := make([]powerColVotes, maxLen)
+	for i := range cols {
+		cols[i].digits = map[byte]int{}
+	}
+	for _, v := range variants {
+		for pos := 0; pos < len(v); pos++ {
+			col := maxLen - len(v) + pos
+			cols[col].digits[v[pos]]++
+			cols[col].total++
+		}
+	}
+	return cols
+}
+
+// votePowerDigits picks the most-supported digit per column; columns without a
+// strict majority come back in the disputed list (filled with the top vote).
+func votePowerDigits(variants []string) (string, []int) {
+	cols := powerColumnVotes(variants)
+	out := make([]byte, len(cols))
+	var disputed []int
+	type dv struct {
+		d byte
+		n int
+	}
+	for i, c := range cols {
+		list := make([]dv, 0, len(c.digits))
+		for d, n := range c.digits {
+			list = append(list, dv{d, n})
+		}
+		sort.Slice(list, func(a, b int) bool {
+			if list[a].n != list[b].n {
+				return list[a].n > list[b].n
+			}
+			return list[a].d < list[b].d
+		})
+		out[i] = list[0].d
+		if list[0].n*2 <= c.total {
+			disputed = append(disputed, i)
+		}
+	}
+	return string(out), disputed
+}
+
+// powerSymbolRecheck re-OCRs individual digit glyphs that variants disagreed
+// on, using per-symbol bounding boxes. Returns corrected digits + remaining disputes.
+func powerSymbolRecheck(powerImg image.Image, digits string, disputed []int) (string, []int) {
+	gray := convertToGrayscale(powerImg)
+	scaled := convertToGrayscale(scaleImage(gray, 3))
+	data, err := encodePNGBytes(scaled)
+	if err != nil {
+		return digits, disputed
+	}
+	client := gosseract.NewClient()
+	defer client.Close()
+	if err := client.SetImageFromBytes(data); err != nil {
+		return digits, disputed
+	}
+	client.SetVariable("tessedit_char_whitelist", "0123456789")
+	client.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
+	symbols, err := client.GetBoundingBoxes(gosseract.RIL_SYMBOL)
+	if err != nil || len(symbols) != len(digits) {
+		return digits, disputed
+	}
+	sort.SliceStable(symbols, func(a, b int) bool {
+		if symbols[a].Box.Min.X != symbols[b].Box.Min.X {
+			return symbols[a].Box.Min.X < symbols[b].Box.Min.X
+		}
+		return symbols[a].Box.Min.Y < symbols[b].Box.Min.Y
+	})
+	sb := scaled.Bounds()
+	resolved := map[int]bool{}
+	for _, col := range disputed {
+		box := symbols[col].Box
+		x0, y0 := box.Min.X-2, box.Min.Y-2
+		x1, y1 := box.Max.X+2, box.Max.Y+2
+		if x0 < sb.Min.X {
+			x0 = sb.Min.X
+		}
+		if y0 < sb.Min.Y {
+			y0 = sb.Min.Y
+		}
+		if x1 > sb.Max.X {
+			x1 = sb.Max.X
+		}
+		if y1 > sb.Max.Y {
+			y1 = sb.Max.Y
+		}
+		glyph := image.NewRGBA(image.Rect(0, 0, x1-x0, y1-y0))
+		draw.Draw(glyph, glyph.Bounds(), scaled, image.Pt(x0, y0), draw.Src)
+		again := convertToGrayscale(scaleImage(glyph, 2))
+		gdata, err := encodePNGBytes(again)
+		if err != nil {
+			continue
+		}
+		gc := gosseract.NewClient()
+		if err := gc.SetImageFromBytes(gdata); err != nil {
+			gc.Close()
+			continue
+		}
+		gc.SetVariable("tessedit_char_whitelist", "0123456789")
+		gc.SetPageSegMode(gosseract.PSM_SINGLE_CHAR)
+		gtxt, err := gc.Text()
+		gc.Close()
+		if err != nil {
+			continue
+		}
+		gd := powerNonDigitRe.ReplaceAllString(gtxt, "")
+		if len(gd) == 1 {
+			digits = digits[:col] + string(gd[0]) + digits[col+1:]
+			resolved[col] = true
+			log.Printf("Power OCR symbol recheck: column %d re-read as %c", col, gd[0])
+		}
+	}
+	remaining := []int{}
+	for _, col := range disputed {
+		if !resolved[col] {
+			remaining = append(remaining, col)
+		}
+	}
+	return digits, remaining
+}
+
+// powerOrderTiebreak resolves remaining disputed digits by enumerating the
+// top-2 voted digits per column and preferring combinations that keep the
+// strictly-descending ranking order relative to the previous row.
+func powerOrderTiebreak(variants []string, digits string, disputed []int, prevPower int64) string {
+	cols := powerColumnVotes(variants)
+	type dv struct {
+		d byte
+		n int
+	}
+	choices := make([][]dv, len(disputed))
+	for k, col := range disputed {
+		list := make([]dv, 0, len(cols[col].digits))
+		for d, n := range cols[col].digits {
+			list = append(list, dv{d, n})
+		}
+		sort.Slice(list, func(a, b int) bool {
+			if list[a].n != list[b].n {
+				return list[a].n > list[b].n
+			}
+			return list[a].d < list[b].d
+		})
+		if len(list) > 2 {
+			list = list[:2]
+		}
+		choices[k] = list
+	}
+	best := ""
+	bestScore := -1
+	var walk func(k int, cur []byte, score int)
+	walk = func(k int, cur []byte, score int) {
+		if k == len(choices) {
+			s := string(cur)
+			v, err := strconv.ParseInt(s, 10, 64)
+			if err != nil || v < 1000000 {
+				return
+			}
+			if prevPower > 0 && v >= prevPower {
+				return
+			}
+			if score > bestScore {
+				best, bestScore = s, score
+			}
+			return
+		}
+		for _, c := range choices[k] {
+			cur[disputed[k]] = c.d
+			walk(k+1, cur, score+c.n)
+		}
+	}
+	walk(0, []byte(digits), 0)
+	if best != "" {
+		log.Printf("Power OCR order tiebreak: %s (prev=%d)", best, prevPower)
+		return best
+	}
+	return digits
 }
 
 // germanDiacriticReplacer folds German diacritics and ß for name matching.
@@ -7859,6 +8255,9 @@ func isVSUILabel(text string) bool {
 		"rang kommandant", "kommandant punkte",
 		"ranking commander", "commander points", "ranking commander points",
 		"nova sapphire", "reset reapers",
+		// Alliance name (shown as "[tag] Name" on every ranking row) leaks into
+		// OCR as a bare word; its misreads must not be accepted as player names.
+		"bosozoku", "basozoku", "besozoku", "bésozoku", "bésozoku",
 	}
 	for _, label := range phraseLabels {
 		if strings.Contains(lower, label) {
@@ -8103,16 +8502,27 @@ func extractVSPointsDataFromImage(imageData []byte) (day string, records []VSOCR
 
 	if !rowResultsValid {
 		log.Printf("Segmented OCR failed or produced invalid results (%v), falling back to full image OCR", err)
-		records, err = extractVSPointsFullImage(imageData, attrs)
-		if err != nil {
-			return detectedDay, nil, err
+		if recs := vsWordBoxOCR(imageData); len(recs) >= 2 {
+			log.Printf("Word-box OCR recovered %d records", len(recs))
+			records = recs
+		} else {
+			records, err = extractVSPointsFullImage(imageData, attrs)
+			if err != nil {
+				return detectedDay, nil, err
+			}
 		}
 	} else if len(records) < 5 {
 		log.Printf("Segmented OCR produced only %d records; trying full-image OCR to supplement missing rows", len(records))
-		if supplemental, fullErr := extractVSPointsFullImage(imageData, attrs); fullErr == nil {
+		supplemental := vsWordBoxSupplemental(imageData, records)
+		if len(supplemental) < 2 {
+			if fullRecs, fullErr := extractVSPointsFullImage(imageData, attrs); fullErr == nil {
+				supplemental = fullRecs
+			} else {
+				log.Printf("Supplemental full-image OCR failed: %v", fullErr)
+			}
+		}
+		if len(supplemental) > 0 {
 			records = mergeVSRecordsByName(records, supplemental)
-		} else {
-			log.Printf("Supplemental full-image OCR failed: %v", fullErr)
 		}
 	}
 
@@ -8123,6 +8533,10 @@ func extractVSPointsDataFromImage(imageData []byte) (day string, records []VSOCR
 	if len(records) == 0 {
 		return "", nil, fmt.Errorf("no valid VS point records found in extracted text")
 	}
+
+	// Drop hallucinated points outliers and normalize ranking order before return.
+	records = filterVSOutlierPoints(records)
+	sortVSRecordsDescending(records)
 
 	return detectedDay, records, nil
 }
@@ -9086,7 +9500,281 @@ func extractVSPointsFullImage(imageData []byte, attrs *ScreenshotAttributes) ([]
 		})
 	}
 
-	return records, nil
+	return filterVSOutlierPoints(records), nil
+}
+
+// vsNumWordRe matches a full points word: grouped thousands ("450,558" or
+// "450.558") or a bare run of 6+ digits ("450558").
+var vsNumWordRe = regexp.MustCompile(`^(?:[0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{6,})$`)
+
+// vsNameWordRe matches a plausible player-name word (letter start, then
+// letters/digits/underscore).
+var vsNameWordRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
+
+// extractVSPointsWordBoxes runs Tesseract word-level segmentation on the full
+// screenshot and reconstructs rows geometrically (clustering words by
+// y-center). Each row's points word is the rightmost numeric word in the
+// points column; the name is assembled from confident word boxes to its left.
+// This avoids the text-line regex junk ("call _", "ones") that leaks through
+// the full-image text fallback.
+func extractVSPointsWordBoxes(imageData []byte, psm gosseract.PageSegMode) []VSOCRRecord {
+	img, _, err := image.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		return nil
+	}
+	imgW := img.Bounds().Dx()
+	imgH := img.Bounds().Dy()
+
+	scaled := convertToGrayscale(scaleImage(img, 2))
+	procData, err := encodePNGBytes(scaled)
+	if err != nil {
+		return nil
+	}
+
+	client := gosseract.NewClient()
+	defer client.Close()
+	if err := client.SetImageFromBytes(procData); err != nil {
+		return nil
+	}
+	client.SetPageSegMode(psm)
+	words, err := client.GetBoundingBoxes(gosseract.RIL_WORD)
+	if err != nil || len(words) == 0 {
+		return nil
+	}
+
+	// Restrict to VS data rows and the points column (coordinates are 2x scaled).
+	regionTop := int(float64(imgH) * 0.215 * 2)
+	regionBottom := int(float64(imgH) * 0.855 * 2)
+	pointsXMin := int(float64(imgW) * 0.55 * 2)
+
+	filtered := make([]gosseract.BoundingBox, 0, len(words))
+	for _, w := range words {
+		if strings.TrimSpace(w.Word) == "" {
+			continue
+		}
+		cy := (w.Box.Min.Y + w.Box.Max.Y) / 2
+		if cy < regionTop || cy > regionBottom {
+			continue
+		}
+		filtered = append(filtered, w)
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	sort.SliceStable(filtered, func(a, b int) bool {
+		if filtered[a].Box.Min.Y != filtered[b].Box.Min.Y {
+			return filtered[a].Box.Min.Y < filtered[b].Box.Min.Y
+		}
+		return filtered[a].Box.Min.X < filtered[b].Box.Min.X
+	})
+
+	medianH := vsMedianWordHeight(filtered)
+	tol := int(float64(medianH) * 0.55)
+	if tol < 5 {
+		tol = 5
+	}
+
+	type rowCluster struct {
+		y     int
+		boxes []gosseract.BoundingBox
+	}
+	var rows []*rowCluster
+	for _, w := range filtered {
+		cy := (w.Box.Min.Y + w.Box.Max.Y) / 2
+		joined := false
+		for _, r := range rows {
+			diff := cy - r.y
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff <= tol {
+				r.y = (r.y*len(r.boxes) + cy) / (len(r.boxes) + 1)
+				r.boxes = append(r.boxes, w)
+				joined = true
+				break
+			}
+		}
+		if !joined {
+			rows = append(rows, &rowCluster{y: cy, boxes: []gosseract.BoundingBox{w}})
+		}
+	}
+
+	records := []VSOCRRecord{}
+	for _, r := range rows {
+		boxes := r.boxes
+		sort.SliceStable(boxes, func(a, b int) bool { return boxes[a].Box.Min.X < boxes[b].Box.Min.X })
+
+		// Points word = rightmost numeric word inside the points column.
+		var pointsBox *gosseract.BoundingBox
+		for i := len(boxes) - 1; i >= 0; i-- {
+			b := boxes[i]
+			cx := (b.Box.Min.X + b.Box.Max.X) / 2
+			if cx <= pointsXMin {
+				break
+			}
+			if vsNumWordRe.MatchString(strings.TrimSpace(b.Word)) {
+				pointsBox = &boxes[i]
+				break
+			}
+		}
+		if pointsBox == nil {
+			continue
+		}
+
+		pointsStr := strings.NewReplacer(",", "", ".", "").Replace(strings.TrimSpace(pointsBox.Word))
+		points, err := strconv.ParseInt(pointsStr, 10, 64)
+		if err != nil || points < 10000 || points > 9999999999 {
+			continue
+		}
+
+		// Name = confident word boxes strictly left of the points box.
+		nameParts := []string{}
+		for _, b := range boxes {
+			if b.Box.Min.X >= pointsBox.Box.Min.X {
+				break
+			}
+			w := strings.TrimSpace(b.Word)
+			if !vsNameWordRe.MatchString(w) || b.Confidence < 40 {
+				continue
+			}
+			nameParts = append(nameParts, w)
+		}
+		name := cleanVSRowName(strings.Join(nameParts, " "))
+		if len(name) < 2 || isVSUILabel(name) {
+			continue
+		}
+
+		records = append(records, VSOCRRecord{
+			MemberName: name,
+			Points:     points,
+			Confidence: "review",
+			Notes:      []string{"full-image OCR word boxes"},
+			RawPoints:  pointsBox.Word,
+		})
+	}
+
+	return records
+}
+
+// vsMedianWordHeight returns the median box height across word boxes.
+func vsMedianWordHeight(words []gosseract.BoundingBox) int {
+	heights := make([]int, 0, len(words))
+	for _, w := range words {
+		heights = append(heights, w.Box.Dy())
+	}
+	sort.Ints(heights)
+	if len(heights) == 0 {
+		return 20
+	}
+	return heights[len(heights)/2]
+}
+
+// vsWordBoxOCR runs word-box extraction under several page-segmentation modes
+// and returns the result with the most records (nil if none reach 2).
+func vsWordBoxOCR(imageData []byte) []VSOCRRecord {
+	var best []VSOCRRecord
+	for _, psm := range []gosseract.PageSegMode{gosseract.PSM_AUTO, gosseract.PSM_SPARSE_TEXT, gosseract.PSM_SINGLE_BLOCK} {
+		recs := extractVSPointsWordBoxes(imageData, psm)
+		if len(recs) > len(best) {
+			best = recs
+		}
+	}
+	return best
+}
+
+// vsWordBoxSupplemental runs word-box extraction under two page-segmentation
+// modes and keeps only records whose points value was seen in both (points are
+// unique per rank in a single screenshot), then filters by magnitude relative
+// to the primary records' median points. This suppresses junk rows that only
+// one mode hallucinates.
+func vsWordBoxSupplemental(imageData []byte, primary []VSOCRRecord) []VSOCRRecord {
+	byMode := make([][]VSOCRRecord, 0, 2)
+	for _, psm := range []gosseract.PageSegMode{gosseract.PSM_AUTO, gosseract.PSM_SPARSE_TEXT} {
+		byMode = append(byMode, extractVSPointsWordBoxes(imageData, psm))
+	}
+	if len(byMode[0]) == 0 || len(byMode[1]) == 0 {
+		return nil
+	}
+
+	inFirst := map[int64]bool{}
+	for _, r := range byMode[0] {
+		inFirst[r.Points] = true
+	}
+	var intersected []VSOCRRecord
+	seen := map[int64]bool{}
+	for _, r := range byMode[1] {
+		if !inFirst[r.Points] || seen[r.Points] {
+			continue
+		}
+		seen[r.Points] = true
+		intersected = append(intersected, r)
+	}
+
+	median := vsMedianPoints(primary)
+	if median > 0 {
+		lo := median / 10
+		hi := median * 10
+		filtered := intersected[:0]
+		for _, r := range intersected {
+			if r.Points >= lo && r.Points <= hi {
+				filtered = append(filtered, r)
+			}
+		}
+		intersected = filtered
+	}
+
+	return intersected
+}
+
+// vsMedianPoints returns the median points value of the primary records.
+func vsMedianPoints(records []VSOCRRecord) int64 {
+	vals := make([]int64, 0, len(records))
+	for _, r := range records {
+		if r.Points > 0 {
+			vals = append(vals, r.Points)
+		}
+	}
+	if len(vals) == 0 {
+		return 0
+	}
+	sort.Slice(vals, func(i, j int) bool { return vals[i] < vals[j] })
+	// Lower-middle for even-length slices so a single huge hallucination (e.g.
+	// 2 records [450k, 8M]) doesn't bias the median to the outlier and make the
+	// filter drop the legitimate value instead.
+	return vals[(len(vals)-1)/2]
+}
+
+// filterVSOutlierPoints drops records whose points value is wildly off from
+// the median of the set (hallucinated digits, e.g. a neighbouring rank's
+// points attributed to the wrong name). Within a single VS screenshot the
+// visible ranks are consecutive, so legitimate values stay within ~2x of each
+// other; a 10x band is generous.
+func filterVSOutlierPoints(records []VSOCRRecord) []VSOCRRecord {
+	if len(records) < 2 {
+		return records
+	}
+	median := vsMedianPoints(records)
+	if median <= 0 {
+		return records
+	}
+	lo := median / 10
+	hi := median * 10
+	out := records[:0]
+	for _, r := range records {
+		if r.Points >= lo && r.Points <= hi {
+			out = append(out, r)
+		} else {
+			log.Printf("VS outlier filter: dropping %q points=%d (median=%d)", r.MemberName, r.Points, median)
+		}
+	}
+	return out
+}
+
+// sortVSRecordsDescending orders records by points high-to-low so the merged
+// row + supplemental sets present in ranking order regardless of source.
+func sortVSRecordsDescending(records []VSOCRRecord) {
+	sort.SliceStable(records, func(i, j int) bool { return records[i].Points > records[j].Points })
 }
 
 // Clean player name by removing alliance tags, special characters, etc
@@ -9724,26 +10412,38 @@ func processPowerScreenshot(w http.ResponseWriter, r *http.Request) {
 	failedCount := 0
 	errors := []string{}
 
-	// Get all member names (and nicknames) for fuzzy matching
+	// Get all member names (and nicknames) for fuzzy matching, plus each
+	// member's most recent stored power for order-repair hints.
 	allMembers := []struct {
-		ID       int
-		Name     string
-		Nickname string
+		ID         int
+		Name       string
+		Nickname   string
+		PriorPower int64
 	}{}
-	rows, err := tx.Query("SELECT id, name, COALESCE(nickname, '') FROM members WHERE deleted_at IS NULL")
+	rows, err := tx.Query("SELECT m.id, m.name, COALESCE(m.nickname, ''), COALESCE((SELECT ph.power FROM power_history ph WHERE ph.member_id = m.id ORDER BY ph.id DESC LIMIT 1), 0) FROM members m WHERE m.deleted_at IS NULL")
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var m struct {
-				ID       int
-				Name     string
-				Nickname string
+				ID         int
+				Name       string
+				Nickname   string
+				PriorPower int64
 			}
-			if rows.Scan(&m.ID, &m.Name, &m.Nickname) == nil {
+			if rows.Scan(&m.ID, &m.Name, &m.Nickname, &m.PriorPower) == nil {
 				allMembers = append(allMembers, m)
 			}
 		}
 	}
+
+	priorPower := map[string]int64{}
+	for _, m := range allMembers {
+		priorPower[normalizeName(m.Name)] = m.PriorPower
+		if m.Nickname != "" {
+			priorPower[normalizeName(m.Nickname)] = m.PriorPower
+		}
+	}
+	records = repairPowerByOrder(records, priorPower)
 
 	for _, record := range records {
 		// Try exact match first
