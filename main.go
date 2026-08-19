@@ -245,6 +245,7 @@ type Settings struct {
 	MinHQLevel                   int    `json:"min_hq_level"`
 	VipSeatEnabled               bool   `json:"vip_seat_enabled"`
 	MarshalGuardEnabled          bool   `json:"marshal_guard_enabled"`
+	DesertStormEnabled           bool   `json:"desert_storm_enabled"`
 }
 
 type MemberRanking struct {
@@ -1885,6 +1886,17 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 		log.Println("Database migration: Added marshal_guard_enabled column to settings table")
 	}
 
+	// Migrate settings table to add desert_storm_enabled column if missing
+	var dsEnabledColumnExists bool
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name='desert_storm_enabled'`).Scan(&dsEnabledColumnExists)
+	if err != nil || !dsEnabledColumnExists {
+		_, err = db.Exec(`ALTER TABLE settings ADD COLUMN desert_storm_enabled INTEGER NOT NULL DEFAULT 1`)
+		if err != nil {
+			return err
+		}
+		log.Println("Database migration: Added desert_storm_enabled column to settings table")
+	}
+
 	// Create marshal_guard_events table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS marshal_guard_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1908,6 +1920,35 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 		rank_in_event INTEGER NOT NULL,
 		damage INTEGER NOT NULL DEFAULT 0,
 		attack_count INTEGER,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(event_id, rank_in_event)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// Create desert_storm_events table (individual points ranking)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS desert_storm_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_date TEXT NOT NULL,
+		total_alliance_damage INTEGER NOT NULL DEFAULT 0,
+		notes TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		created_by_id INTEGER REFERENCES users(id)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// Create desert_storm_participants table
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS desert_storm_participants (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id INTEGER NOT NULL REFERENCES desert_storm_events(id) ON DELETE CASCADE,
+		member_id INTEGER REFERENCES members(id),
+		name_snapshot TEXT NOT NULL,
+		alliance_tag TEXT,
+		rank_in_event INTEGER NOT NULL,
+		damage INTEGER NOT NULL DEFAULT 0,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(event_id, rank_in_event)
 	)`)
@@ -4776,7 +4817,8 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		COALESCE(min_power, 0) as min_power,
 		COALESCE(min_hq_level, 0) as min_hq_level,
 		COALESCE(vip_seat_enabled, 1) as vip_seat_enabled,
-		COALESCE(marshal_guard_enabled, 1) as marshal_guard_enabled
+		COALESCE(marshal_guard_enabled, 1) as marshal_guard_enabled,
+		COALESCE(desert_storm_enabled, 1) as desert_storm_enabled
 		FROM settings WHERE id = 1`).Scan(
 		&settings.ID,
 		&settings.AllianceName,
@@ -4802,6 +4844,7 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		&settings.MinHQLevel,
 		&settings.VipSeatEnabled,
 		&settings.MarshalGuardEnabled,
+		&settings.DesertStormEnabled,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -4853,7 +4896,8 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		min_power = ?,
 		min_hq_level = ?,
 		vip_seat_enabled = ?,
-		marshal_guard_enabled = ?
+		marshal_guard_enabled = ?,
+		desert_storm_enabled = ?
 		WHERE id = 1`,
 		settings.AllianceName,
 		settings.AllianceShortName,
@@ -4878,6 +4922,7 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		settings.MinHQLevel,
 		settings.VipSeatEnabled,
 		settings.MarshalGuardEnabled,
+		settings.DesertStormEnabled,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -10888,6 +10933,531 @@ func processPowerScreenshot(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================
+// Desert Storm handlers
+// ============================================================
+
+type DesertStormEvent struct {
+	ID                  int                      `json:"id"`
+	EventDate           string                   `json:"event_date"`
+	TotalAllianceDamage int64                    `json:"total_alliance_damage"`
+	Notes               string                   `json:"notes"`
+	CreatedAt           string                   `json:"created_at"`
+	CreatedByID         *int                     `json:"created_by_id"`
+	ParticipantCount    int                      `json:"participant_count,omitempty"`
+	TopDamageDealer     string                   `json:"top_damage_dealer,omitempty"`
+	TopDamage           int64                    `json:"top_damage,omitempty"`
+	Participants        []DesertStormParticipant `json:"participants,omitempty"`
+}
+
+type DesertStormParticipant struct {
+	ID           int    `json:"id"`
+	EventID      int    `json:"event_id"`
+	MemberID     *int   `json:"member_id"`
+	MemberName   string `json:"member_name,omitempty"`
+	NameSnapshot string `json:"name_snapshot"`
+	AllianceTag  string `json:"alliance_tag"`
+	RankInEvent  int    `json:"rank_in_event"`
+	Damage       int64  `json:"damage"`
+}
+
+type DesertStormOCRResult struct {
+	EventDate       string             `json:"event_date"`
+	TotalDamage     int64              `json:"total_damage"`
+	Participants    []DSOCRParticipant `json:"participants"`
+	ExistingEventID *int               `json:"existing_event_id,omitempty"`
+}
+
+type DSOCRParticipant struct {
+	RankInEvent  int    `json:"rank_in_event"`
+	NameSnapshot string `json:"name_snapshot"`
+	AllianceTag  string `json:"alliance_tag"`
+	Damage       int64  `json:"damage"`
+	MemberID     *int   `json:"member_id"`
+	MemberName   string `json:"member_name,omitempty"`
+}
+
+type DSConfirmRequest struct {
+	EventDate        string             `json:"event_date"`
+	TotalDamage      int64              `json:"total_damage"`
+	Notes            string             `json:"notes"`
+	OverwriteEventID *int               `json:"overwrite_event_id,omitempty"`
+	Participants     []DSOCRParticipant `json:"participants"`
+}
+
+type DSMemberStats struct {
+	MemberID    int     `json:"member_id"`
+	MemberName  string  `json:"member_name"`
+	MemberRank  string  `json:"member_rank"`
+	EventCount  int     `json:"event_count"`
+	TotalDamage int64   `json:"total_damage"`
+	AvgRank     float64 `json:"avg_rank"`
+	BestDamage  int64   `json:"best_damage"`
+}
+
+// matchDSParticipant links an OCR participant to a member using the same
+// matching strategy as Marshal Guard (exact name → nickname → fuzzy →
+// OCR-normalised).
+func matchDSParticipant(p *DSOCRParticipant, members []Member) {
+	name := strings.TrimSpace(p.NameSnapshot)
+	if name == "" {
+		return
+	}
+	lower := strings.ToLower(name)
+
+	for _, m := range members {
+		if strings.ToLower(m.Name) == lower {
+			p.MemberID = &m.ID
+			p.MemberName = m.Name
+			return
+		}
+	}
+	for _, m := range members {
+		if m.Nickname != nil && strings.ToLower(*m.Nickname) == lower {
+			p.MemberID = &m.ID
+			p.MemberName = m.Name
+			return
+		}
+	}
+	bestScore := 0
+	bestIdx := -1
+	for i, m := range members {
+		sim := calculateSimilarity(name, m.Name)
+		if m.Nickname != nil && *m.Nickname != "" {
+			if nickSim := calculateSimilarity(name, *m.Nickname); nickSim > sim {
+				sim = nickSim
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		p.MemberID = &members[bestIdx].ID
+		p.MemberName = members[bestIdx].Name
+		return
+	}
+
+	ocrNorm := mgOcrNormForCompare(name)
+	bestScore = 0
+	bestIdx = -1
+	for i, m := range members {
+		dbNorm := mgOcrNormForCompare(m.Name)
+		sim := mgSimilarityNorm(ocrNorm, dbNorm)
+		if len(ocrNorm) > 3 {
+			if s2 := mgSimilarityNorm(ocrNorm[1:], dbNorm); s2 > sim {
+				sim = s2
+			}
+		}
+		if m.Nickname != nil && *m.Nickname != "" {
+			nickNorm := mgOcrNormForCompare(*m.Nickname)
+			if s := mgSimilarityNorm(ocrNorm, nickNorm); s > sim {
+				sim = s
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		p.MemberID = &members[bestIdx].ID
+		p.MemberName = members[bestIdx].Name
+	}
+}
+
+// GET /api/desert-storm — list events with summary
+func listDesertStormEvents(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT e.id, e.event_date, e.total_alliance_damage, COALESCE(e.notes, ''),
+			e.created_at, e.created_by_id,
+			COUNT(p.id) as participant_count,
+			COALESCE((SELECT p2.name_snapshot FROM desert_storm_participants p2 WHERE p2.event_id = e.id ORDER BY p2.damage DESC LIMIT 1), '') as top_dealer,
+			COALESCE((SELECT p2.damage FROM desert_storm_participants p2 WHERE p2.event_id = e.id ORDER BY p2.damage DESC LIMIT 1), 0) as top_damage
+		FROM desert_storm_events e
+		LEFT JOIN desert_storm_participants p ON p.event_id = e.id
+		GROUP BY e.id
+		ORDER BY e.event_date DESC`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	events := []DesertStormEvent{}
+	for rows.Next() {
+		var ev DesertStormEvent
+		var createdByID sql.NullInt64
+		if err := rows.Scan(&ev.ID, &ev.EventDate, &ev.TotalAllianceDamage, &ev.Notes,
+			&ev.CreatedAt, &createdByID, &ev.ParticipantCount, &ev.TopDamageDealer, &ev.TopDamage); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if createdByID.Valid {
+			id := int(createdByID.Int64)
+			ev.CreatedByID = &id
+		}
+		events = append(events, ev)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(events)
+}
+
+// GET /api/desert-storm/{id} — get event with participants
+func getDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+
+	var ev DesertStormEvent
+	var createdByID sql.NullInt64
+	err := db.QueryRow(`SELECT id, event_date, total_alliance_damage, COALESCE(notes, ''), created_at, created_by_id
+		FROM desert_storm_events WHERE id = ?`, id).Scan(
+		&ev.ID, &ev.EventDate, &ev.TotalAllianceDamage, &ev.Notes, &ev.CreatedAt, &createdByID)
+	if err != nil {
+		http.Error(w, "Event not found", http.StatusNotFound)
+		return
+	}
+	if createdByID.Valid {
+		cid := int(createdByID.Int64)
+		ev.CreatedByID = &cid
+	}
+
+	rows, err := db.Query(`
+		SELECT p.id, p.event_id, p.member_id, COALESCE(m.name, ''), p.name_snapshot,
+			COALESCE(p.alliance_tag, ''), p.rank_in_event, p.damage
+		FROM desert_storm_participants p
+		LEFT JOIN members m ON m.id = p.member_id
+		WHERE p.event_id = ?
+		ORDER BY p.rank_in_event`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	ev.Participants = []DesertStormParticipant{}
+	for rows.Next() {
+		var p DesertStormParticipant
+		var memberID sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.EventID, &memberID, &p.MemberName,
+			&p.NameSnapshot, &p.AllianceTag, &p.RankInEvent, &p.Damage); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if memberID.Valid {
+			mid := int(memberID.Int64)
+			p.MemberID = &mid
+		}
+		ev.Participants = append(ev.Participants, p)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ev)
+}
+
+// POST /api/desert-storm — create event manually (no OCR)
+func createDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EventDate           string `json:"event_date"`
+		TotalAllianceDamage int64  `json:"total_alliance_damage"`
+		Notes               string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EventDate == "" {
+		http.Error(w, "event_date is required", http.StatusBadRequest)
+		return
+	}
+
+	session, _ := store.Get(r, "session")
+	userID, _ := session.Values["user_id"].(int)
+
+	result, err := db.Exec(`INSERT INTO desert_storm_events (event_date, total_alliance_damage, notes, created_by_id)
+		VALUES (?, ?, ?, ?)`, req.EventDate, req.TotalAllianceDamage, req.Notes, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	id, _ := result.LastInsertId()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "message": "Event created"})
+}
+
+// PUT /api/desert-storm/{id} — update event metadata
+func updateDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+	var req struct {
+		EventDate           string `json:"event_date"`
+		TotalAllianceDamage int64  `json:"total_alliance_damage"`
+		Notes               string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := db.Exec(`UPDATE desert_storm_events SET event_date = ?, total_alliance_damage = ?, notes = ? WHERE id = ?`,
+		req.EventDate, req.TotalAllianceDamage, req.Notes, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event updated"})
+}
+
+// DELETE /api/desert-storm/{id} — delete event + participants (cascade)
+func deleteDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+	db.Exec("PRAGMA foreign_keys = ON")
+	_, err := db.Exec(`DELETE FROM desert_storm_events WHERE id = ?`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event deleted"})
+}
+
+// PUT /api/desert-storm/{id}/participants/{pid} — fix single participant
+func updateDesertStormParticipant(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	pid, _ := strconv.Atoi(vars["pid"])
+	var req struct {
+		MemberID     *int   `json:"member_id"`
+		NameSnapshot string `json:"name_snapshot"`
+		Damage       int64  `json:"damage"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := db.Exec(`UPDATE desert_storm_participants SET member_id = ?, name_snapshot = ?, damage = ? WHERE id = ?`,
+		req.MemberID, req.NameSnapshot, req.Damage, pid)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Participant updated"})
+}
+
+// GET /api/desert-storm/member-stats — per-member Desert Storm stats
+func getDesertStormMemberStats(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT p.member_id, m.name, m.rank,
+			COUNT(DISTINCT p.event_id) as event_count,
+			COALESCE(SUM(p.damage), 0) as total_damage,
+			COALESCE(AVG(p.rank_in_event), 0) as avg_rank,
+			COALESCE(MAX(p.damage), 0) as best_damage
+		FROM desert_storm_participants p
+		JOIN members m ON m.id = p.member_id
+		WHERE p.member_id IS NOT NULL
+		GROUP BY p.member_id
+		ORDER BY total_damage DESC`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	stats := []DSMemberStats{}
+	for rows.Next() {
+		var s DSMemberStats
+		if err := rows.Scan(&s.MemberID, &s.MemberName, &s.MemberRank,
+			&s.EventCount, &s.TotalDamage, &s.AvgRank, &s.BestDamage); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		stats = append(stats, s)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+// POST /api/desert-storm/confirm — atomic create event + participants
+func confirmDesertStorm(w http.ResponseWriter, r *http.Request) {
+	var req DSConfirmRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EventDate == "" {
+		http.Error(w, "event_date is required", http.StatusBadRequest)
+		return
+	}
+
+	session, _ := store.Get(r, "session")
+	userID, _ := session.Values["user_id"].(int)
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	if req.OverwriteEventID != nil {
+		tx.Exec("PRAGMA foreign_keys = ON")
+		if _, err := tx.Exec(`DELETE FROM desert_storm_events WHERE id = ?`, *req.OverwriteEventID); err != nil {
+			http.Error(w, "Failed to overwrite existing event: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	result, err := tx.Exec(`INSERT INTO desert_storm_events (event_date, total_alliance_damage, notes, created_by_id) VALUES (?, ?, ?, ?)`,
+		req.EventDate, req.TotalDamage, req.Notes, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	eventID, _ := result.LastInsertId()
+
+	added := 0
+	for _, p := range req.Participants {
+		_, err := tx.Exec(`INSERT INTO desert_storm_participants (event_id, member_id, name_snapshot, alliance_tag, rank_in_event, damage)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			eventID, p.MemberID, p.NameSnapshot, p.AllianceTag, p.RankInEvent, p.Damage)
+		if err != nil {
+			log.Printf("DS confirm: failed to insert participant rank %d: %v", p.RankInEvent, err)
+			continue
+		}
+		added++
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"event_id": eventID,
+		"added":    added,
+		"message":  fmt.Sprintf("Event created with %d participants", added),
+	})
+}
+
+// POST /api/desert-storm/process-screenshots — OCR parse DS screenshots
+func processDesertStormScreenshots(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	files := r.MultipartForm.File["images[]"]
+	if len(files) == 0 {
+		files = r.MultipartForm.File["image"]
+	}
+	if len(files) == 0 {
+		http.Error(w, "No images provided", http.StatusBadRequest)
+		return
+	}
+	if len(files) > 40 {
+		http.Error(w, "Maximum 40 images allowed", http.StatusBadRequest)
+		return
+	}
+
+	var allParticipants []DSOCRParticipant
+	var eventDate string
+
+	for _, fh := range files {
+		file, err := fh.Open()
+		if err != nil {
+			continue
+		}
+		imageData, err := io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			continue
+		}
+
+		records, date, err := extractDesertStormDataFromImage(imageData)
+		if err != nil {
+			log.Printf("DS OCR: %v", err)
+			continue
+		}
+		if date != "" && eventDate == "" {
+			eventDate = date
+		}
+
+		for _, rec := range records {
+			if rec.MemberName == "" {
+				continue
+			}
+			p := DSOCRParticipant{
+				NameSnapshot: rec.MemberName,
+				AllianceTag:  rec.AllianceTag,
+				Damage:       rec.Damage,
+			}
+			merged := false
+			for i, existing := range allParticipants {
+				if strings.EqualFold(existing.NameSnapshot, p.NameSnapshot) ||
+					calculateSimilarity(existing.NameSnapshot, p.NameSnapshot) >= 75 {
+					if p.Damage > existing.Damage {
+						allParticipants[i].Damage = p.Damage
+						allParticipants[i].AllianceTag = p.AllianceTag
+					}
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				allParticipants = append(allParticipants, p)
+			}
+		}
+	}
+
+	// Manual event_date override.
+	if manualDate := r.FormValue("event_date"); manualDate != "" {
+		eventDate = manualDate
+	}
+
+	// Rank by damage descending (higher damage = lower rank number).
+	sort.SliceStable(allParticipants, func(i, j int) bool {
+		if allParticipants[i].Damage != allParticipants[j].Damage {
+			return allParticipants[i].Damage > allParticipants[j].Damage
+		}
+		return strings.ToLower(allParticipants[i].NameSnapshot) < strings.ToLower(allParticipants[j].NameSnapshot)
+	})
+	var totalDamage int64
+	for i := range allParticipants {
+		allParticipants[i].RankInEvent = i + 1
+		totalDamage += allParticipants[i].Damage
+	}
+
+	// Match participants to members.
+	members, err := loadAllMembers()
+	if err == nil {
+		for i := range allParticipants {
+			matchDSParticipant(&allParticipants[i], members)
+		}
+	}
+
+	// Check for existing event on same date.
+	var existingEventID *int
+	if eventDate != "" {
+		var eid int
+		err := db.QueryRow(`SELECT id FROM desert_storm_events WHERE event_date = ?`, eventDate).Scan(&eid)
+		if err == nil {
+			existingEventID = &eid
+		}
+	}
+
+	sort.Slice(allParticipants, func(i, j int) bool {
+		return allParticipants[i].RankInEvent < allParticipants[j].RankInEvent
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(DesertStormOCRResult{
+		EventDate:       eventDate,
+		TotalDamage:     totalDamage,
+		Participants:    allParticipants,
+		ExistingEventID: existingEventID,
+	})
+}
+
+// ============================================================
 // Marshal Guard handlers
 // ============================================================
 
@@ -15115,6 +15685,17 @@ func main() {
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(rankManagementMiddleware(updateMarshalGuardEvent))).Methods("PUT")
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(rankManagementMiddleware(deleteMarshalGuardEvent))).Methods("DELETE")
 	router.HandleFunc("/api/marshal-guard/{id}/participants/{pid}", authMiddleware(rankManagementMiddleware(updateMarshalGuardParticipant))).Methods("PUT")
+
+	// Desert Storm routes (protected)
+	router.HandleFunc("/api/desert-storm", authMiddleware(listDesertStormEvents)).Methods("GET")
+	router.HandleFunc("/api/desert-storm", authMiddleware(r3PlusMiddleware(createDesertStormEvent))).Methods("POST")
+	router.HandleFunc("/api/desert-storm/process-screenshots", authMiddleware(r3PlusMiddleware(processDesertStormScreenshots))).Methods("POST")
+	router.HandleFunc("/api/desert-storm/confirm", authMiddleware(r3PlusMiddleware(confirmDesertStorm))).Methods("POST")
+	router.HandleFunc("/api/desert-storm/member-stats", authMiddleware(getDesertStormMemberStats)).Methods("GET")
+	router.HandleFunc("/api/desert-storm/{id}", authMiddleware(getDesertStormEvent)).Methods("GET")
+	router.HandleFunc("/api/desert-storm/{id}", authMiddleware(rankManagementMiddleware(updateDesertStormEvent))).Methods("PUT")
+	router.HandleFunc("/api/desert-storm/{id}", authMiddleware(rankManagementMiddleware(deleteDesertStormEvent))).Methods("DELETE")
+	router.HandleFunc("/api/desert-storm/{id}/participants/{pid}", authMiddleware(rankManagementMiddleware(updateDesertStormParticipant))).Methods("PUT")
 
 	// Donations routes (protected)
 	router.HandleFunc("/api/donations", authMiddleware(getDonationRecords)).Methods("GET")

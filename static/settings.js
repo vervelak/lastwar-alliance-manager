@@ -58,6 +58,10 @@ async function loadSettings() {
         // Marshal Guard
         const mgEnabled = settings.marshal_guard_enabled !== undefined ? settings.marshal_guard_enabled : true;
         document.getElementById('marshal-guard-enabled').checked = mgEnabled;
+
+        // Desert Storm
+        const dsEnabled = settings.desert_storm_enabled !== undefined ? settings.desert_storm_enabled : true;
+        document.getElementById('desert-storm-enabled').checked = dsEnabled;
     } catch (error) {
         console.error('Error loading settings:', error);
         showToast('Failed to load settings.', 'error');
@@ -92,6 +96,7 @@ document.getElementById('settings-form').addEventListener('submit', async (e) =>
         power_tracking_enabled: document.getElementById('power-tracking-enabled').checked,
         vip_seat_enabled: document.getElementById('vip-seat-enabled').checked,
         marshal_guard_enabled: document.getElementById('marshal-guard-enabled').checked,
+        desert_storm_enabled: document.getElementById('desert-storm-enabled').checked,
         server_timezone: document.getElementById('server-timezone').value,
         conductor_time: document.getElementById('conductor-time').value,
         backup_time: document.getElementById('backup-time').value,
