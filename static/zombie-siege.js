@@ -349,6 +349,7 @@ function showPreview(result) {
             waves: p.waves || 0,
             member_id: p.member_id || null,
             member_name: p.member_name || '',
+            warnings: p.warnings || [],
         })),
     };
     renderPreview();
@@ -367,10 +368,16 @@ function renderPreview() {
     let memberRows = '';
     ocrResult.rows.forEach((row, rIdx) => {
         const isTop = row.rank_in_event === 1;
+        const hasWarnings = (row.warnings || []).length > 0;
+        const cls = [isTop ? 'mg-mvp-row' : '', hasWarnings ? 'zs-warn-row' : ''].filter(Boolean).join(' ');
+        const warnBadge = hasWarnings
+            ? `<span class="zs-warn-badge" title="${escapeAttr(row.warnings.join('; '))}">⚠️</span>`
+            : '';
         const opts = buildZSMemberOptions(row.member_id);
-        memberRows += `<tr${isTop ? ' class="mg-mvp-row"' : ''}>
+        memberRows += `<tr${cls ? ` class="${cls}"` : ''}>
             <td class="mg-rank-col">${isTop ? '🏆' : row.rank_in_event}</td>
             <td class="mg-name-col">
+                ${warnBadge}
                 <input class="mg-cell-input" data-field="name_snapshot" data-row="${rIdx}"
                     value="${escapeAttr(row.name_snapshot)}" placeholder="Player name">
                 <input class="mg-cell-input" data-field="alliance_tag" data-row="${rIdx}"
@@ -411,7 +418,18 @@ document.addEventListener('input', e => {
     if (t.classList.contains('mg-cell-input')) {
         const rIdx = parseInt(t.dataset.row);
         const field = t.dataset.field;
-        if (!isNaN(rIdx)) ocrResult.rows[rIdx][field] = t.value;
+        if (!isNaN(rIdx)) {
+            ocrResult.rows[rIdx][field] = t.value;
+            // User-corrected values are authoritative — clear OCR warnings.
+            if (field === 'name_snapshot' || field === 'waves') {
+                ocrResult.rows[rIdx].warnings = [];
+                const tr = t.closest('tr');
+                if (tr) {
+                    tr.classList.remove('zs-warn-row');
+                    tr.querySelector('.zs-warn-badge')?.remove();
+                }
+            }
+        }
     }
     if (t.id === 'zs-preview-date') ocrResult.event_date = t.value;
     if (t.id === 'zs-preview-notes') ocrResult.notes = t.value;

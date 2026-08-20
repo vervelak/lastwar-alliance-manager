@@ -8216,9 +8216,49 @@ func extractDesertStormDataFromImage(imageData []byte) ([]DSOCRRecord, string, e
 // The metric is individual waves defended (a small integer), not the 8-digit
 // power/score printed beneath the name.
 type ZSOCRRecord struct {
-	MemberName  string `json:"member_name"`
-	AllianceTag string `json:"alliance_tag"`
-	Waves       int64  `json:"waves"`
+	MemberName  string   `json:"member_name"`
+	AllianceTag string   `json:"alliance_tag"`
+	Waves       int64    `json:"waves"`
+	Warnings    []string `json:"warnings,omitempty"`
+}
+
+// Warning messages surfaced in the OCR preview so users can fix weak reads.
+const (
+	zsWaveWarning = "Wave count unreadable by OCR — verify"
+	zsNameWarning = "Name may be OCR garbage — verify"
+)
+
+// zsNameLooksLikeJunk flags multi-word names whose tokens are all short
+// ("Pte iit itt"); real multi-word names ("Theodore Silas") have tokens of
+// at least four chars. Single-word names pass (short names like "evil" exist).
+func zsNameLooksLikeJunk(name string) bool {
+	parts := strings.Fields(name)
+	if len(parts) < 2 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) < 4 {
+			return true
+		}
+	}
+	return false
+}
+
+// zsMergeWarnings unions warnings from two OCR reads of the same player,
+// dropping the wave warning once a legible wave count exists.
+func zsMergeWarnings(a, b []string, waves int64) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, w := range append(append([]string{}, a...), b...) {
+		if w == zsWaveWarning && waves > 0 {
+			continue
+		}
+		if !seen[w] {
+			seen[w] = true
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // parseZSWave recognises a small integer wave count (individual waves defended
@@ -8543,6 +8583,14 @@ func extractZombieSiegeDataFromImage(imageData []byte) ([]ZSOCRRecord, string, e
 	records := names[:n]
 	for i := 0; i < n; i++ {
 		records[i].Waves = waves[i]
+	}
+	for i := range records {
+		if zsNameLooksLikeJunk(records[i].MemberName) {
+			records[i].Warnings = append(records[i].Warnings, zsNameWarning)
+		}
+		if records[i].Waves == 0 {
+			records[i].Warnings = append(records[i].Warnings, zsWaveWarning)
+		}
 	}
 
 	sort.SliceStable(records, func(i, j int) bool {
@@ -11882,12 +11930,13 @@ type ZombieSiegeOCRResult struct {
 }
 
 type ZSOCRParticipant struct {
-	RankInEvent  int    `json:"rank_in_event"`
-	NameSnapshot string `json:"name_snapshot"`
-	AllianceTag  string `json:"alliance_tag"`
-	Waves        int64  `json:"waves"`
-	MemberID     *int   `json:"member_id"`
-	MemberName   string `json:"member_name,omitempty"`
+	RankInEvent  int      `json:"rank_in_event"`
+	NameSnapshot string   `json:"name_snapshot"`
+	AllianceTag  string   `json:"alliance_tag"`
+	Waves        int64    `json:"waves"`
+	MemberID     *int     `json:"member_id"`
+	MemberName   string   `json:"member_name,omitempty"`
+	Warnings     []string `json:"warnings,omitempty"`
 }
 
 type ZSConfirmRequest struct {
@@ -12302,6 +12351,7 @@ func processZombieSiegeScreenshots(w http.ResponseWriter, r *http.Request) {
 				NameSnapshot: rec.MemberName,
 				AllianceTag:  rec.AllianceTag,
 				Waves:        rec.Waves,
+				Warnings:     rec.Warnings,
 			}
 			merged := false
 			for i, existing := range allParticipants {
@@ -12311,6 +12361,7 @@ func processZombieSiegeScreenshots(w http.ResponseWriter, r *http.Request) {
 						allParticipants[i].Waves = p.Waves
 						allParticipants[i].AllianceTag = p.AllianceTag
 					}
+					allParticipants[i].Warnings = zsMergeWarnings(existing.Warnings, p.Warnings, allParticipants[i].Waves)
 					merged = true
 					break
 				}

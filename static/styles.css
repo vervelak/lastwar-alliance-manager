@@ -7409,6 +7409,7 @@ section:last-child {
     max-width: 100%;
 }
 .mg-member-select--warn { border-color: var(--warning, #f59e0b); }
+.zs-warn-row { background: var(--warning-light, #fef3c7); }
 .mg-ocr-hint  { font-size: .73em; color: var(--text-muted, #9ca3af); font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* Status icon */
