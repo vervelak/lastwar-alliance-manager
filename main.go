@@ -8082,7 +8082,7 @@ func parseDesertStormWords(boxes []gosseract.BoundingBox, cropWidth int) ([]DSOC
 		}
 		wordLines[len(wordLines)-1] = append(wordLines[len(wordLines)-1], w)
 	}
-	var lines []line
+	lines := make([]line, 0, len(wordLines))
 	for _, ws := range wordLines {
 		// Order left-to-right so a split "[TAG] name" joins correctly even
 		// when OCR boxes sit at slightly different y.
