@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zombie Siege - Last War Alliance</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="branding.js"></script>
+    <script src="toast.js"></script>
+    <script src="common.js"></script>
+    <script src="navigation.js"></script>
+</head>
+<body data-h1="🧟 Last War: Survival" data-subtitle="Zombie Siege individual wave rankings. Someone has to keep score.">
+    <div class="container">
+
+        <main>
+            <!-- Tab Buttons -->
+            <div class="tab-buttons">
+                <button class="tab-btn active" data-tab="events">🗓️ Events</button>
+                <button class="tab-btn" data-tab="stats">📊 Member Stats</button>
+            </div>
+
+            <!-- Events Tab -->
+            <div id="tab-events" class="tab-content active">
+                <section class="form-section">
+                    <div class="mg-toolbar">
+                        <h3>🧟 Zombie Siege Events</h3>
+                        <button id="add-event-btn" class="primary-btn uploader-only" style="display:none;">➕ Add Event</button>
+                    </div>
+                    <div id="event-list" class="rk-table-wrapper">
+                        <p class="loading">⏳ Loading events...</p>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Member Stats Tab -->
+            <div id="tab-stats" class="tab-content">
+                <section class="form-section">
+                    <div class="mg-toolbar">
+                        <h3>📊 Member Statistics</h3>
+                        <input type="text" id="stats-search" class="form-control mg-search" placeholder="🔍 Search member...">
+                    </div>
+                    <div id="stats-list" class="rk-table-wrapper">
+                        <p class="loading">⏳ Loading stats...</p>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+    </div>
+
+    <!-- Add Event Modal -->
+    <div id="event-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <span class="close" role="button" tabindex="0" aria-label="Close dialog">&times;</span>
+            <h3 id="event-modal-title">Add Event</h3>
+            <form id="event-form">
+
+                <div class="tab-buttons">
+                    <button type="button" class="tab-btn active" data-modal-tab="upload">📷 Screenshot Upload</button>
+                    <button type="button" class="tab-btn" data-modal-tab="manual">✍️ Manual Entry</button>
+                </div>
+
+                <!-- Upload sub-tab -->
+                <div id="modal-tab-upload" class="modal-tab-content active">
+                    <input type="file" id="zs-image-input" accept="image/*" multiple style="display:none;">
+                    <div id="zs-drop-zone" class="drop-zone">
+                        <div id="zs-drop-content">
+                            <div class="drop-icon">📁</div>
+                            <p class="drop-text">Tap to upload or drag &amp; drop</p>
+                            <p class="drop-subtext">Zombie Siege ranking screenshots (up to 40 images)</p>
+                        </div>
+                        <div id="zs-preview-container" class="preview-container">
+                            <div class="preview-header">
+                                <p id="zs-files-count"></p>
+                                <button type="button" id="zs-clear-btn" class="btn btn-secondary">🗑️ Clear</button>
+                            </div>
+                            <div id="zs-preview-gallery"></div>
+                        </div>
+                    </div>
+                    <button type="button" id="zs-process-btn" class="btn btn-primary" style="display:none;">🔍 Process Screenshots with OCR</button>
+                    <div id="zs-progress-wrap" style="display:none;margin-top:.75rem;">
+                        <div style="display:flex;justify-content:space-between;font-size:.82em;margin-bottom:.3rem;">
+                            <span id="zs-progress-label">Processing…</span>
+                            <span id="zs-progress-time">0s</span>
+                        </div>
+                        <div style="background:var(--bg-secondary,#e5e7eb);border-radius:999px;height:8px;overflow:hidden;">
+                            <div id="zs-progress-bar" style="height:100%;width:0%;background:var(--primary,#6366f1);border-radius:999px;transition:width .3s ease;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Manual sub-tab -->
+                <div id="modal-tab-manual" class="modal-tab-content">
+                    <div class="form-group">
+                        <label for="zs-date">Event Date</label>
+                        <input type="date" id="zs-date" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="zs-total-waves">Total Alliance Waves</label>
+                        <input type="number" id="zs-total-waves" min="0" placeholder="e.g. 20">
+                    </div>
+                    <div class="form-group">
+                        <label for="zs-notes">Notes (optional)</label>
+                        <textarea id="zs-notes" rows="2" placeholder="Any notes about this event..."></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary">💾 Save Event</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- OCR Preview Modal (single event, per-row editing) -->
+    <div id="zs-ocr-modal" class="modal" style="display:none;">
+        <div class="modal-content" style="max-width:800px;">
+            <span class="close" role="button" tabindex="0" aria-label="Close dialog">&times;</span>
+            <h3>📋 OCR Preview — Review &amp; Import</h3>
+            <p class="text-muted" style="margin-top:0;font-size:0.9em;">
+                Edit any cell before importing. Unmatched players need a member selected.
+            </p>
+            <div id="zs-ocr-event"></div>
+            <div class="modal-footer" style="margin-top:1rem;">
+                <button type="button" id="zs-ocr-cancel-btn" class="secondary-btn">Cancel</button>
+                <button type="button" id="zs-ocr-import-btn" class="primary-btn">✔ Import Event</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Event Detail Modal -->
+    <div id="detail-modal" class="modal" style="display:none;">
+        <div class="modal-content" style="max-width:700px;">
+            <span class="close" role="button" tabindex="0" aria-label="Close dialog">&times;</span>
+            <h3 id="detail-modal-title">Event Details</h3>
+            <div id="detail-summary"></div>
+            <div id="detail-participants" class="rk-table-wrapper"></div>
+        </div>
+    </div>
+
+    <script src="theme.js"></script>
+    <script src="zombie-siege.js"></script>
+</body>
+</html>

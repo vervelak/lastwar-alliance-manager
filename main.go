@@ -245,6 +245,8 @@ type Settings struct {
 	MinHQLevel                   int    `json:"min_hq_level"`
 	VipSeatEnabled               bool   `json:"vip_seat_enabled"`
 	MarshalGuardEnabled          bool   `json:"marshal_guard_enabled"`
+	DesertStormEnabled           bool   `json:"desert_storm_enabled"`
+	ZombieSiegeEnabled           bool   `json:"zombie_siege_enabled"`
 }
 
 type MemberRanking struct {
@@ -1885,6 +1887,28 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 		log.Println("Database migration: Added marshal_guard_enabled column to settings table")
 	}
 
+	// Migrate settings table to add desert_storm_enabled column if missing
+	var dsEnabledColumnExists bool
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name='desert_storm_enabled'`).Scan(&dsEnabledColumnExists)
+	if err != nil || !dsEnabledColumnExists {
+		_, err = db.Exec(`ALTER TABLE settings ADD COLUMN desert_storm_enabled INTEGER NOT NULL DEFAULT 1`)
+		if err != nil {
+			return err
+		}
+		log.Println("Database migration: Added desert_storm_enabled column to settings table")
+	}
+
+	// Migrate settings table to add zombie_siege_enabled column if missing
+	var zsEnabledColumnExists bool
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name='zombie_siege_enabled'`).Scan(&zsEnabledColumnExists)
+	if err != nil || !zsEnabledColumnExists {
+		_, err = db.Exec(`ALTER TABLE settings ADD COLUMN zombie_siege_enabled INTEGER NOT NULL DEFAULT 1`)
+		if err != nil {
+			return err
+		}
+		log.Println("Database migration: Added zombie_siege_enabled column to settings table")
+	}
+
 	// Create marshal_guard_events table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS marshal_guard_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1908,6 +1932,64 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 		rank_in_event INTEGER NOT NULL,
 		damage INTEGER NOT NULL DEFAULT 0,
 		attack_count INTEGER,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(event_id, rank_in_event)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// Create desert_storm_events table (individual points ranking)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS desert_storm_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_date TEXT NOT NULL,
+		total_alliance_damage INTEGER NOT NULL DEFAULT 0,
+		notes TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		created_by_id INTEGER REFERENCES users(id)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// Create desert_storm_participants table
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS desert_storm_participants (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id INTEGER NOT NULL REFERENCES desert_storm_events(id) ON DELETE CASCADE,
+		member_id INTEGER REFERENCES members(id),
+		name_snapshot TEXT NOT NULL,
+		alliance_tag TEXT,
+		rank_in_event INTEGER NOT NULL,
+		damage INTEGER NOT NULL DEFAULT 0,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(event_id, rank_in_event)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// Create zombie_siege_events table (waves-defended ranking)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS zombie_siege_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_date TEXT NOT NULL,
+		total_waves INTEGER NOT NULL DEFAULT 0,
+		notes TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		created_by_id INTEGER REFERENCES users(id)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	// Create zombie_siege_participants table
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS zombie_siege_participants (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id INTEGER NOT NULL REFERENCES zombie_siege_events(id) ON DELETE CASCADE,
+		member_id INTEGER REFERENCES members(id),
+		name_snapshot TEXT NOT NULL,
+		alliance_tag TEXT,
+		rank_in_event INTEGER NOT NULL,
+		waves INTEGER NOT NULL DEFAULT 0,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(event_id, rank_in_event)
 	)`)
@@ -4776,7 +4858,9 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		COALESCE(min_power, 0) as min_power,
 		COALESCE(min_hq_level, 0) as min_hq_level,
 		COALESCE(vip_seat_enabled, 1) as vip_seat_enabled,
-		COALESCE(marshal_guard_enabled, 1) as marshal_guard_enabled
+		COALESCE(marshal_guard_enabled, 1) as marshal_guard_enabled,
+		COALESCE(desert_storm_enabled, 1) as desert_storm_enabled,
+		COALESCE(zombie_siege_enabled, 1) as zombie_siege_enabled
 		FROM settings WHERE id = 1`).Scan(
 		&settings.ID,
 		&settings.AllianceName,
@@ -4802,6 +4886,8 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		&settings.MinHQLevel,
 		&settings.VipSeatEnabled,
 		&settings.MarshalGuardEnabled,
+		&settings.DesertStormEnabled,
+		&settings.ZombieSiegeEnabled,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -4853,7 +4939,9 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		min_power = ?,
 		min_hq_level = ?,
 		vip_seat_enabled = ?,
-		marshal_guard_enabled = ?
+		marshal_guard_enabled = ?,
+		desert_storm_enabled = ?,
+		zombie_siege_enabled = ?
 		WHERE id = 1`,
 		settings.AllianceName,
 		settings.AllianceShortName,
@@ -4878,6 +4966,8 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		settings.MinHQLevel,
 		settings.VipSeatEnabled,
 		settings.MarshalGuardEnabled,
+		settings.DesertStormEnabled,
+		settings.ZombieSiegeEnabled,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -7750,6 +7840,768 @@ func repairPowerSingleDigit(power, prev, next, prior int64) (int64, bool) {
 	return best, true
 }
 
+// ── Desert Storm ─────────────────────────────────────────────────────────────
+
+// DSOCRRecord is a single Desert Storm ranking row extracted from a screenshot.
+type DSOCRRecord struct {
+	MemberName  string `json:"member_name"`
+	AllianceTag string `json:"alliance_tag"`
+	Damage      int64  `json:"damage"`
+}
+
+// dsHeaderNoise lists substrings that mark Desert Storm UI header/decoration
+// lines and must be dropped before name/damage parsing.
+var dsHeaderNoise = []string{
+	"desert", "storm", "battle", "result", "individual", "point",
+	"ranking", "commander", "wave", "report", "congrat", "defend",
+	"stronghold", "suppl",
+}
+
+func dsContainsNoise(line string) bool {
+	lower := strings.ToLower(line)
+	for _, n := range dsHeaderNoise {
+		if strings.Contains(lower, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// dsIsDigits reports whether s contains only ASCII digits.
+func dsIsDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseDSNumber recognises a standalone damage line. DS damage can be "0"
+// (bottom ranks) up to ~10 digits. A candidate must already be digit-dominant
+// before any correction, so player-name lines (mostly letters) are never
+// mistaken for numbers; common OCR letter misreads are then corrected.
+func parseDSNumber(line string) (int64, bool) {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return 0, false
+	}
+	s = strings.TrimRight(s, ".,;:|")
+	s = strings.ReplaceAll(s, ",", "")
+	s = strings.ReplaceAll(s, " ", "")
+	if s == "" {
+		return 0, false
+	}
+	digits := 0
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			digits++
+		}
+	}
+	if digits == 0 || digits < len(s)-digits {
+		return 0, false
+	}
+	s = strings.NewReplacer(
+		"O", "0", "o", "0", "S", "5", "s", "5", "l", "1", "I", "1",
+		"Z", "2", "B", "8", "b", "6", "G", "6", "g", "9", "e", "6",
+	).Replace(s)
+	s = regexp.MustCompile(`[^0-9]`).ReplaceAllString(s, "")
+	if s == "" || len(s) > 10 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseDesertStormText parses OCR text from the (left-column-trimmed) Desert
+// Storm data region. The ranking list renders "[TAG]Name" with the damage
+// number beneath it, so the parser pairs a name line with a following number
+// line. It also tolerates OCR joining them into a single "name number" line
+// when the trailing number is large (5+ digits — player names never end in
+// more than 4 digits).
+func parseDesertStormText(text string) ([]DSOCRRecord, string) {
+	var records []DSOCRRecord
+	eventDate := ""
+	knownTag := getAllianceShortName()
+
+	dateRe := regexp.MustCompile(`(\d{4})[-/](\d{1,2})[-/](\d{1,2})`)
+	sameLineRe := regexp.MustCompile(`^(.+?)\s+(\d{5,10})\s*[.,]?$`)
+
+	var pendingName, pendingTag string
+	emit := func() {
+		if pendingName != "" {
+			records = append(records, DSOCRRecord{MemberName: pendingName, AllianceTag: pendingTag, Damage: 0})
+		}
+	}
+
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+
+		// Event date from the trailing timestamp ("2026-8-7 23:30:12").
+		if eventDate == "" {
+			if m := dateRe.FindStringSubmatch(line); m != nil {
+				eventDate = m[1] + "-" + m[2] + "-" + m[3]
+			}
+		}
+
+		// Skip timestamp and header/decoration lines.
+		if dateRe.MatchString(strings.TrimSpace(line)) && !strings.Contains(line, " ") {
+			continue
+		}
+		if strings.HasPrefix(line, "202") && strings.Contains(line, ":") {
+			continue
+		}
+		if dsContainsNoise(line) {
+			continue
+		}
+
+		// Same-line "name number" (large trailing number).
+		if m := sameLineRe.FindStringSubmatch(line); m != nil {
+			if num, ok := parseDSNumber(m[2]); ok {
+				tag, nameOnly := parsePlayerTag(m[1], knownTag)
+				nameOnly = strings.TrimSpace(nameOnly)
+				if len(nameOnly) >= 2 {
+					records = append(records, DSOCRRecord{MemberName: nameOnly, AllianceTag: tag, Damage: num})
+					pendingName, pendingTag = "", ""
+					continue
+				}
+			}
+		}
+
+		// Standalone number line → damage for the pending name.
+		if num, ok := parseDSNumber(line); ok {
+			if pendingName != "" {
+				records = append(records, DSOCRRecord{MemberName: pendingName, AllianceTag: pendingTag, Damage: num})
+				pendingName, pendingTag = "", ""
+			}
+			continue
+		}
+
+		// Otherwise treat as a name line (replaces any un-paired pending name,
+		// which happens with OCR garbage like "eitithel Pots" before the list).
+		tag, nameOnly := parsePlayerTag(line, knownTag)
+		nameOnly = strings.TrimSpace(nameOnly)
+		if len(nameOnly) >= 2 {
+			pendingName, pendingTag = nameOnly, tag
+		}
+	}
+	emit()
+
+	// Dedupe by name (keep first occurrence — the higher rank / damage).
+	seen := map[string]bool{}
+	out := records[:0]
+	for _, r := range records {
+		key := strings.ToLower(r.MemberName)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+
+	// Drop any trailing record that never got a damage value paired.
+	final := out[:0]
+	for _, r := range out {
+		if r.Damage > 0 || r.MemberName != "" {
+			final = append(final, r)
+		}
+	}
+	return final, eventDate
+}
+
+// parseDesertStormWords builds Desert Storm records from tesseract word boxes.
+// The ranking list left-aligns "[TAG]Name" with the damage number on the line
+// directly beneath it, both at ~10.5% of the crop width. Words left of that
+// column (rank-number/avatar artwork) and right of it (header/decoration/
+// timestamp) are noise, so grouping words into lines and classifying by the
+// alignment column plus digit content avoids the plain-text parser's misreads
+// (split damage numbers, leaked rank badges, joined "name number" lines).
+func parseDesertStormWords(boxes []gosseract.BoundingBox, cropWidth int) ([]DSOCRRecord, string) {
+	var records []DSOCRRecord
+	knownTag := getAllianceShortName()
+	dateRe := regexp.MustCompile(`(\d{4})[-/](\d{1,2})[-/](\d{1,2})`)
+	eventDate := ""
+
+	if cropWidth <= 0 {
+		cropWidth = 1
+	}
+	minListX := cropWidth * 95 / 1000
+	maxListX := cropWidth * 160 / 1000
+
+	type word struct {
+		text string
+		x, y int
+	}
+	var words []word
+	for _, b := range boxes {
+		s := strings.TrimSpace(b.Word)
+		if s == "" {
+			continue
+		}
+		if eventDate == "" {
+			if m := dateRe.FindStringSubmatch(s); m != nil {
+				eventDate = m[1] + "-" + m[2] + "-" + m[3]
+			}
+		}
+		if b.Box.Min.X < minListX && !dsIsDigits(s) {
+			// Left of the name/damage column: keep only pure-digit
+			// fragments (leading digits of a split damage number hidden
+			// under rank/avatar artwork). Drop rank badges and other noise.
+			continue
+		}
+		words = append(words, word{text: s, x: b.Box.Min.X, y: b.Box.Min.Y})
+	}
+
+	sort.SliceStable(words, func(i, j int) bool {
+		if words[i].y != words[j].y {
+			return words[i].y < words[j].y
+		}
+		return words[i].x < words[j].x
+	})
+
+	type line struct {
+		text string
+		x    int
+	}
+	// Group words into visual lines: names and damages sit ~104px apart
+	// vertically, while a multi-word name varies by only a few px.
+	var wordLines [][]word
+	for _, w := range words {
+		if len(wordLines) == 0 || w.y-wordLines[len(wordLines)-1][0].y > 40 {
+			wordLines = append(wordLines, []word{w})
+			continue
+		}
+		wordLines[len(wordLines)-1] = append(wordLines[len(wordLines)-1], w)
+	}
+	lines := make([]line, 0, len(wordLines))
+	for _, ws := range wordLines {
+		// Order left-to-right so a split "[TAG] name" joins correctly even
+		// when OCR boxes sit at slightly different y.
+		sort.SliceStable(ws, func(i, j int) bool { return ws[i].x < ws[j].x })
+		var sb strings.Builder
+		for i, w := range ws {
+			if i > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString(w.text)
+		}
+		lines = append(lines, line{text: sb.String(), x: ws[0].x})
+	}
+
+	var pendingName, pendingTag string
+	for _, l := range lines {
+		if l.x > maxListX {
+			continue // header/decoration or right-side noise
+		}
+		if n, ok := parseDSNumber(l.text); ok {
+			if pendingName != "" {
+				records = append(records, DSOCRRecord{MemberName: pendingName, AllianceTag: pendingTag, Damage: n})
+				pendingName, pendingTag = "", ""
+			}
+			continue
+		}
+		tag, nameOnly := parsePlayerTag(l.text, knownTag)
+		nameOnly = strings.TrimSpace(nameOnly)
+		if len(nameOnly) >= 2 {
+			pendingName, pendingTag = nameOnly, tag
+		}
+	}
+
+	// Dedupe by name (first occurrence = higher rank/damage).
+	seen := map[string]bool{}
+	out := records[:0]
+	for _, r := range records {
+		key := strings.ToLower(r.MemberName)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+	return out, eventDate
+}
+
+// extractDesertStormDataFromImage OCRs a Desert Storm battle-results
+// screenshot. It crops to the data region, drops the left ~33% avatar/rank
+// artwork (which produces noise), and parses the left-aligned ranking list.
+// Returns records sorted by damage descending plus the detected event date.
+func extractDesertStormDataFromImage(imageData []byte) ([]DSOCRRecord, string, error) {
+	img, _, err := image.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to decode image: %v", err)
+	}
+
+	attrs := analyzeScreenshot(img)
+	if attrs.DataRegion == nil || attrs.Width <= 0 {
+		return nil, "", fmt.Errorf("could not analyze screenshot")
+	}
+
+	cropLeft := attrs.Width * 33 / 100
+	cropRight := attrs.Width
+	cropTop := attrs.DataRegion.Top
+	cropBottom := attrs.DataRegion.Bottom
+	if cropBottom > attrs.Height {
+		cropBottom = attrs.Height
+	}
+	if cropTop >= cropBottom || cropRight <= cropLeft {
+		return nil, "", fmt.Errorf("invalid crop region")
+	}
+
+	crop := image.NewRGBA(image.Rect(0, 0, cropRight-cropLeft, cropBottom-cropTop))
+	draw.Draw(crop, crop.Bounds(), img, image.Point{cropLeft, cropTop}, draw.Src)
+
+	gray := convertToGrayscale(scaleImage(crop, 2))
+	crop2xWidth := gray.Bounds().Dx()
+	data, err := encodePNGBytes(gray)
+	if err != nil {
+		return nil, "", err
+	}
+
+	client := gosseract.NewClient()
+	defer client.Close()
+	if err := client.SetImageFromBytes(data); err != nil {
+		return nil, "", fmt.Errorf("failed to load image: %v", err)
+	}
+
+	var records []DSOCRRecord
+	var eventDate string
+
+	// Primary path: word boxes carry spatial layout, so split damage numbers
+	// and leaked rank-badge noise can be filtered by position.
+	for _, mode := range []gosseract.PageSegMode{gosseract.PSM_AUTO, gosseract.PSM_SPARSE_TEXT, gosseract.PSM_SINGLE_BLOCK} {
+		client.SetPageSegMode(mode)
+		boxes, err := client.GetBoundingBoxes(gosseract.RIL_WORD)
+		if err != nil || len(boxes) == 0 {
+			continue
+		}
+		records, eventDate = parseDesertStormWords(boxes, crop2xWidth)
+		if len(records) > 0 {
+			break
+		}
+	}
+
+	// Fallback: plain text for older/quirky layouts where word boxes fail.
+	if len(records) == 0 {
+		for _, mode := range []gosseract.PageSegMode{gosseract.PSM_SINGLE_BLOCK, gosseract.PSM_AUTO, gosseract.PSM_SPARSE_TEXT} {
+			client.SetPageSegMode(mode)
+			if t, err := client.Text(); err == nil && len(strings.TrimSpace(t)) > 0 {
+				records, eventDate = parseDesertStormText(t)
+				if len(records) > 0 {
+					break
+				}
+			}
+		}
+	}
+
+	if len(records) == 0 {
+		return nil, eventDate, fmt.Errorf("no valid records found in Desert Storm screenshot")
+	}
+
+	sort.SliceStable(records, func(i, j int) bool { return records[i].Damage > records[j].Damage })
+	return records, eventDate, nil
+}
+
+// ── Zombie Siege ────────────────────────────────────────────────────────────
+
+// ZSOCRRecord is a single Zombie Siege ranking row extracted from a screenshot.
+// The metric is individual waves defended (a small integer), not the 8-digit
+// power/score printed beneath the name.
+type ZSOCRRecord struct {
+	MemberName  string   `json:"member_name"`
+	AllianceTag string   `json:"alliance_tag"`
+	Waves       int64    `json:"waves"`
+	Warnings    []string `json:"warnings,omitempty"`
+}
+
+// Warning messages surfaced in the OCR preview so users can fix weak reads.
+const (
+	zsWaveWarning = "Wave count unreadable by OCR — verify"
+	zsNameWarning = "Name may be OCR garbage — verify"
+)
+
+// zsNameLooksLikeJunk flags multi-word names whose tokens are all short
+// ("Pte iit itt"); real multi-word names ("Theodore Silas") have tokens of
+// at least four chars. Single-word names pass (short names like "evil" exist).
+func zsNameLooksLikeJunk(name string) bool {
+	parts := strings.Fields(name)
+	if len(parts) < 2 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) < 4 {
+			return true
+		}
+	}
+	return false
+}
+
+// zsMergeWarnings unions warnings from two OCR reads of the same player,
+// dropping the wave warning once a legible wave count exists.
+func zsMergeWarnings(a, b []string, waves int64) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, w := range append(append([]string{}, a...), b...) {
+		if w == zsWaveWarning && waves > 0 {
+			continue
+		}
+		if !seen[w] {
+			seen[w] = true
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// parseZSWave recognises a small integer wave count (individual waves defended
+// are single/double digit; totals stay far below 100000). It is stricter than
+// parseDSNumber: any character outside the digit/misread set rejects the token,
+// so decimal-power values like "37.3M" and "2.2K" are never mistaken for a wave.
+func parseZSWave(line string) (int64, bool) {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return 0, false
+	}
+	s = strings.TrimRight(s, ".,;:|")
+	s = strings.ReplaceAll(s, ",", "")
+	s = strings.ReplaceAll(s, " ", "")
+	if s == "" {
+		return 0, false
+	}
+	digits := 0
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			digits++
+		} else if !strings.ContainsRune("OoSslIZBbGge", c) {
+			return 0, false
+		}
+	}
+	if digits == 0 {
+		return 0, false
+	}
+	s = strings.NewReplacer(
+		"O", "0", "o", "0", "S", "5", "s", "5", "l", "1", "I", "1",
+		"Z", "2", "B", "8", "b", "6", "G", "6", "g", "9", "e", "6",
+	).Replace(s)
+	s = regexp.MustCompile(`[^0-9]`).ReplaceAllString(s, "")
+	if s == "" || len(s) > 5 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if n >= 100000 {
+		return 0, false // power/score column leak, never a wave count
+	}
+	return n, true
+}
+
+// zsValidName rejects OCR junk that lands in the name column: rank/avatar
+// glyphs read as single symbols ("|", "=", "_"), two-letter fragments ("BY",
+// "Gy", "oe"), or merged junk like "= = oe". A real player name contains at
+// least three letters.
+func zsValidName(s string) bool {
+	letters := 0
+	for _, c := range strings.TrimSpace(s) {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			letters++
+		}
+	}
+	return letters >= 3
+}
+
+// zsParseNames extracts player names from full-width word boxes. Names sit at
+// ~33% of width, the 8-digit power at ~40% (dropped as pure digits), and the
+// alliance tag / rank badge left of ~30% or just below the name. The column
+// header row ("Ranking | Commander | Wave") marks the top of the data region;
+// everything above it is header text.
+func zsParseNames(boxes []gosseract.BoundingBox, cropWidth int) ([]ZSOCRRecord, string) {
+	dateRe := regexp.MustCompile(`(\d{4})[-/](\d{1,2})[-/](\d{1,2})`)
+	eventDate := ""
+	if cropWidth <= 0 {
+		cropWidth = 1
+	}
+
+	headerY := 0
+	for _, b := range boxes {
+		lw := strings.ToLower(strings.TrimSpace(b.Word))
+		if strings.Contains(lw, "commander") || strings.Contains(lw, "ranking") || strings.Contains(lw, "wave") {
+			if b.Box.Min.Y > headerY {
+				headerY = b.Box.Min.Y
+			}
+		}
+	}
+
+	nameMinX := cropWidth * 30 / 100
+	nameMaxX := cropWidth * 42 / 100  // a new row's name starts within this column
+	nameContX := cropWidth * 60 / 100 // hard right bound for same-line continuation
+
+	type word struct {
+		text string
+		x, y int
+	}
+	var words []word
+	for _, b := range boxes {
+		s := strings.TrimSpace(b.Word)
+		if s == "" {
+			continue
+		}
+		if eventDate == "" {
+			if m := dateRe.FindStringSubmatch(s); m != nil {
+				eventDate = m[1] + "-" + m[2] + "-" + m[3]
+			}
+		}
+		words = append(words, word{text: s, x: b.Box.Min.X, y: b.Box.Min.Y})
+	}
+	sort.SliceStable(words, func(i, j int) bool {
+		if words[i].y != words[j].y {
+			return words[i].y < words[j].y
+		}
+		return words[i].x < words[j].x
+	})
+
+	// Group name-column words into visual lines (~25px vertical threshold),
+	// so a multi-word name joins while a tag (which sits ~40px below the name)
+	// stays a separate line.
+	type line struct {
+		text string
+		y    int
+	}
+	var lines []line
+	for _, w := range words {
+		if w.y <= headerY+20 {
+			continue
+		}
+		if w.x < nameMinX || w.x > nameContX {
+			continue
+		}
+		if dateRe.MatchString(w.text) || strings.Contains(w.text, ":") {
+			continue
+		}
+		if dsIsDigits(w.text) {
+			continue // power/score value beneath the name
+		}
+		if len(lines) == 0 || w.y-lines[len(lines)-1].y > 25 {
+			// A new row only starts inside the name column; words to the right
+			// of it (multi-word name tails like "Silas") only extend a row.
+			if w.x > nameMaxX {
+				continue
+			}
+			lines = append(lines, line{text: w.text, y: w.y})
+			continue
+		}
+		lines[len(lines)-1].text += " " + w.text
+	}
+
+	// Each row's name is the first line after a >200px vertical gap (rows are
+	// ~382px apart; tag/power lines trail the name by <200px).
+	var names []ZSOCRRecord
+	lastY := -100000
+	for _, l := range lines {
+		if l.y-lastY <= 200 {
+			continue
+		}
+		name := strings.TrimSpace(l.text)
+		if !zsValidName(name) {
+			continue
+		}
+		names = append(names, ZSOCRRecord{MemberName: name})
+		lastY = l.y
+	}
+
+	// Dedupe by name (first occurrence = higher rank).
+	seen := map[string]bool{}
+	out := names[:0]
+	for _, r := range names {
+		key := strings.ToLower(r.MemberName)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+	return out, eventDate
+}
+
+// zsParseWaves extracts wave counts from word boxes. minX filters to the right
+// column (0 for an already-cropped right-column pass, ~78% of width for a
+// full-width pass). cropHeight bounds the search so the "0" from the report
+// timestamp ("22:33:00") is never mistaken for a wave. Waves are returned in
+// top-to-bottom (rank) order.
+func zsParseWaves(boxes []gosseract.BoundingBox, minX, cropHeight int) []int64 {
+	headerY := 0
+	for _, b := range boxes {
+		lw := strings.ToLower(strings.TrimSpace(b.Word))
+		if strings.Contains(lw, "wave") && b.Box.Min.Y > headerY {
+			headerY = b.Box.Min.Y
+		}
+	}
+	maxY := cropHeight * 85 / 100
+	if maxY <= headerY {
+		maxY = cropHeight // header not found; no cap
+	}
+
+	type wave struct {
+		y int
+		n int64
+	}
+	var waves []wave
+	for _, b := range boxes {
+		if b.Box.Min.Y <= headerY+20 || b.Box.Min.Y > maxY {
+			continue
+		}
+		if b.Box.Min.X < minX {
+			continue
+		}
+		if n, ok := parseZSWave(b.Word); ok {
+			waves = append(waves, wave{y: b.Box.Min.Y, n: n})
+		}
+	}
+	sort.SliceStable(waves, func(i, j int) bool { return waves[i].y < waves[j].y })
+	out := make([]int64, len(waves))
+	for i, w := range waves {
+		out[i] = w.n
+	}
+	return out
+}
+
+// extractZombieSiegeDataFromImage OCRs a Zombie Siege report screenshot using
+// two passes: names come from a full-width 2x crop, wave counts from a
+// right-column 4x crop (the small wave text is illegible at 2x). Names and
+// waves are both rank-ordered top-to-bottom, so they are zipped by index.
+// Returns records sorted by waves descending plus the detected event date.
+func extractZombieSiegeDataFromImage(imageData []byte) ([]ZSOCRRecord, string, error) {
+	img, _, err := image.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to decode image: %v", err)
+	}
+
+	attrs := analyzeScreenshot(img)
+	if attrs.DataRegion == nil || attrs.Width <= 0 {
+		return nil, "", fmt.Errorf("could not analyze screenshot")
+	}
+	cropTop := attrs.DataRegion.Top
+	cropBottom := attrs.DataRegion.Bottom
+	if cropBottom > attrs.Height {
+		cropBottom = attrs.Height
+	}
+	if cropTop >= cropBottom {
+		return nil, "", fmt.Errorf("invalid crop region")
+	}
+
+	// Pass 1: names from full-width 2x crop; also harvest any legible wave
+	// numbers from the right column of that same pass (some screenshots read
+	// the wave at 2x but not at 4x).
+	var names []ZSOCRRecord
+	var waves2x []int64
+	eventDate := ""
+	{
+		crop := image.NewRGBA(image.Rect(0, 0, attrs.Width, cropBottom-cropTop))
+		draw.Draw(crop, crop.Bounds(), img, image.Point{0, cropTop}, draw.Src)
+		gray := convertToGrayscale(scaleImage(crop, 2))
+		crop2xWidth := gray.Bounds().Dx()
+		crop2xHeight := gray.Bounds().Dy()
+		data, err := encodePNGBytes(gray)
+		if err != nil {
+			return nil, "", err
+		}
+		client := gosseract.NewClient()
+		if err := client.SetImageFromBytes(data); err != nil {
+			client.Close()
+			return nil, "", fmt.Errorf("failed to load image: %v", err)
+		}
+		for _, mode := range []gosseract.PageSegMode{gosseract.PSM_AUTO, gosseract.PSM_SPARSE_TEXT, gosseract.PSM_SINGLE_BLOCK} {
+			client.SetPageSegMode(mode)
+			boxes, err := client.GetBoundingBoxes(gosseract.RIL_WORD)
+			if err != nil || len(boxes) == 0 {
+				continue
+			}
+			names, eventDate = zsParseNames(boxes, crop2xWidth)
+			if len(names) > 0 {
+				waves2x = zsParseWaves(boxes, crop2xWidth*78/100, crop2xHeight)
+				break
+			}
+		}
+		client.Close()
+	}
+
+	// Pass 2: waves from right-column 4x crop (the small wave text is only
+	// legible when upscaled).
+	var waves []int64
+	{
+		cropLeft := attrs.Width * 60 / 100
+		cropRight := attrs.Width
+		crop := image.NewRGBA(image.Rect(0, 0, cropRight-cropLeft, cropBottom-cropTop))
+		draw.Draw(crop, crop.Bounds(), img, image.Point{cropLeft, cropTop}, draw.Src)
+		gray := convertToGrayscale(scaleImage(crop, 4))
+		crop4xHeight := gray.Bounds().Dy()
+		data, err := encodePNGBytes(gray)
+		if err != nil {
+			return nil, eventDate, err
+		}
+		client := gosseract.NewClient()
+		if err := client.SetImageFromBytes(data); err != nil {
+			client.Close()
+			return nil, eventDate, fmt.Errorf("failed to load image: %v", err)
+		}
+		for _, mode := range []gosseract.PageSegMode{gosseract.PSM_SPARSE_TEXT, gosseract.PSM_AUTO} {
+			client.SetPageSegMode(mode)
+			boxes, err := client.GetBoundingBoxes(gosseract.RIL_WORD)
+			if err != nil || len(boxes) == 0 {
+				continue
+			}
+			waves = zsParseWaves(boxes, 0, crop4xHeight)
+			if len(waves) > 0 {
+				break
+			}
+		}
+		client.Close()
+	}
+
+	if len(names) == 0 {
+		return nil, eventDate, fmt.Errorf("no valid records found in Zombie Siege screenshot")
+	}
+
+	// Prefer whichever wave pass recovered more rows; fall back to the other.
+	if len(waves2x) > len(waves) {
+		waves = waves2x
+	}
+
+	n := len(names)
+	if len(waves) < n {
+		n = len(waves)
+	}
+	records := names[:n]
+	for i := 0; i < n; i++ {
+		records[i].Waves = waves[i]
+	}
+	for i := range records {
+		if zsNameLooksLikeJunk(records[i].MemberName) {
+			records[i].Warnings = append(records[i].Warnings, zsNameWarning)
+		}
+		if records[i].Waves == 0 {
+			records[i].Warnings = append(records[i].Warnings, zsWaveWarning)
+		}
+	}
+
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].Waves != records[j].Waves {
+			return records[i].Waves > records[j].Waves
+		}
+		return strings.ToLower(records[i].MemberName) < strings.ToLower(records[j].MemberName)
+	})
+	return records, eventDate, nil
+}
+
 // extractPowerByRows segments the power rankings screenshot into individual rows
 // using edge-based separator detection and OCRs each name+power cell separately.
 //
@@ -10518,6 +11370,1055 @@ func processPowerScreenshot(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================
+// Desert Storm handlers
+// ============================================================
+
+type DesertStormEvent struct {
+	ID                  int                      `json:"id"`
+	EventDate           string                   `json:"event_date"`
+	TotalAllianceDamage int64                    `json:"total_alliance_damage"`
+	Notes               string                   `json:"notes"`
+	CreatedAt           string                   `json:"created_at"`
+	CreatedByID         *int                     `json:"created_by_id"`
+	ParticipantCount    int                      `json:"participant_count,omitempty"`
+	TopDamageDealer     string                   `json:"top_damage_dealer,omitempty"`
+	TopDamage           int64                    `json:"top_damage,omitempty"`
+	Participants        []DesertStormParticipant `json:"participants,omitempty"`
+}
+
+type DesertStormParticipant struct {
+	ID           int    `json:"id"`
+	EventID      int    `json:"event_id"`
+	MemberID     *int   `json:"member_id"`
+	MemberName   string `json:"member_name,omitempty"`
+	NameSnapshot string `json:"name_snapshot"`
+	AllianceTag  string `json:"alliance_tag"`
+	RankInEvent  int    `json:"rank_in_event"`
+	Damage       int64  `json:"damage"`
+}
+
+type DesertStormOCRResult struct {
+	EventDate       string             `json:"event_date"`
+	TotalDamage     int64              `json:"total_damage"`
+	Participants    []DSOCRParticipant `json:"participants"`
+	ExistingEventID *int               `json:"existing_event_id,omitempty"`
+}
+
+type DSOCRParticipant struct {
+	RankInEvent  int    `json:"rank_in_event"`
+	NameSnapshot string `json:"name_snapshot"`
+	AllianceTag  string `json:"alliance_tag"`
+	Damage       int64  `json:"damage"`
+	MemberID     *int   `json:"member_id"`
+	MemberName   string `json:"member_name,omitempty"`
+}
+
+type DSConfirmRequest struct {
+	EventDate        string             `json:"event_date"`
+	TotalDamage      int64              `json:"total_damage"`
+	Notes            string             `json:"notes"`
+	OverwriteEventID *int               `json:"overwrite_event_id,omitempty"`
+	Participants     []DSOCRParticipant `json:"participants"`
+}
+
+type DSMemberStats struct {
+	MemberID    int     `json:"member_id"`
+	MemberName  string  `json:"member_name"`
+	MemberRank  string  `json:"member_rank"`
+	EventCount  int     `json:"event_count"`
+	TotalDamage int64   `json:"total_damage"`
+	AvgRank     float64 `json:"avg_rank"`
+	BestDamage  int64   `json:"best_damage"`
+}
+
+// matchDSParticipant links an OCR participant to a member using the same
+// matching strategy as Marshal Guard (exact name → nickname → fuzzy →
+// OCR-normalised).
+func matchDSParticipant(p *DSOCRParticipant, members []Member) {
+	name := strings.TrimSpace(p.NameSnapshot)
+	if name == "" {
+		return
+	}
+	lower := strings.ToLower(name)
+
+	for _, m := range members {
+		if strings.ToLower(m.Name) == lower {
+			p.MemberID = &m.ID
+			p.MemberName = m.Name
+			return
+		}
+	}
+	for _, m := range members {
+		if m.Nickname != nil && strings.ToLower(*m.Nickname) == lower {
+			p.MemberID = &m.ID
+			p.MemberName = m.Name
+			return
+		}
+	}
+	bestScore := 0
+	bestIdx := -1
+	for i, m := range members {
+		sim := calculateSimilarity(name, m.Name)
+		if m.Nickname != nil && *m.Nickname != "" {
+			if nickSim := calculateSimilarity(name, *m.Nickname); nickSim > sim {
+				sim = nickSim
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		p.MemberID = &members[bestIdx].ID
+		p.MemberName = members[bestIdx].Name
+		return
+	}
+
+	ocrNorm := mgOcrNormForCompare(name)
+	bestScore = 0
+	bestIdx = -1
+	for i, m := range members {
+		dbNorm := mgOcrNormForCompare(m.Name)
+		sim := mgSimilarityNorm(ocrNorm, dbNorm)
+		if len(ocrNorm) > 3 {
+			if s2 := mgSimilarityNorm(ocrNorm[1:], dbNorm); s2 > sim {
+				sim = s2
+			}
+		}
+		if m.Nickname != nil && *m.Nickname != "" {
+			nickNorm := mgOcrNormForCompare(*m.Nickname)
+			if s := mgSimilarityNorm(ocrNorm, nickNorm); s > sim {
+				sim = s
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		p.MemberID = &members[bestIdx].ID
+		p.MemberName = members[bestIdx].Name
+	}
+}
+
+// GET /api/desert-storm — list events with summary
+func listDesertStormEvents(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT e.id, e.event_date, e.total_alliance_damage, COALESCE(e.notes, ''),
+			e.created_at, e.created_by_id,
+			COUNT(p.id) as participant_count,
+			COALESCE((SELECT p2.name_snapshot FROM desert_storm_participants p2 WHERE p2.event_id = e.id ORDER BY p2.damage DESC LIMIT 1), '') as top_dealer,
+			COALESCE((SELECT p2.damage FROM desert_storm_participants p2 WHERE p2.event_id = e.id ORDER BY p2.damage DESC LIMIT 1), 0) as top_damage
+		FROM desert_storm_events e
+		LEFT JOIN desert_storm_participants p ON p.event_id = e.id
+		GROUP BY e.id
+		ORDER BY e.event_date DESC`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	events := []DesertStormEvent{}
+	for rows.Next() {
+		var ev DesertStormEvent
+		var createdByID sql.NullInt64
+		if err := rows.Scan(&ev.ID, &ev.EventDate, &ev.TotalAllianceDamage, &ev.Notes,
+			&ev.CreatedAt, &createdByID, &ev.ParticipantCount, &ev.TopDamageDealer, &ev.TopDamage); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if createdByID.Valid {
+			id := int(createdByID.Int64)
+			ev.CreatedByID = &id
+		}
+		events = append(events, ev)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(events)
+}
+
+// GET /api/desert-storm/{id} — get event with participants
+func getDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+
+	var ev DesertStormEvent
+	var createdByID sql.NullInt64
+	err := db.QueryRow(`SELECT id, event_date, total_alliance_damage, COALESCE(notes, ''), created_at, created_by_id
+		FROM desert_storm_events WHERE id = ?`, id).Scan(
+		&ev.ID, &ev.EventDate, &ev.TotalAllianceDamage, &ev.Notes, &ev.CreatedAt, &createdByID)
+	if err != nil {
+		http.Error(w, "Event not found", http.StatusNotFound)
+		return
+	}
+	if createdByID.Valid {
+		cid := int(createdByID.Int64)
+		ev.CreatedByID = &cid
+	}
+
+	rows, err := db.Query(`
+		SELECT p.id, p.event_id, p.member_id, COALESCE(m.name, ''), p.name_snapshot,
+			COALESCE(p.alliance_tag, ''), p.rank_in_event, p.damage
+		FROM desert_storm_participants p
+		LEFT JOIN members m ON m.id = p.member_id
+		WHERE p.event_id = ?
+		ORDER BY p.rank_in_event`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	ev.Participants = []DesertStormParticipant{}
+	for rows.Next() {
+		var p DesertStormParticipant
+		var memberID sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.EventID, &memberID, &p.MemberName,
+			&p.NameSnapshot, &p.AllianceTag, &p.RankInEvent, &p.Damage); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if memberID.Valid {
+			mid := int(memberID.Int64)
+			p.MemberID = &mid
+		}
+		ev.Participants = append(ev.Participants, p)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ev)
+}
+
+// POST /api/desert-storm — create event manually (no OCR)
+func createDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EventDate           string `json:"event_date"`
+		TotalAllianceDamage int64  `json:"total_alliance_damage"`
+		Notes               string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EventDate == "" {
+		http.Error(w, "event_date is required", http.StatusBadRequest)
+		return
+	}
+
+	session, _ := store.Get(r, "session")
+	userID, _ := session.Values["user_id"].(int)
+
+	result, err := db.Exec(`INSERT INTO desert_storm_events (event_date, total_alliance_damage, notes, created_by_id)
+		VALUES (?, ?, ?, ?)`, req.EventDate, req.TotalAllianceDamage, req.Notes, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	id, _ := result.LastInsertId()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "message": "Event created"})
+}
+
+// PUT /api/desert-storm/{id} — update event metadata
+func updateDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+	var req struct {
+		EventDate           string `json:"event_date"`
+		TotalAllianceDamage int64  `json:"total_alliance_damage"`
+		Notes               string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := db.Exec(`UPDATE desert_storm_events SET event_date = ?, total_alliance_damage = ?, notes = ? WHERE id = ?`,
+		req.EventDate, req.TotalAllianceDamage, req.Notes, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event updated"})
+}
+
+// DELETE /api/desert-storm/{id} — delete event + participants (cascade)
+func deleteDesertStormEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+	db.Exec("PRAGMA foreign_keys = ON")
+	_, err := db.Exec(`DELETE FROM desert_storm_events WHERE id = ?`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event deleted"})
+}
+
+// PUT /api/desert-storm/{id}/participants/{pid} — fix single participant
+func updateDesertStormParticipant(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	pid, _ := strconv.Atoi(vars["pid"])
+	var req struct {
+		MemberID     *int   `json:"member_id"`
+		NameSnapshot string `json:"name_snapshot"`
+		Damage       int64  `json:"damage"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := db.Exec(`UPDATE desert_storm_participants SET member_id = ?, name_snapshot = ?, damage = ? WHERE id = ?`,
+		req.MemberID, req.NameSnapshot, req.Damage, pid)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Participant updated"})
+}
+
+// GET /api/desert-storm/member-stats — per-member Desert Storm stats
+func getDesertStormMemberStats(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT p.member_id, m.name, m.rank,
+			COUNT(DISTINCT p.event_id) as event_count,
+			COALESCE(SUM(p.damage), 0) as total_damage,
+			COALESCE(AVG(p.rank_in_event), 0) as avg_rank,
+			COALESCE(MAX(p.damage), 0) as best_damage
+		FROM desert_storm_participants p
+		JOIN members m ON m.id = p.member_id
+		WHERE p.member_id IS NOT NULL
+		GROUP BY p.member_id
+		ORDER BY total_damage DESC`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	stats := []DSMemberStats{}
+	for rows.Next() {
+		var s DSMemberStats
+		if err := rows.Scan(&s.MemberID, &s.MemberName, &s.MemberRank,
+			&s.EventCount, &s.TotalDamage, &s.AvgRank, &s.BestDamage); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		stats = append(stats, s)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+// POST /api/desert-storm/confirm — atomic create event + participants
+func confirmDesertStorm(w http.ResponseWriter, r *http.Request) {
+	var req DSConfirmRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EventDate == "" {
+		http.Error(w, "event_date is required", http.StatusBadRequest)
+		return
+	}
+
+	session, _ := store.Get(r, "session")
+	userID, _ := session.Values["user_id"].(int)
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	if req.OverwriteEventID != nil {
+		tx.Exec("PRAGMA foreign_keys = ON")
+		if _, err := tx.Exec(`DELETE FROM desert_storm_events WHERE id = ?`, *req.OverwriteEventID); err != nil {
+			http.Error(w, "Failed to overwrite existing event: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	result, err := tx.Exec(`INSERT INTO desert_storm_events (event_date, total_alliance_damage, notes, created_by_id) VALUES (?, ?, ?, ?)`,
+		req.EventDate, req.TotalDamage, req.Notes, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	eventID, _ := result.LastInsertId()
+
+	added := 0
+	for _, p := range req.Participants {
+		_, err := tx.Exec(`INSERT INTO desert_storm_participants (event_id, member_id, name_snapshot, alliance_tag, rank_in_event, damage)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			eventID, p.MemberID, p.NameSnapshot, p.AllianceTag, p.RankInEvent, p.Damage)
+		if err != nil {
+			log.Printf("DS confirm: failed to insert participant rank %d: %v", p.RankInEvent, err)
+			continue
+		}
+		added++
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"event_id": eventID,
+		"added":    added,
+		"message":  fmt.Sprintf("Event created with %d participants", added),
+	})
+}
+
+// POST /api/desert-storm/process-screenshots — OCR parse DS screenshots
+func processDesertStormScreenshots(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	files := r.MultipartForm.File["images[]"]
+	if len(files) == 0 {
+		files = r.MultipartForm.File["image"]
+	}
+	if len(files) == 0 {
+		http.Error(w, "No images provided", http.StatusBadRequest)
+		return
+	}
+	if len(files) > 40 {
+		http.Error(w, "Maximum 40 images allowed", http.StatusBadRequest)
+		return
+	}
+
+	var allParticipants []DSOCRParticipant
+	var eventDate string
+
+	for _, fh := range files {
+		file, err := fh.Open()
+		if err != nil {
+			continue
+		}
+		imageData, err := io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			continue
+		}
+
+		records, date, err := extractDesertStormDataFromImage(imageData)
+		if err != nil {
+			log.Printf("DS OCR: %v", err)
+			continue
+		}
+		if date != "" && eventDate == "" {
+			eventDate = date
+		}
+
+		for _, rec := range records {
+			if rec.MemberName == "" {
+				continue
+			}
+			p := DSOCRParticipant{
+				NameSnapshot: rec.MemberName,
+				AllianceTag:  rec.AllianceTag,
+				Damage:       rec.Damage,
+			}
+			merged := false
+			for i, existing := range allParticipants {
+				if strings.EqualFold(existing.NameSnapshot, p.NameSnapshot) ||
+					calculateSimilarity(existing.NameSnapshot, p.NameSnapshot) >= 75 {
+					if p.Damage > existing.Damage {
+						allParticipants[i].Damage = p.Damage
+						allParticipants[i].AllianceTag = p.AllianceTag
+					}
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				allParticipants = append(allParticipants, p)
+			}
+		}
+	}
+
+	// Manual event_date override.
+	if manualDate := r.FormValue("event_date"); manualDate != "" {
+		eventDate = manualDate
+	}
+
+	// Rank by damage descending (higher damage = lower rank number).
+	sort.SliceStable(allParticipants, func(i, j int) bool {
+		if allParticipants[i].Damage != allParticipants[j].Damage {
+			return allParticipants[i].Damage > allParticipants[j].Damage
+		}
+		return strings.ToLower(allParticipants[i].NameSnapshot) < strings.ToLower(allParticipants[j].NameSnapshot)
+	})
+	var totalDamage int64
+	for i := range allParticipants {
+		allParticipants[i].RankInEvent = i + 1
+		totalDamage += allParticipants[i].Damage
+	}
+
+	// Match participants to members.
+	members, err := loadAllMembers()
+	if err == nil {
+		for i := range allParticipants {
+			matchDSParticipant(&allParticipants[i], members)
+		}
+	}
+
+	// Check for existing event on same date.
+	var existingEventID *int
+	if eventDate != "" {
+		var eid int
+		err := db.QueryRow(`SELECT id FROM desert_storm_events WHERE event_date = ?`, eventDate).Scan(&eid)
+		if err == nil {
+			existingEventID = &eid
+		}
+	}
+
+	sort.Slice(allParticipants, func(i, j int) bool {
+		return allParticipants[i].RankInEvent < allParticipants[j].RankInEvent
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(DesertStormOCRResult{
+		EventDate:       eventDate,
+		TotalDamage:     totalDamage,
+		Participants:    allParticipants,
+		ExistingEventID: existingEventID,
+	})
+}
+
+// ============================================================
+// Zombie Siege handlers
+// ============================================================
+
+type ZombieSiegeEvent struct {
+	ID               int                      `json:"id"`
+	EventDate        string                   `json:"event_date"`
+	TotalWaves       int64                    `json:"total_waves"`
+	Notes            string                   `json:"notes"`
+	CreatedAt        string                   `json:"created_at"`
+	CreatedByID      *int                     `json:"created_by_id"`
+	ParticipantCount int                      `json:"participant_count,omitempty"`
+	TopWaveDefender  string                   `json:"top_wave_defender,omitempty"`
+	TopWaves         int64                    `json:"top_waves,omitempty"`
+	Participants     []ZombieSiegeParticipant `json:"participants,omitempty"`
+}
+
+type ZombieSiegeParticipant struct {
+	ID           int    `json:"id"`
+	EventID      int    `json:"event_id"`
+	MemberID     *int   `json:"member_id"`
+	MemberName   string `json:"member_name,omitempty"`
+	NameSnapshot string `json:"name_snapshot"`
+	AllianceTag  string `json:"alliance_tag"`
+	RankInEvent  int    `json:"rank_in_event"`
+	Waves        int64  `json:"waves"`
+}
+
+type ZombieSiegeOCRResult struct {
+	EventDate       string             `json:"event_date"`
+	TotalWaves      int64              `json:"total_waves"`
+	Participants    []ZSOCRParticipant `json:"participants"`
+	ExistingEventID *int               `json:"existing_event_id,omitempty"`
+}
+
+type ZSOCRParticipant struct {
+	RankInEvent  int      `json:"rank_in_event"`
+	NameSnapshot string   `json:"name_snapshot"`
+	AllianceTag  string   `json:"alliance_tag"`
+	Waves        int64    `json:"waves"`
+	MemberID     *int     `json:"member_id"`
+	MemberName   string   `json:"member_name,omitempty"`
+	Warnings     []string `json:"warnings,omitempty"`
+}
+
+type ZSConfirmRequest struct {
+	EventDate        string             `json:"event_date"`
+	TotalWaves       int64              `json:"total_waves"`
+	Notes            string             `json:"notes"`
+	OverwriteEventID *int               `json:"overwrite_event_id,omitempty"`
+	Participants     []ZSOCRParticipant `json:"participants"`
+}
+
+type ZSMemberStats struct {
+	MemberID   int     `json:"member_id"`
+	MemberName string  `json:"member_name"`
+	MemberRank string  `json:"member_rank"`
+	EventCount int     `json:"event_count"`
+	TotalWaves int64   `json:"total_waves"`
+	AvgRank    float64 `json:"avg_rank"`
+	BestWaves  int64   `json:"best_waves"`
+}
+
+// matchZSParticipant links an OCR participant to a member (same strategy as
+// Marshal Guard / Desert Storm: exact name → nickname → fuzzy → OCR-normalised).
+func matchZSParticipant(p *ZSOCRParticipant, members []Member) {
+	name := strings.TrimSpace(p.NameSnapshot)
+	if name == "" {
+		return
+	}
+	lower := strings.ToLower(name)
+
+	for _, m := range members {
+		if strings.ToLower(m.Name) == lower {
+			p.MemberID = &m.ID
+			p.MemberName = m.Name
+			return
+		}
+	}
+	for _, m := range members {
+		if m.Nickname != nil && strings.ToLower(*m.Nickname) == lower {
+			p.MemberID = &m.ID
+			p.MemberName = m.Name
+			return
+		}
+	}
+	bestScore := 0
+	bestIdx := -1
+	for i, m := range members {
+		sim := calculateSimilarity(name, m.Name)
+		if m.Nickname != nil && *m.Nickname != "" {
+			if nickSim := calculateSimilarity(name, *m.Nickname); nickSim > sim {
+				sim = nickSim
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		p.MemberID = &members[bestIdx].ID
+		p.MemberName = members[bestIdx].Name
+		return
+	}
+
+	ocrNorm := mgOcrNormForCompare(name)
+	bestScore = 0
+	bestIdx = -1
+	for i, m := range members {
+		dbNorm := mgOcrNormForCompare(m.Name)
+		sim := mgSimilarityNorm(ocrNorm, dbNorm)
+		if len(ocrNorm) > 3 {
+			if s2 := mgSimilarityNorm(ocrNorm[1:], dbNorm); s2 > sim {
+				sim = s2
+			}
+		}
+		if m.Nickname != nil && *m.Nickname != "" {
+			nickNorm := mgOcrNormForCompare(*m.Nickname)
+			if s := mgSimilarityNorm(ocrNorm, nickNorm); s > sim {
+				sim = s
+			}
+		}
+		if sim > bestScore {
+			bestScore = sim
+			bestIdx = i
+		}
+	}
+	if bestScore >= 70 && bestIdx >= 0 {
+		p.MemberID = &members[bestIdx].ID
+		p.MemberName = members[bestIdx].Name
+	}
+}
+
+// GET /api/zombie-siege — list events with summary
+func listZombieSiegeEvents(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT e.id, e.event_date, e.total_waves, COALESCE(e.notes, ''),
+			e.created_at, e.created_by_id,
+			COUNT(p.id) as participant_count,
+			COALESCE((SELECT p2.name_snapshot FROM zombie_siege_participants p2 WHERE p2.event_id = e.id ORDER BY p2.waves DESC LIMIT 1), '') as top_defender,
+			COALESCE((SELECT p2.waves FROM zombie_siege_participants p2 WHERE p2.event_id = e.id ORDER BY p2.waves DESC LIMIT 1), 0) as top_waves
+		FROM zombie_siege_events e
+		LEFT JOIN zombie_siege_participants p ON p.event_id = e.id
+		GROUP BY e.id
+		ORDER BY e.event_date DESC`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	events := []ZombieSiegeEvent{}
+	for rows.Next() {
+		var ev ZombieSiegeEvent
+		var createdByID sql.NullInt64
+		if err := rows.Scan(&ev.ID, &ev.EventDate, &ev.TotalWaves, &ev.Notes,
+			&ev.CreatedAt, &createdByID, &ev.ParticipantCount, &ev.TopWaveDefender, &ev.TopWaves); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if createdByID.Valid {
+			id := int(createdByID.Int64)
+			ev.CreatedByID = &id
+		}
+		events = append(events, ev)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(events)
+}
+
+// GET /api/zombie-siege/{id} — get event with participants
+func getZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+
+	var ev ZombieSiegeEvent
+	var createdByID sql.NullInt64
+	err := db.QueryRow(`SELECT id, event_date, total_waves, COALESCE(notes, ''), created_at, created_by_id
+		FROM zombie_siege_events WHERE id = ?`, id).Scan(
+		&ev.ID, &ev.EventDate, &ev.TotalWaves, &ev.Notes, &ev.CreatedAt, &createdByID)
+	if err != nil {
+		http.Error(w, "Event not found", http.StatusNotFound)
+		return
+	}
+	if createdByID.Valid {
+		cid := int(createdByID.Int64)
+		ev.CreatedByID = &cid
+	}
+
+	rows, err := db.Query(`
+		SELECT p.id, p.event_id, p.member_id, COALESCE(m.name, ''), p.name_snapshot,
+			COALESCE(p.alliance_tag, ''), p.rank_in_event, p.waves
+		FROM zombie_siege_participants p
+		LEFT JOIN members m ON m.id = p.member_id
+		WHERE p.event_id = ?
+		ORDER BY p.rank_in_event`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	ev.Participants = []ZombieSiegeParticipant{}
+	for rows.Next() {
+		var p ZombieSiegeParticipant
+		var memberID sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.EventID, &memberID, &p.MemberName,
+			&p.NameSnapshot, &p.AllianceTag, &p.RankInEvent, &p.Waves); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if memberID.Valid {
+			mid := int(memberID.Int64)
+			p.MemberID = &mid
+		}
+		ev.Participants = append(ev.Participants, p)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ev)
+}
+
+// POST /api/zombie-siege — create event manually (no OCR)
+func createZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EventDate  string `json:"event_date"`
+		TotalWaves int64  `json:"total_waves"`
+		Notes      string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EventDate == "" {
+		http.Error(w, "event_date is required", http.StatusBadRequest)
+		return
+	}
+
+	session, _ := store.Get(r, "session")
+	userID, _ := session.Values["user_id"].(int)
+
+	result, err := db.Exec(`INSERT INTO zombie_siege_events (event_date, total_waves, notes, created_by_id)
+		VALUES (?, ?, ?, ?)`, req.EventDate, req.TotalWaves, req.Notes, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	id, _ := result.LastInsertId()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "message": "Event created"})
+}
+
+// PUT /api/zombie-siege/{id} — update event metadata
+func updateZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+	var req struct {
+		EventDate  string `json:"event_date"`
+		TotalWaves int64  `json:"total_waves"`
+		Notes      string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := db.Exec(`UPDATE zombie_siege_events SET event_date = ?, total_waves = ?, notes = ? WHERE id = ?`,
+		req.EventDate, req.TotalWaves, req.Notes, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event updated"})
+}
+
+// DELETE /api/zombie-siege/{id} — delete event + participants (cascade)
+func deleteZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.Atoi(mux.Vars(r)["id"])
+	db.Exec("PRAGMA foreign_keys = ON")
+	_, err := db.Exec(`DELETE FROM zombie_siege_events WHERE id = ?`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Event deleted"})
+}
+
+// PUT /api/zombie-siege/{id}/participants/{pid} — fix single participant
+func updateZombieSiegeParticipant(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	pid, _ := strconv.Atoi(vars["pid"])
+	var req struct {
+		MemberID     *int   `json:"member_id"`
+		NameSnapshot string `json:"name_snapshot"`
+		Waves        int64  `json:"waves"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := db.Exec(`UPDATE zombie_siege_participants SET member_id = ?, name_snapshot = ?, waves = ? WHERE id = ?`,
+		req.MemberID, req.NameSnapshot, req.Waves, pid)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Participant updated"})
+}
+
+// GET /api/zombie-siege/member-stats — per-member Zombie Siege stats
+func getZombieSiegeMemberStats(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT p.member_id, m.name, m.rank,
+			COUNT(DISTINCT p.event_id) as event_count,
+			COALESCE(SUM(p.waves), 0) as total_waves,
+			COALESCE(AVG(p.rank_in_event), 0) as avg_rank,
+			COALESCE(MAX(p.waves), 0) as best_waves
+		FROM zombie_siege_participants p
+		JOIN members m ON m.id = p.member_id
+		WHERE p.member_id IS NOT NULL
+		GROUP BY p.member_id
+		ORDER BY total_waves DESC`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	stats := []ZSMemberStats{}
+	for rows.Next() {
+		var s ZSMemberStats
+		if err := rows.Scan(&s.MemberID, &s.MemberName, &s.MemberRank,
+			&s.EventCount, &s.TotalWaves, &s.AvgRank, &s.BestWaves); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		stats = append(stats, s)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+// POST /api/zombie-siege/confirm — atomic create event + participants
+func confirmZombieSiege(w http.ResponseWriter, r *http.Request) {
+	var req ZSConfirmRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EventDate == "" {
+		http.Error(w, "event_date is required", http.StatusBadRequest)
+		return
+	}
+
+	session, _ := store.Get(r, "session")
+	userID, _ := session.Values["user_id"].(int)
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	if req.OverwriteEventID != nil {
+		tx.Exec("PRAGMA foreign_keys = ON")
+		if _, err := tx.Exec(`DELETE FROM zombie_siege_events WHERE id = ?`, *req.OverwriteEventID); err != nil {
+			http.Error(w, "Failed to overwrite existing event: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	result, err := tx.Exec(`INSERT INTO zombie_siege_events (event_date, total_waves, notes, created_by_id) VALUES (?, ?, ?, ?)`,
+		req.EventDate, req.TotalWaves, req.Notes, userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	eventID, _ := result.LastInsertId()
+
+	added := 0
+	for _, p := range req.Participants {
+		_, err := tx.Exec(`INSERT INTO zombie_siege_participants (event_id, member_id, name_snapshot, alliance_tag, rank_in_event, waves)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			eventID, p.MemberID, p.NameSnapshot, p.AllianceTag, p.RankInEvent, p.Waves)
+		if err != nil {
+			log.Printf("ZS confirm: failed to insert participant rank %d: %v", p.RankInEvent, err)
+			continue
+		}
+		added++
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"event_id": eventID,
+		"added":    added,
+		"message":  fmt.Sprintf("Event created with %d participants", added),
+	})
+}
+
+// POST /api/zombie-siege/process-screenshots — OCR parse ZS screenshots
+func processZombieSiegeScreenshots(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	files := r.MultipartForm.File["images[]"]
+	if len(files) == 0 {
+		files = r.MultipartForm.File["image"]
+	}
+	if len(files) == 0 {
+		http.Error(w, "No images provided", http.StatusBadRequest)
+		return
+	}
+	if len(files) > 40 {
+		http.Error(w, "Maximum 40 images allowed", http.StatusBadRequest)
+		return
+	}
+
+	var allParticipants []ZSOCRParticipant
+	var eventDate string
+
+	for _, fh := range files {
+		file, err := fh.Open()
+		if err != nil {
+			continue
+		}
+		imageData, err := io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			continue
+		}
+
+		records, date, err := extractZombieSiegeDataFromImage(imageData)
+		if err != nil {
+			log.Printf("ZS OCR: %v", err)
+			continue
+		}
+		if date != "" && eventDate == "" {
+			eventDate = date
+		}
+
+		for _, rec := range records {
+			if rec.MemberName == "" {
+				continue
+			}
+			p := ZSOCRParticipant{
+				NameSnapshot: rec.MemberName,
+				AllianceTag:  rec.AllianceTag,
+				Waves:        rec.Waves,
+				Warnings:     rec.Warnings,
+			}
+			merged := false
+			for i, existing := range allParticipants {
+				if strings.EqualFold(existing.NameSnapshot, p.NameSnapshot) ||
+					calculateSimilarity(existing.NameSnapshot, p.NameSnapshot) >= 75 {
+					if p.Waves > existing.Waves {
+						allParticipants[i].Waves = p.Waves
+						allParticipants[i].AllianceTag = p.AllianceTag
+					}
+					allParticipants[i].Warnings = zsMergeWarnings(existing.Warnings, p.Warnings, allParticipants[i].Waves)
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				allParticipants = append(allParticipants, p)
+			}
+		}
+	}
+
+	if manualDate := r.FormValue("event_date"); manualDate != "" {
+		eventDate = manualDate
+	}
+
+	// Rank by waves descending (higher waves = lower rank number).
+	sort.SliceStable(allParticipants, func(i, j int) bool {
+		if allParticipants[i].Waves != allParticipants[j].Waves {
+			return allParticipants[i].Waves > allParticipants[j].Waves
+		}
+		return strings.ToLower(allParticipants[i].NameSnapshot) < strings.ToLower(allParticipants[j].NameSnapshot)
+	})
+	var totalWaves int64
+	for i := range allParticipants {
+		allParticipants[i].RankInEvent = i + 1
+		totalWaves += allParticipants[i].Waves
+	}
+
+	members, err := loadAllMembers()
+	if err == nil {
+		for i := range allParticipants {
+			matchZSParticipant(&allParticipants[i], members)
+		}
+	}
+
+	var existingEventID *int
+	if eventDate != "" {
+		var eid int
+		err := db.QueryRow(`SELECT id FROM zombie_siege_events WHERE event_date = ?`, eventDate).Scan(&eid)
+		if err == nil {
+			existingEventID = &eid
+		}
+	}
+
+	sort.Slice(allParticipants, func(i, j int) bool {
+		return allParticipants[i].RankInEvent < allParticipants[j].RankInEvent
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ZombieSiegeOCRResult{
+		EventDate:       eventDate,
+		TotalWaves:      totalWaves,
+		Participants:    allParticipants,
+		ExistingEventID: existingEventID,
+	})
+}
+
+// ============================================================
 // Marshal Guard handlers
 // ============================================================
 
@@ -12073,6 +13974,14 @@ func loadAllMembers() ([]Member, error) {
 // parsePlayerTag extracts the alliance tag and plain player name from strings like
 // "[RSRP]Gargoland" or "[RSRPlJazzyopolis" (where ] was OCR'd as l, 1, | or I).
 // knownTag (from settings) is used for fuzzy bracket matching before standard parsing.
+// getAllianceShortName returns the uppercase alliance short name from settings,
+// used as the known tag hint for player-tag parsing.
+func getAllianceShortName() string {
+	var tag string
+	db.QueryRow(`SELECT COALESCE(alliance_short_name, '') FROM settings WHERE id = 1`).Scan(&tag)
+	return strings.ToUpper(strings.TrimSpace(tag))
+}
+
 func parsePlayerTag(name, knownTag string) (tag, nameOnly string) {
 	name = strings.TrimSpace(name)
 	// Prefer known-tag match with fuzzy closing bracket.
@@ -14737,6 +16646,28 @@ func main() {
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(rankManagementMiddleware(updateMarshalGuardEvent))).Methods("PUT")
 	router.HandleFunc("/api/marshal-guard/{id}", authMiddleware(rankManagementMiddleware(deleteMarshalGuardEvent))).Methods("DELETE")
 	router.HandleFunc("/api/marshal-guard/{id}/participants/{pid}", authMiddleware(rankManagementMiddleware(updateMarshalGuardParticipant))).Methods("PUT")
+
+	// Desert Storm routes (protected)
+	router.HandleFunc("/api/desert-storm", authMiddleware(listDesertStormEvents)).Methods("GET")
+	router.HandleFunc("/api/desert-storm", authMiddleware(r3PlusMiddleware(createDesertStormEvent))).Methods("POST")
+	router.HandleFunc("/api/desert-storm/process-screenshots", authMiddleware(r3PlusMiddleware(processDesertStormScreenshots))).Methods("POST")
+	router.HandleFunc("/api/desert-storm/confirm", authMiddleware(r3PlusMiddleware(confirmDesertStorm))).Methods("POST")
+	router.HandleFunc("/api/desert-storm/member-stats", authMiddleware(getDesertStormMemberStats)).Methods("GET")
+	router.HandleFunc("/api/desert-storm/{id}", authMiddleware(getDesertStormEvent)).Methods("GET")
+	router.HandleFunc("/api/desert-storm/{id}", authMiddleware(rankManagementMiddleware(updateDesertStormEvent))).Methods("PUT")
+	router.HandleFunc("/api/desert-storm/{id}", authMiddleware(rankManagementMiddleware(deleteDesertStormEvent))).Methods("DELETE")
+	router.HandleFunc("/api/desert-storm/{id}/participants/{pid}", authMiddleware(rankManagementMiddleware(updateDesertStormParticipant))).Methods("PUT")
+
+	// Zombie Siege routes (protected)
+	router.HandleFunc("/api/zombie-siege", authMiddleware(listZombieSiegeEvents)).Methods("GET")
+	router.HandleFunc("/api/zombie-siege", authMiddleware(r3PlusMiddleware(createZombieSiegeEvent))).Methods("POST")
+	router.HandleFunc("/api/zombie-siege/process-screenshots", authMiddleware(r3PlusMiddleware(processZombieSiegeScreenshots))).Methods("POST")
+	router.HandleFunc("/api/zombie-siege/confirm", authMiddleware(r3PlusMiddleware(confirmZombieSiege))).Methods("POST")
+	router.HandleFunc("/api/zombie-siege/member-stats", authMiddleware(getZombieSiegeMemberStats)).Methods("GET")
+	router.HandleFunc("/api/zombie-siege/{id}", authMiddleware(getZombieSiegeEvent)).Methods("GET")
+	router.HandleFunc("/api/zombie-siege/{id}", authMiddleware(rankManagementMiddleware(updateZombieSiegeEvent))).Methods("PUT")
+	router.HandleFunc("/api/zombie-siege/{id}", authMiddleware(rankManagementMiddleware(deleteZombieSiegeEvent))).Methods("DELETE")
+	router.HandleFunc("/api/zombie-siege/{id}/participants/{pid}", authMiddleware(rankManagementMiddleware(updateZombieSiegeParticipant))).Methods("PUT")
 
 	// Donations routes (protected)
 	router.HandleFunc("/api/donations", authMiddleware(getDonationRecords)).Methods("GET")
