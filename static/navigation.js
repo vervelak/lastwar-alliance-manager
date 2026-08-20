@@ -55,6 +55,7 @@
                 <a href="/zombie-siege.html" class="nav-link" id="zs-nav-link">🧟 Zombie Siege</a>
                 <a href="/vs.html" class="nav-link">⚔️ VS Points</a>
                 <a href="/vs-compliance.html" class="nav-link">✅ VS Compliance</a>
+                <a href="/donations.html" class="nav-link">💰 Donations</a>
                 <a href="/participation.html" class="nav-link">📋 Participation</a>
                 <a href="/upload.html" class="nav-link">📸 Upload</a>
                 <a href="/settings.html" class="nav-link">⚙️ Settings</a>

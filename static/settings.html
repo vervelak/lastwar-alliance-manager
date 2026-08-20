@@ -113,6 +113,25 @@
                     </div>
 
                     <div class="settings-group">
+                        <h4>💰 Tech Donation Targets</h4>
+                        <div class="form-group">
+                            <label for="donation-weekly-target">Weekly Donation Target (per member):</label>
+                            <input type="number" id="donation-weekly-target" min="0" placeholder="0 = disabled">
+                            <span class="help-text">Minimum weekly tech donations expected per member. Drives the donations compliance view. Set to 0 to disable.</span>
+                        </div>
+                        <div class="form-group">
+                            <label for="conductor-donation-threshold">Conductor Donation Threshold:</label>
+                            <input type="number" id="conductor-donation-threshold" min="0" required>
+                            <span class="help-text">Minimum weekly tech donations to enter the conductor lucky draw (Save Week mode).</span>
+                        </div>
+                        <div class="form-group">
+                            <label for="vip-donation-threshold">VIP Seat Donation Threshold:</label>
+                            <input type="number" id="vip-donation-threshold" min="0" required>
+                            <span class="help-text">Minimum weekly tech donations to enter the VIP seat lucky draw (Save Week mode).</span>
+                        </div>
+                    </div>
+
+                    <div class="settings-group">
                         <h4>⚡ Power Tracking</h4>
                         <div class="form-group">
                             <label class="checkbox-label">
