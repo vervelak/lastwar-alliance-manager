@@ -8265,6 +8265,20 @@ func parseZSWave(line string) (int64, bool) {
 	return n, true
 }
 
+// zsValidName rejects OCR junk that lands in the name column: rank/avatar
+// glyphs read as single symbols ("|", "=", "_"), two-letter fragments ("BY",
+// "Gy", "oe"), or merged junk like "= = oe". A real player name contains at
+// least three letters.
+func zsValidName(s string) bool {
+	letters := 0
+	for _, c := range strings.TrimSpace(s) {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			letters++
+		}
+	}
+	return letters >= 3
+}
+
 // zsParseNames extracts player names from full-width word boxes. Names sit at
 // ~33% of width, the 8-digit power at ~40% (dropped as pure digits), and the
 // alliance tag / rank badge left of ~30% or just below the name. The column
@@ -8288,7 +8302,8 @@ func zsParseNames(boxes []gosseract.BoundingBox, cropWidth int) ([]ZSOCRRecord, 
 	}
 
 	nameMinX := cropWidth * 30 / 100
-	nameMaxX := cropWidth * 42 / 100
+	nameMaxX := cropWidth * 42 / 100  // a new row's name starts within this column
+	nameContX := cropWidth * 60 / 100 // hard right bound for same-line continuation
 
 	type word struct {
 		text string
@@ -8326,7 +8341,7 @@ func zsParseNames(boxes []gosseract.BoundingBox, cropWidth int) ([]ZSOCRRecord, 
 		if w.y <= headerY+20 {
 			continue
 		}
-		if w.x < nameMinX || w.x > nameMaxX {
+		if w.x < nameMinX || w.x > nameContX {
 			continue
 		}
 		if dateRe.MatchString(w.text) || strings.Contains(w.text, ":") {
@@ -8336,6 +8351,11 @@ func zsParseNames(boxes []gosseract.BoundingBox, cropWidth int) ([]ZSOCRRecord, 
 			continue // power/score value beneath the name
 		}
 		if len(lines) == 0 || w.y-lines[len(lines)-1].y > 25 {
+			// A new row only starts inside the name column; words to the right
+			// of it (multi-word name tails like "Silas") only extend a row.
+			if w.x > nameMaxX {
+				continue
+			}
 			lines = append(lines, line{text: w.text, y: w.y})
 			continue
 		}
@@ -8350,7 +8370,11 @@ func zsParseNames(boxes []gosseract.BoundingBox, cropWidth int) ([]ZSOCRRecord, 
 		if l.y-lastY <= 200 {
 			continue
 		}
-		names = append(names, ZSOCRRecord{MemberName: strings.TrimSpace(l.text)})
+		name := strings.TrimSpace(l.text)
+		if !zsValidName(name) {
+			continue
+		}
+		names = append(names, ZSOCRRecord{MemberName: name})
 		lastY = l.y
 	}
 
