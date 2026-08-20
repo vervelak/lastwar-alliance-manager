@@ -263,6 +263,7 @@ function buildDetailContent(r) {
                 <label><input type="checkbox" class="timeline-opt" id="show-reset-${r.member.id}" data-member-id="${r.member.id}" checked> Points</label>
                 <label><input type="checkbox" class="timeline-opt" id="show-vs-${r.member.id}" data-member-id="${r.member.id}" checked> VS Points</label>
                 <label><input type="checkbox" class="timeline-opt" id="show-power-${r.member.id}" data-member-id="${r.member.id}"> Power</label>
+                <label><input type="checkbox" class="timeline-opt" id="show-donations-${r.member.id}" data-member-id="${r.member.id}"> Donations</label>
                 <button class="rk-advanced-btn" onclick="toggleAdvanced(${r.member.id}, this)">More ▸</button>
             </div>
             <div class="rk-timeline-advanced" id="advanced-${r.member.id}">
@@ -275,6 +276,7 @@ function buildDetailContent(r) {
             <canvas id="timeline-${r.member.id}" class="member-timeline-canvas" style="display:none"></canvas>
             <canvas id="vs-timeline-${r.member.id}" class="rk-power-canvas" style="display:none"></canvas>
             <canvas id="power-timeline-${r.member.id}" class="rk-power-canvas" style="display:none"></canvas>
+            <canvas id="donation-timeline-${r.member.id}" class="rk-power-canvas" style="display:none"></canvas>
         </div>`;
 
     return `
@@ -476,6 +478,7 @@ function buildMemberChart(ranking, timelineData) {
     const canvas      = document.getElementById(`timeline-${ranking.member.id}`);
     const vsCanvas    = document.getElementById(`vs-timeline-${ranking.member.id}`);
     const powerCanvas = document.getElementById(`power-timeline-${ranking.member.id}`);
+    const donationCanvas = document.getElementById(`donation-timeline-${ranking.member.id}`);
 
     if (!memberData || memberData.dates.length === 0) {
         if (loadingEl) loadingEl.innerHTML = '<p class="empty">No timeline data available.</p>';
@@ -487,7 +490,7 @@ function buildMemberChart(ranking, timelineData) {
     canvas.style.display = '';
 
     // Destroy previous instances
-    [canvas, vsCanvas, powerCanvas].forEach(c => {
+    [canvas, vsCanvas, powerCanvas, donationCanvas].forEach(c => {
         if (!c) return;
         const existing = Chart.getChart(c);
         if (existing) existing.destroy();
@@ -499,6 +502,7 @@ function buildMemberChart(ranking, timelineData) {
     const showBreakdown = document.getElementById(`show-breakdown-${ranking.member.id}`)?.checked ?? false;
     const showVS        = document.getElementById(`show-vs-${ranking.member.id}`)?.checked ?? true;
     const showPower     = document.getElementById(`show-power-${ranking.member.id}`)?.checked ?? false;
+    const showDonations = document.getElementById(`show-donations-${ranking.member.id}`)?.checked ?? false;
     const scaleType     = document.querySelector(`input[name="scale-type-${ranking.member.id}"]:checked`)?.value || 'linear';
 
     applyChartTheme();
@@ -705,6 +709,70 @@ function buildMemberChart(ranking, timelineData) {
             memberTimelineCharts.push(powerChart);
         } else {
             powerCanvas.style.display = 'none';
+        }
+    }
+
+    // ── Donations mini-chart ─────────────────────────────────────────────────
+    if (donationCanvas) {
+        const hasDonations = memberData.donation_weekly_total && memberData.donation_weekly_total.some(v => v > 0);
+        if (showDonations && hasDonations) {
+            donationCanvas.style.display = '';
+            const donationTarget = currentData?.settings?.donation_weekly_target || 0;
+            const donationAnnotations = {};
+            if (donationTarget > 0) {
+                donationAnnotations.target = {
+                    type: 'line', yMin: donationTarget, yMax: donationTarget,
+                    borderColor: 'rgba(239,68,68,0.7)', borderWidth: 1.5, borderDash: [4, 4],
+                    label: { display: true, content: `Target: ${donationTarget.toLocaleString()}`, position: 'end', font: { size: 10 } }
+                };
+            }
+            const donationChart = new Chart(donationCanvas, {
+                type: 'bar',
+                data: {
+                    labels: memberData.dates,
+                    datasets: [{
+                        label: 'Tech Donations',
+                        data: memberData.donation_weekly_total,
+                        backgroundColor: memberData.donation_weekly_total.map(v =>
+                            donationTarget > 0
+                                ? (v >= donationTarget ? 'rgba(34,197,94,0.55)' : 'rgba(239,68,68,0.45)')
+                                : 'rgba(245,158,11,0.55)'
+                        ),
+                        borderColor: memberData.donation_weekly_total.map(v =>
+                            donationTarget > 0
+                                ? (v >= donationTarget ? '#22c55e' : '#ef4444')
+                                : '#f59e0b'
+                        ),
+                        borderWidth: 1,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                title: items => items[0]?.label || '',
+                                label: item => ` Donations: ${item.parsed.y.toLocaleString()}${donationTarget > 0 ? ' / ' + donationTarget.toLocaleString() + ' target' : ''}`
+                            }
+                        },
+                        annotation: { annotations: donationAnnotations }
+                    },
+                    scales: {
+                        x: { ticks: { maxRotation: 45, minRotation: 45, font: { size: 9 } } },
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Donations', font: { size: 11 } },
+                            ticks: { font: { size: 10 }, callback: v => v >= 1000 ? (v / 1000).toFixed(0) + 'K' : v }
+                        }
+                    },
+                    interaction: { mode: 'nearest', axis: 'x', intersect: false }
+                }
+            });
+            memberTimelineCharts.push(donationChart);
+        } else {
+            donationCanvas.style.display = 'none';
         }
     }
 }

@@ -247,6 +247,9 @@ type Settings struct {
 	MarshalGuardEnabled          bool   `json:"marshal_guard_enabled"`
 	DesertStormEnabled           bool   `json:"desert_storm_enabled"`
 	ZombieSiegeEnabled           bool   `json:"zombie_siege_enabled"`
+	DonationWeeklyTarget         int    `json:"donation_weekly_target"`
+	ConductorDonationThreshold   int    `json:"conductor_donation_threshold"`
+	VipDonationThreshold         int    `json:"vip_donation_threshold"`
 }
 
 type MemberRanking struct {
@@ -1907,6 +1910,26 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 			return err
 		}
 		log.Println("Database migration: Added zombie_siege_enabled column to settings table")
+	}
+
+	// Migrate settings table to add donation tracking columns if missing
+	for _, col := range []struct {
+		name    string
+		def     string
+		display string
+	}{
+		{"donation_weekly_target", "0", "donation_weekly_target"},
+		{"conductor_donation_threshold", "60000", "conductor_donation_threshold"},
+		{"vip_donation_threshold", "40000", "vip_donation_threshold"},
+	} {
+		var exists bool
+		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name='` + col.name + `'`).Scan(&exists)
+		if err != nil || !exists {
+			if _, err = db.Exec(`ALTER TABLE settings ADD COLUMN ` + col.name + ` INTEGER NOT NULL DEFAULT ` + col.def); err != nil {
+				return err
+			}
+			log.Println("Database migration: Added " + col.display + " column to settings table")
+		}
 	}
 
 	// Create marshal_guard_events table
@@ -4860,7 +4883,10 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		COALESCE(vip_seat_enabled, 1) as vip_seat_enabled,
 		COALESCE(marshal_guard_enabled, 1) as marshal_guard_enabled,
 		COALESCE(desert_storm_enabled, 1) as desert_storm_enabled,
-		COALESCE(zombie_siege_enabled, 1) as zombie_siege_enabled
+		COALESCE(zombie_siege_enabled, 1) as zombie_siege_enabled,
+		COALESCE(donation_weekly_target, 0) as donation_weekly_target,
+		COALESCE(conductor_donation_threshold, 60000) as conductor_donation_threshold,
+		COALESCE(vip_donation_threshold, 40000) as vip_donation_threshold
 		FROM settings WHERE id = 1`).Scan(
 		&settings.ID,
 		&settings.AllianceName,
@@ -4888,6 +4914,9 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 		&settings.MarshalGuardEnabled,
 		&settings.DesertStormEnabled,
 		&settings.ZombieSiegeEnabled,
+		&settings.DonationWeeklyTarget,
+		&settings.ConductorDonationThreshold,
+		&settings.VipDonationThreshold,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -4941,7 +4970,10 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		vip_seat_enabled = ?,
 		marshal_guard_enabled = ?,
 		desert_storm_enabled = ?,
-		zombie_siege_enabled = ?
+		zombie_siege_enabled = ?,
+		donation_weekly_target = ?,
+		conductor_donation_threshold = ?,
+		vip_donation_threshold = ?
 		WHERE id = 1`,
 		settings.AllianceName,
 		settings.AllianceShortName,
@@ -4968,6 +5000,9 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		settings.MarshalGuardEnabled,
 		settings.DesertStormEnabled,
 		settings.ZombieSiegeEnabled,
+		settings.DonationWeeklyTarget,
+		settings.ConductorDonationThreshold,
+		settings.VipDonationThreshold,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -5109,10 +5144,13 @@ func luckyDraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Donation thresholds: conductor = 60k, vip = 40k
-	threshold := int64(40000)
+	// Donation thresholds from settings (defaults: conductor = 60k, vip = 40k)
+	conductorThreshold, vipThreshold := 60000, 40000
+	db.QueryRow(`SELECT COALESCE(conductor_donation_threshold, 60000), COALESCE(vip_donation_threshold, 40000)
+		FROM settings WHERE id = 1`).Scan(&conductorThreshold, &vipThreshold)
+	threshold := int64(vipThreshold)
 	if req.Type == "conductor" {
-		threshold = int64(60000)
+		threshold = int64(conductorThreshold)
 	}
 
 	// Eligible = members with tech donations >= threshold for the given week
@@ -5912,6 +5950,26 @@ func getMemberTimelines(w http.ResponseWriter, r *http.Request) {
 			vsRows.Close()
 		}
 
+		// Get weekly tech donations for this member (keyed by week date)
+		donationWeekMap := make(map[string]int)
+		donationRows, err := db.Query(`
+			SELECT week_date, SUM(amount) as weekly_total
+			FROM tech_donations
+			WHERE member_id = ? AND donation_type = 'weekly' AND week_date >= ?
+			GROUP BY week_date
+			ORDER BY week_date ASC
+		`, member.ID, formatDateString(startDate))
+		if err == nil {
+			for donationRows.Next() {
+				var weekDate string
+				var total int
+				if err := donationRows.Scan(&weekDate, &total); err == nil {
+					donationWeekMap[weekDate] = total
+				}
+			}
+			donationRows.Close()
+		}
+
 		// Build weekly timeline arrays
 		weekLabels := []string{}
 		pointsWithReset := []int{}
@@ -5931,6 +5989,7 @@ func getMemberTimelines(w http.ResponseWriter, r *http.Request) {
 		powerValues := []int{}
 		lastKnownPower := 0
 		vsWeeklyTotals := []int{}
+		donationWeeklyTotals := []int{}
 
 		currentPoints := 0
 		cumulativePoints := 0
@@ -6092,6 +6151,7 @@ func getMemberTimelines(w http.ResponseWriter, r *http.Request) {
 			aboveAvgPenaltyCumulative = append(aboveAvgPenaltyCumulative, cumulativeAboveAvgPenalty)
 			powerValues = append(powerValues, weekMaxPower)
 			vsWeeklyTotals = append(vsWeeklyTotals, vsWeekMap[weekStartStr])
+			donationWeeklyTotals = append(donationWeeklyTotals, donationWeekMap[weekStartStr])
 
 			currentDate = currentDate.AddDate(0, 0, 7)
 		}
@@ -6128,6 +6188,7 @@ func getMemberTimelines(w http.ResponseWriter, r *http.Request) {
 			"conductor_dates":              conductorWeekLabels,
 			"power":                        powerValues,
 			"vs_weekly_total":              vsWeeklyTotals,
+			"donation_weekly_total":        donationWeeklyTotals,
 		}
 	}
 
@@ -16382,6 +16443,114 @@ func processDonationScreenshots(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// getDonationCompliance — GET /api/donations/compliance?weeks=N
+// Weekly donation totals per member vs the configured weekly target.
+func getDonationCompliance(w http.ResponseWriter, r *http.Request) {
+	weeksParam := r.URL.Query().Get("weeks")
+	numWeeks := 4
+	if weeksParam != "" {
+		if n, err := strconv.Atoi(weeksParam); err == nil && n > 0 && n <= 12 {
+			numWeeks = n
+		}
+	}
+
+	var weeklyTarget int
+	db.QueryRow(`SELECT COALESCE(donation_weekly_target, 0) FROM settings WHERE id = 1`).Scan(&weeklyTarget)
+
+	memberRows, err := db.Query(`SELECT id, name, COALESCE(nickname, ''), rank FROM members WHERE deleted_at IS NULL ORDER BY name`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type ComplianceMember struct {
+		ID       int
+		Name     string
+		Nickname string
+		Rank     string
+	}
+	var members []ComplianceMember
+	for memberRows.Next() {
+		var m ComplianceMember
+		if err := memberRows.Scan(&m.ID, &m.Name, &m.Nickname, &m.Rank); err != nil {
+			continue
+		}
+		members = append(members, m)
+	}
+	memberRows.Close()
+
+	now := getServerTime()
+	currentMonday := getMondayOfWeek(now)
+	startDate := currentMonday.AddDate(0, 0, -(numWeeks-1)*7)
+
+	// week_date -> member_id -> total amount (only matched members count)
+	donationRows, err := db.Query(`
+		SELECT member_id, week_date, SUM(amount)
+		FROM tech_donations
+		WHERE donation_type = 'weekly' AND member_id IS NOT NULL AND week_date >= ?
+		GROUP BY member_id, week_date
+	`, formatDateString(startDate))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	donationData := make(map[string]map[int]int)
+	for donationRows.Next() {
+		var memberID int
+		var weekDate string
+		var amount int
+		if err := donationRows.Scan(&memberID, &weekDate, &amount); err != nil {
+			continue
+		}
+		if donationData[weekDate] == nil {
+			donationData[weekDate] = make(map[int]int)
+		}
+		donationData[weekDate][memberID] += amount
+	}
+	donationRows.Close()
+
+	type MemberCompliance struct {
+		MemberID int    `json:"member_id"`
+		Name     string `json:"name"`
+		Nickname string `json:"nickname,omitempty"`
+		Rank     string `json:"rank"`
+		Amount   int    `json:"amount"`
+		Met      bool   `json:"met"`
+		HasData  bool   `json:"has_data"`
+	}
+	type WeekCompliance struct {
+		WeekDate  string             `json:"week_date"`
+		WeekLabel string             `json:"week_label"`
+		Members   []MemberCompliance `json:"members"`
+	}
+
+	weeks := make([]WeekCompliance, 0, numWeeks)
+	for i := numWeeks - 1; i >= 0; i-- {
+		monday := currentMonday.AddDate(0, 0, -i*7)
+		sunday := monday.AddDate(0, 0, 6)
+		weekDate := formatDateString(monday)
+		weekLabel := fmt.Sprintf("%s – %s", monday.Format("Jan 2"), sunday.Format("Jan 2"))
+
+		weekDonations := donationData[weekDate]
+		memberList := make([]MemberCompliance, 0, len(members))
+		for _, m := range members {
+			mc := MemberCompliance{MemberID: m.ID, Name: m.Name, Nickname: m.Nickname, Rank: m.Rank}
+			if amount, ok := weekDonations[m.ID]; ok {
+				mc.Amount = amount
+				mc.HasData = true
+				mc.Met = weeklyTarget > 0 && amount >= weeklyTarget
+			}
+			memberList = append(memberList, mc)
+		}
+		weeks = append(weeks, WeekCompliance{WeekDate: weekDate, WeekLabel: weekLabel, Members: memberList})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"target": weeklyTarget,
+		"weeks":  weeks,
+	})
+}
+
 // getDonationRecords — GET /api/donations?type=daily|weekly&date=YYYY-MM-DD
 func getDonationRecords(w http.ResponseWriter, r *http.Request) {
 	donationType := r.URL.Query().Get("type")
@@ -16676,6 +16845,7 @@ func main() {
 	router.HandleFunc("/api/donations", authMiddleware(getDonationRecords)).Methods("GET")
 	router.HandleFunc("/api/donations", authMiddleware(r3PlusMiddleware(saveDonationRecords))).Methods("POST")
 	router.HandleFunc("/api/donations/process-screenshots", authMiddleware(r3PlusMiddleware(processDonationScreenshots))).Methods("POST")
+	router.HandleFunc("/api/donations/compliance", authMiddleware(getDonationCompliance)).Methods("GET")
 	router.HandleFunc("/api/donations/{id}", authMiddleware(r3PlusMiddleware(deleteDonationRecord))).Methods("DELETE")
 
 	// Health check endpoints (no auth)

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tech Donations - Last War Alliance</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="branding.js"></script>
+    <script src="toast.js"></script>
+    <script src="common.js"></script>
+    <script src="navigation.js"></script>
+</head>
+<body data-h1="🧟 Last War: Survival" data-subtitle="Tech donations — who feeds the alliance, who freeloads.">
+    <div class="container">
+
+        <main>
+            <!-- Tab Buttons -->
+            <div class="tab-buttons">
+                <button class="tab-btn active" data-tab="import">📥 Import</button>
+                <button class="tab-btn" data-tab="leaderboard">🏆 Leaderboard</button>
+                <button class="tab-btn" data-tab="compliance">✅ Compliance</button>
+            </div>
+
+            <!-- Import Tab -->
+            <div id="tab-import" class="tab-content active">
+                <section class="form-section">
+                    <div class="mg-toolbar">
+                        <h3>📷 Donation Screenshot Upload</h3>
+                    </div>
+                    <div class="form-group" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;">
+                        <div>
+                            <label for="donation-type-select">Leaderboard Type</label>
+                            <select id="donation-type-select" class="form-control">
+                                <option value="weekly" selected>Weekly</option>
+                                <option value="daily">Daily</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="donation-record-date">Record Date (week start)</label>
+                            <input type="date" id="donation-record-date" class="form-control">
+                        </div>
+                    </div>
+                    <input type="file" id="donation-image-input" accept="image/*" multiple style="display:none;">
+                    <div id="donation-drop-zone" class="drop-zone">
+                        <div id="donation-drop-content">
+                            <div class="drop-icon">📁</div>
+                            <p class="drop-text">Tap to upload or drag &amp; drop</p>
+                            <p class="drop-subtext">Strength Ranking → Donation tab screenshots (up to 40 images)</p>
+                        </div>
+                        <div id="donation-preview-container" class="preview-container">
+                            <div class="preview-header">
+                                <p id="donation-files-count"></p>
+                                <button type="button" id="donation-clear-btn" class="btn btn-secondary">🗑️ Clear</button>
+                            </div>
+                            <div id="donation-preview-gallery"></div>
+                        </div>
+                    </div>
+                    <button type="button" id="donation-process-btn" class="btn btn-primary uploader-only" style="display:none;">🔍 Process Screenshots with OCR</button>
+                    <div id="donation-progress-wrap" style="display:none;margin-top:.75rem;">
+                        <div style="display:flex;justify-content:space-between;font-size:.82em;margin-bottom:.3rem;">
+                            <span id="donation-progress-label">Processing…</span>
+                            <span id="donation-progress-time">0s</span>
+                        </div>
+                        <div style="background:var(--bg-secondary,#e5e7eb);border-radius:999px;height:8px;overflow:hidden;">
+                            <div id="donation-progress-bar" style="height:100%;width:0%;background:var(--primary,#6366f1);border-radius:999px;transition:width .3s ease;"></div>
+                        </div>
+                    </div>
+                    <p class="help-text" style="margin-top:.75rem;">
+                        💡 Manual entry is available from the Leaderboard tab (➕ Add Record).
+                    </p>
+                </section>
+            </div>
+
+            <!-- Leaderboard Tab -->
+            <div id="tab-leaderboard" class="tab-content">
+                <section class="form-section">
+                    <div class="mg-toolbar">
+                        <h3>🏆 Donation Records</h3>
+                        <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;">
+                            <select id="board-type-select" class="form-control">
+                                <option value="weekly" selected>Weekly</option>
+                                <option value="daily">Daily</option>
+                            </select>
+                            <input type="date" id="board-date" class="form-control">
+                            <button type="button" id="add-record-btn" class="primary-btn uploader-only" style="display:none;">➕ Add Record</button>
+                        </div>
+                    </div>
+                    <div id="board-list" class="rk-table-wrapper">
+                        <p class="loading">⏳ Loading records...</p>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Compliance Tab -->
+            <div id="tab-compliance" class="tab-content">
+                <section class="form-section">
+                    <div class="mg-toolbar">
+                        <h3>✅ Weekly Donation Compliance</h3>
+                        <select id="compliance-weeks" class="form-control">
+                            <option value="2">2 weeks</option>
+                            <option value="4" selected>4 weeks</option>
+                            <option value="8">8 weeks</option>
+                            <option value="12">12 weeks</option>
+                        </select>
+                    </div>
+                    <div id="compliance-list">
+                        <p class="loading">⏳ Loading compliance...</p>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+    </div>
+
+    <!-- OCR Preview Modal -->
+    <div id="donation-ocr-modal" class="modal" style="display:none;">
+        <div class="modal-content" style="max-width:860px;">
+            <span class="close" role="button" tabindex="0" aria-label="Close dialog">&times;</span>
+            <h3>📋 OCR Preview — Review &amp; Import</h3>
+            <p class="text-muted" style="margin-top:0;font-size:0.9em;">
+                Edit any cell before importing. Records replace existing data for the selected type + date.
+            </p>
+            <div id="donation-ocr-content"></div>
+            <div class="modal-footer" style="margin-top:1rem;">
+                <button type="button" id="donation-ocr-cancel-btn" class="secondary-btn">Cancel</button>
+                <button type="button" id="donation-ocr-import-btn" class="primary-btn">✔ Import Records</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Record Modal -->
+    <div id="add-record-modal" class="modal" style="display:none;">
+        <div class="modal-content" style="max-width:440px;">
+            <span class="close" role="button" tabindex="0" aria-label="Close dialog">&times;</span>
+            <h3>➕ Add Donation Record</h3>
+            <form id="add-record-form">
+                <div class="form-group">
+                    <label for="record-member">Member</label>
+                    <select id="record-member" class="form-control" required></select>
+                </div>
+                <div class="form-group">
+                    <label for="record-amount">Donation Amount</label>
+                    <input type="number" id="record-amount" class="form-control" min="0" required placeholder="e.g. 45000">
+                </div>
+                <button type="submit" class="btn btn-primary">💾 Save Record</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="theme.js"></script>
+    <script src="donations.js"></script>
+</body>
+</html>
