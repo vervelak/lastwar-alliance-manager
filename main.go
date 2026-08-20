@@ -13977,6 +13977,9 @@ func loadAllMembers() ([]Member, error) {
 // getAllianceShortName returns the uppercase alliance short name from settings,
 // used as the known tag hint for player-tag parsing.
 func getAllianceShortName() string {
+	if db == nil {
+		return ""
+	}
 	var tag string
 	db.QueryRow(`SELECT COALESCE(alliance_short_name, '') FROM settings WHERE id = 1`).Scan(&tag)
 	return strings.ToUpper(strings.TrimSpace(tag))
