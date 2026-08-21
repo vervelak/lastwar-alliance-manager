@@ -101,8 +101,11 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for the comprehensive production guide coveri
 Production images are published to GitHub Container Registry — no clone or Go toolchain needed:
 
 ```bash
-# Generate a session key once:
-export SESSION_KEY=$(openssl rand -hex 32)
+# Grab the production compose file (or clone the repo):
+curl -O https://raw.githubusercontent.com/vervelak/lastwar-alliance-manager/main/docker-compose.yml
+
+# Set a session key via .env (Compose reads it automatically):
+echo "SESSION_KEY=$(openssl rand -hex 32)" > .env && chmod 600 .env
 
 docker compose up -d          # Docker
 # -- or --
@@ -111,6 +114,8 @@ podman-compose up -d          # Podman
 # The app is now running at http://localhost:8080
 # The SQLite database is persisted in ./data/alliance.db
 ```
+
+**Container image:** `ghcr.io/vervelak/lastwar-alliance-manager` — built for `linux/amd64` and `linux/arm64` (Raspberry Pi works), published automatically on every merge to `main` and on version tags. Tags: `latest`, semver (e.g. `1.2.3`), `main`, and commit sha.
 
 To test local code changes instead, build from source with the dev compose file:
 `docker compose -f docker-compose.dev.yml up -d --build`

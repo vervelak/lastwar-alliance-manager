@@ -110,8 +110,8 @@ docker compose down
 # Restart
 docker compose restart
 
-# Rebuild after a code change
-docker compose up -d --build
+# Pull the latest published image and recreate the container
+docker compose pull && docker compose up -d
 
 # Open a shell inside the running container
 docker compose exec lastwar sh
@@ -140,11 +140,15 @@ echo "0 2 * * * root /usr/local/bin/backup-lastwar.sh" | sudo tee /etc/cron.d/la
 
 ### 8. Updating the Application (Docker)
 
+The production compose file pulls the published image from GHCR, so updates need no rebuild:
+
 ```bash
 cd /opt/lastwar
-git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+Optionally `git pull` first if you also want the latest compose file or docs.
 
 ---
 

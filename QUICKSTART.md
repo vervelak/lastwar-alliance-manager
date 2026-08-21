@@ -200,7 +200,7 @@ docker compose up -d              # Start (detached)
 docker compose down               # Stop
 docker compose logs -f            # Tail logs
 docker compose restart            # Restart
-docker compose up -d --build      # Rebuild after code change
+docker compose pull && docker compose up -d   # Update to latest image
 ```
 
 ### Systemd Service (Bare-Metal)
@@ -265,10 +265,9 @@ curl https://www.ssllabs.com/ssltest/analyze.html?d=your-domain.com
 # Update system packages
 sudo apt update && sudo apt upgrade -y
 
-# Update application (Docker)
+# Update application (Docker) — pulls the latest published image
 cd /opt/lastwar
-git pull
-docker compose up -d --build
+docker compose pull && docker compose up -d
 
 # Update application (bare-metal)
 cd /opt/lastwar
