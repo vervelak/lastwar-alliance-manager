@@ -5,6 +5,12 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v1.2.3)
+        type: string
+        default: ''
 
 env:
   REGISTRY: ghcr.io
@@ -43,13 +49,24 @@ jobs:
             type=ref,event=branch
             type=sha
 
+      - name: Compute release tags
+        if: inputs.tag != ''
+        id: reltags
+        run: |
+          V="${{ inputs.tag }}"
+          V="${V#v}"
+          MAJOR="${V%%.*}"
+          MINOR="${V#*.}"; MINOR="${MINOR%%.*}"
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "tags=$IMG:$V,$IMG:$MAJOR.$MINOR,$IMG:latest" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ inputs.tag != '' && steps.reltags.outputs.tags || steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
