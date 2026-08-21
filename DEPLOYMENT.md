@@ -9,12 +9,16 @@ Docker is the easiest and most portable way to deploy Last War Alliance Manager.
 - Docker Engine ≥ 24 **or** Podman ≥ 4 with `podman-compose`
 - A domain name pointing to your server (for HTTPS)
 
-### 1. Clone the Repository
+### 1. Get the Compose File
+
+The production compose file pulls the published image from GitHub Container Registry — no Go, GCC, or Tesseract needed. Either clone the repository:
 
 ```bash
 git clone <your-repo-url> /opt/lastwar
 cd /opt/lastwar
 ```
+
+or download just `docker-compose.yml` from the repository into an empty directory.
 
 ### 2. Generate a Session Key
 
@@ -22,9 +26,16 @@ cd /opt/lastwar
 openssl rand -hex 32
 ```
 
-### 3. Configure the Compose File
+### 3. Configure the Session Key
 
-Edit `docker-compose.yml` and set `SESSION_KEY` to the value from the previous step:
+Create a `.env` file next to `docker-compose.yml` with the value from the previous step (Compose reads it automatically):
+
+```bash
+echo "SESSION_KEY=your-64-char-hex-key-here" > .env
+chmod 600 .env
+```
+
+Alternatively edit `docker-compose.yml` and set `SESSION_KEY` directly:
 
 ```yaml
 environment:

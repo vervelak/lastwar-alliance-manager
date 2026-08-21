@@ -1,9 +1,8 @@
+# Production: runs the published image from GitHub Container Registry.
+# For local development against your own build, use docker-compose.dev.yml.
 services:
   lastwar:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: lastwar-alliance:latest
+    image: ghcr.io/vervelak/lastwar-alliance-manager:latest
     container_name: lastwar-alliance
     ports:
       - "8080:8080"
@@ -15,5 +14,9 @@ services:
       # Set SESSION_KEY via .env file or shell environment.
       # Generate one with: openssl rand -hex 32
       SESSION_KEY: "${SESSION_KEY}"
-      MG_DEBUG_DIR: "/data/mg-debug"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

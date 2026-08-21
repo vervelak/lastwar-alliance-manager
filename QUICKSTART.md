@@ -11,7 +11,7 @@ Run the app locally with Docker and validate it with the included Playwright tes
 ### 1. Build and Start
 
 ```bash
-docker compose up -d --build
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 App is now at **http://localhost:8080**. Default credentials: `admin` / `admin123`.
@@ -46,7 +46,7 @@ Screenshots from each run are saved to `playwright-tests/screenshots/`.
 ### Iterate: Rebuild and Retest
 
 ```bash
-docker compose up -d --build   # rebuild image after code changes
+docker compose -f docker-compose.dev.yml up -d --build   # rebuild image after code changes
 cd playwright-tests && npx playwright test
 ```
 
@@ -69,7 +69,12 @@ openssl rand -hex 32
 ```
 
 ### 2. Set the Session Key
-Edit `docker-compose.yml` and paste the key into the `SESSION_KEY` environment variable.
+Create a `.env` file next to `docker-compose.yml` (Compose reads it automatically):
+
+```bash
+echo "SESSION_KEY=your-64-char-hex-key-here" > .env
+chmod 600 .env
+```
 
 ### 3. Start
 ```bash
@@ -92,10 +97,11 @@ sudo systemctl reload caddy
 
 ### Useful Commands
 ```bash
-docker compose logs -f            # Tail logs
-docker compose restart            # Restart
-docker compose up -d --build      # Rebuild after code change
-docker compose down               # Stop and remove containers
+docker compose logs -f                                   # Tail logs
+docker compose restart                                   # Restart
+docker compose pull && docker compose up -d              # Pull latest published image
+docker compose -f docker-compose.dev.yml up -d --build   # Rebuild from local source
+docker compose down                                      # Stop and remove containers
 ```
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for full Docker production setup.

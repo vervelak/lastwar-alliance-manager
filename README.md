@@ -98,8 +98,12 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for the comprehensive production guide coveri
 
 ### Docker / Podman (Quickest)
 
+Production images are published to GitHub Container Registry — no clone or Go toolchain needed:
+
 ```bash
-# Clone or download the project, then:
+# Generate a session key once:
+export SESSION_KEY=$(openssl rand -hex 32)
+
 docker compose up -d          # Docker
 # -- or --
 podman-compose up -d          # Podman
@@ -107,6 +111,9 @@ podman-compose up -d          # Podman
 # The app is now running at http://localhost:8080
 # The SQLite database is persisted in ./data/alliance.db
 ```
+
+To test local code changes instead, build from source with the dev compose file:
+`docker compose -f docker-compose.dev.yml up -d --build`
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for full Docker production setup (with HTTPS reverse proxy).
 
@@ -148,8 +155,8 @@ docker compose logs -f
 # Stop
 docker compose down
 
-# Rebuild after code changes
-docker compose up -d --build
+# Rebuild from local source after code changes (dev compose)
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 The database is stored in `./data/alliance.db` on the host.
@@ -190,7 +197,7 @@ The test suite is built with [Playwright](https://playwright.dev/) and runs agai
 ### 1. Start the App
 
 ```bash
-docker compose up -d --build
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 The app is now at `http://localhost:8080`. Default credentials: `admin` / `admin123`.
@@ -237,8 +244,8 @@ npm run report
 ### Rebuilding After Code Changes
 
 ```bash
-docker compose up -d --build   # rebuild image and restart container
-npx playwright test            # re-run tests against the updated container
+docker compose -f docker-compose.dev.yml up -d --build   # rebuild image and restart container
+npx playwright test                                      # re-run tests against the updated container
 ```
 
 ## Environment Variables
@@ -264,7 +271,8 @@ LastWar/
 ├── main.go                  # Go server and all API routes
 ├── go.mod / go.sum          # Go module dependencies
 ├── Dockerfile               # Multi-stage container build
-├── docker-compose.yml       # Compose file (persists DB in ./data/)
+├── docker-compose.yml       # Production compose (pulls GHCR image)
+├── docker-compose.dev.yml   # Dev compose (builds from local source)
 ├── .env.example             # Environment variable reference
 ├── install.sh               # Automated Debian/Ubuntu installation
 ├── lastwar.service          # Systemd service unit file
