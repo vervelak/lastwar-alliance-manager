@@ -117,6 +117,8 @@ podman-compose up -d          # Podman
 
 **Container image:** `ghcr.io/vervelak/lastwar-alliance-manager` — built for `linux/amd64` and `linux/arm64` (Raspberry Pi works), published automatically on every merge to `main` and on version tags. Tags: `latest`, semver (e.g. `1.2.3`), `main`, and commit sha.
 
+**Versioning:** [release-please](https://github.com/googleapis/release-please) watches merges to `main` and keeps an open release PR that collects all `feat:`/`fix:` commits into a changelog and proposes the next version (semver). Merging that PR creates a `vX.Y.Z` GitHub Release and tag, which triggers the container build for the matching semver tags. Until then, `latest` always tracks the newest `main` build.
+
 To test local code changes instead, build from source with the dev compose file:
 `docker compose -f docker-compose.dev.yml up -d --build`
 
