@@ -508,6 +508,35 @@ func areSimilar(name1, name2 string) bool {
 	return false
 }
 
+// bestSimilarMember finds the roster member that best matches an OCR-garbled
+// name. Stricter than areSimilar: similarity must be >= 0.8 or one name must
+// contain the other, so we only adopt canonical names we are confident about.
+func bestSimilarMember(nameLower string, existingMembers map[string]Member) (Member, bool) {
+	var best Member
+	bestScore := 0.0
+	for existingLower, em := range existingMembers {
+		dist := levenshteinDistance(nameLower, existingLower)
+		maxLen := max(len(nameLower), len(existingLower))
+		similarity := 1.0 - float64(dist)/float64(maxLen)
+		contains := len(nameLower) >= 3 && len(existingLower) >= 3 &&
+			(strings.Contains(nameLower, existingLower) || strings.Contains(existingLower, nameLower))
+		// Long names tolerate more absolute typos than short ones.
+		closeEdit := (dist <= 2 && maxLen >= 4) || (dist <= 3 && maxLen >= 10)
+		if similarity < 0.8 && !contains && !closeEdit {
+			continue
+		}
+		score := similarity
+		if contains {
+			score = 1.0 + similarity
+		}
+		if score > bestScore {
+			bestScore = score
+			best = em
+		}
+	}
+	return best, bestScore > 0
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -6694,6 +6723,8 @@ func importMemberScreenshot(w http.ResponseWriter, r *http.Request) {
 	// or "PlayerName  R4" or "PlayerName (R4)"
 	rankRe := regexp.MustCompile(`(?i)\bR([1-5])\b`)
 	validRanks := map[string]bool{"R1": true, "R2": true, "R3": true, "R4": true, "R5": true}
+	powerTokenRe := regexp.MustCompile(`^[\d,.]{6,}$`) // power values: 154810946 / 114,721,532
+	punctRe := regexp.MustCompile(`[^\p{L}\d\s\-_.]`)
 
 	// Get existing active members
 	existingMembers := make(map[string]Member)
@@ -6717,29 +6748,74 @@ func importMemberScreenshot(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		matches := rankRe.FindStringSubmatch(line)
-		if matches == nil {
-			continue
-		}
-		rank := "R" + strings.ToUpper(matches[1])
-		if !validRanks[rank] {
-			continue
+		// Rank badge is optional — OCR garbles it often ("Ra", "RS", "4)").
+		// Lines without a readable badge are kept; their rank is resolved
+		// against known members below.
+		rank := ""
+		namePart := line
+		if idx := rankRe.FindStringIndex(line); idx != nil {
+			r := "R" + strings.ToUpper(rankRe.FindStringSubmatch(line)[1])
+			if validRanks[r] {
+				rank = r
+			}
+
+			// Take only the text AFTER the rank badge — everything before it is
+			// the row's rank-number column and left-side UI junk. For layouts
+			// where the name precedes the badge, fall back to the text before it.
+			after := strings.TrimSpace(line[idx[1]:])
+			if after != "" {
+				namePart = after
+			} else {
+				namePart = strings.TrimSpace(line[:idx[0]])
+			}
 		}
 
-		// Remove the rank token and surrounding noise (power numbers, special chars)
-		cleaned := rankRe.ReplaceAllString(line, "")
-		// Remove numbers that look like power (6+ digit sequences with optional commas)
-		cleaned = regexp.MustCompile(`[\d,]{5,}`).ReplaceAllString(cleaned, "")
+		// Drop standalone power values; keep digits attached to words so names
+		// like Sandra1310 stay intact. Standalone small numbers are kept — they
+		// can be part of names ("Alexandros 19", "Ludo 45").
+		var kept []string
+		for _, f := range strings.Fields(namePart) {
+			if powerTokenRe.MatchString(f) {
+				continue
+			}
+			kept = append(kept, f)
+		}
 		// Remove leftover punctuation except letters/digits/spaces/hyphens/underscores/dots
-		cleaned = regexp.MustCompile(`[^\p{L}\d\s\-_.]`).ReplaceAllString(cleaned, " ")
+		cleaned := punctRe.ReplaceAllString(strings.Join(kept, " "), " ")
 		name := strings.Join(strings.Fields(cleaned), " ")
 
-		if len(name) < 2 {
+		if len(name) < 3 {
+			// Shortest real roster name is 4 chars; 1-2 char readings are UI junk.
 			parseErrors = append(parseErrors, fmt.Sprintf("Could not extract name from line: %q", line))
 			continue
 		}
 
 		nameLower := strings.ToLower(name)
+
+		// Resolve against the known roster: an exact match wins, and a close
+		// fuzzy match adopts the canonical name so OCR garble ("PuShKat3")
+		// maps onto the real member ("PuShKal3"). Also fills the rank when
+		// the badge was unreadable.
+		if existing, found := existingMembers[nameLower]; found {
+			name = existing.Name
+			if rank == "" {
+				rank = existing.Rank
+			}
+		} else if best, ok := bestSimilarMember(nameLower, existingMembers); ok {
+			log.Printf("Members OCR: adopting %q as known member %q", name, best.Name)
+			name = best.Name
+			nameLower = strings.ToLower(name)
+			if rank == "" {
+				rank = best.Rank
+			}
+		}
+
+		if rank == "" {
+			// Unreadable badge and unknown member — default so the row still
+			// reaches the review UI; the user fixes the rank there.
+			rank = "R1"
+		}
+
 		if seenNames[nameLower] {
 			continue
 		}
@@ -6805,6 +6881,19 @@ func extractMembersByRows(img image.Image, attrs *ScreenshotAttributes) (string,
 
 	log.Printf("Members OCR: edge detection found %d rows in data region", len(rowBounds))
 
+	client := gosseract.NewClient()
+	defer client.Close()
+
+	rankTokenRe := regexp.MustCompile(`(?i)R[1-5]`)
+
+	// Edge detection can fail on dark UIs and return one giant band. In that
+	// case OCR the whole data region in several preprocessing variants —
+	// tesseract reads multi-line blocks fine and each output line is a row.
+	if len(rowBounds) < 2 {
+		log.Printf("Members OCR: row segmentation failed (%d bands), using whole-region OCR", len(rowBounds))
+		return ocrMembersWholeRegion(img, dataRegion, client), nil
+	}
+
 	var lines []string
 	for i, rb := range rowBounds {
 		rowTop, rowBottom := rb[0], rb[1]
@@ -6819,23 +6908,21 @@ func extractMembersByRows(img image.Image, attrs *ScreenshotAttributes) (string,
 		draw.Draw(rowImg, rowImg.Bounds(), img, image.Point{bounds.Min.X, rowTop}, draw.Src)
 
 		scaled := scaleImage(rowImg, 3)
-		gray := convertToGrayscale(scaled)
+		gray := autoContrast(convertToGrayscale(scaled))
 
-		var buf bytes.Buffer
-		if err := png.Encode(&buf, gray); err != nil {
-			log.Printf("Members row %d: encode failed: %v", i+1, err)
+		text := ocrGrayImage(client, gray, gosseract.PSM_SINGLE_LINE)
+		if text == "" || !rankTokenRe.MatchString(text) {
+			// Second pass on a binarized variant — dark badge backgrounds
+			// often garble the rank token in the raw grayscale pass.
+			if alt := ocrGrayImage(client, binarize(gray, 140), gosseract.PSM_SINGLE_LINE); alt != "" {
+				if text == "" || (rankTokenRe.MatchString(alt) && !rankTokenRe.MatchString(text)) {
+					text = alt
+				}
+			}
+		}
+		if text == "" {
 			continue
 		}
-
-		client := gosseract.NewClient()
-		defer client.Close()
-		client.SetImageFromBytes(buf.Bytes())
-		client.SetPageSegMode(gosseract.PSM_SINGLE_LINE)
-		text, err := client.Text()
-		if err != nil || len(strings.TrimSpace(text)) == 0 {
-			continue
-		}
-		text = strings.TrimSpace(text)
 		log.Printf("Members row %d: %q", i+1, text)
 		lines = append(lines, text)
 	}
@@ -6845,6 +6932,337 @@ func extractMembersByRows(img image.Image, attrs *ScreenshotAttributes) (string,
 	}
 
 	return strings.Join(lines, "\n"), nil
+}
+
+// ocrMembersWholeRegion OCRs the whole data region in several preprocessing
+// variants and fuses the results. Tesseract emits one line per member row;
+// variants disagree on badge/name characters but agree on the power number,
+// so rows are fused by power value. Each fused row is emitted as a synthetic
+// "R{rank} {name}" line that the caller's parser consumes directly.
+func ocrMembersWholeRegion(img image.Image, region *ImageRegion, client *gosseract.Client) string {
+	bounds := img.Bounds()
+	top, bottom := region.Top, region.Bottom
+	if top < bounds.Min.Y {
+		top = bounds.Min.Y
+	}
+	if bottom > bounds.Max.Y {
+		bottom = bounds.Max.Y
+	}
+	if bottom-top < 30 {
+		return ""
+	}
+
+	crop := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bottom-top))
+	draw.Draw(crop, crop.Bounds(), img, image.Point{bounds.Min.X, top}, draw.Src)
+
+	type variant struct {
+		img *image.Gray
+		psm gosseract.PageSegMode
+	}
+	variants := []variant{
+		{autoContrast(convertToGrayscale(scaleImage(crop, 2))), gosseract.PSM_SINGLE_BLOCK},
+		{binarize(convertToGrayscale(scaleImage(crop, 2)), 140), gosseract.PSM_SINGLE_BLOCK},
+		{autoContrast(convertToGrayscale(scaleImage(crop, 3))), gosseract.PSM_SPARSE_TEXT},
+	}
+
+	rankRe := regexp.MustCompile(`(?i)\bR([1-5])\b`)
+	powerTokenRe := regexp.MustCompile(`^[\d,.]{6,}$`)
+	punctRe := regexp.MustCompile(`[^\p{L}\d\s\-_.]`)
+
+	type fusedRow struct {
+		ranks     []string
+		badged    string // longest badged reading (own power line or dist-1 attached line)
+		powerName string // name from the line carrying this row's own power, no badge
+		attached  string // name from an attached (power-less) line without a badge
+	}
+	rowsByPower := map[string]*fusedRow{}
+	var powerOrder []string
+
+	for i, v := range variants {
+		text := ocrGrayImage(client, v.img, v.psm)
+		if text == "" {
+			continue
+		}
+		log.Printf("Members whole-region OCR variant %d:\n%s\n---", i+1, text)
+
+		type vline struct {
+			text  string
+			power string
+		}
+		var vlines []vline
+		for _, raw := range strings.Split(text, "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" {
+				continue
+			}
+			// Anchor the row on its power value (first standalone 6+ digit token).
+			power := ""
+			for _, tok := range strings.Fields(line) {
+				if powerTokenRe.MatchString(tok) {
+					power = strings.NewReplacer(",", "", ".", "").Replace(tok)
+					break
+				}
+			}
+			vlines = append(vlines, vline{text: line, power: power})
+		}
+
+		// Variants split one roster row across lines: sparse text reads
+		// name-then-power ("R4 MKJUL" then "94929239") while block reads can
+		// emit power-then-name ("Aa R2| 55443471" then "[R2| tonton nico").
+		// Attach each power-less line to the closest power line (at most 2
+		// lines away). On a distance tie prefer the power line that carries
+		// no name of its own — that row is the one that lost its name in the
+		// split.
+		hasOwnName := func(text string) bool {
+			mm := rankRe.FindStringIndex(text)
+			namePart := text
+			if mm != nil {
+				namePart = text[mm[1]:]
+			}
+			for _, f := range strings.Fields(namePart) {
+				if powerTokenRe.MatchString(f) {
+					continue
+				}
+				if mm == nil && len(punctRe.ReplaceAllString(f, "")) <= 2 {
+					continue
+				}
+				if punctRe.ReplaceAllString(f, "") != "" {
+					return true
+				}
+			}
+			return false
+		}
+		assigned := make([]string, len(vlines))
+		assignedDist := make([]int, len(vlines))
+		for i, vl := range vlines {
+			if vl.power != "" {
+				assigned[i] = vl.power
+				continue
+			}
+			fwdJ, fwdD := -1, 3
+			for j := i + 1; j < len(vlines); j++ {
+				if vlines[j].power == "" {
+					continue
+				}
+				if j-i < fwdD {
+					fwdD, fwdJ = j-i, j
+				}
+			}
+			bwdJ, bwdD := -1, 3
+			for j := i - 1; j >= 0; j-- {
+				if vlines[j].power == "" {
+					continue
+				}
+				if i-j < bwdD {
+					bwdD, bwdJ = i-j, j
+				}
+			}
+			bestJ, bestD := fwdJ, fwdD
+			switch {
+			case fwdJ < 0:
+				bestJ, bestD = bwdJ, bwdD
+			case bwdJ >= 0 && bwdD < fwdD:
+				bestJ, bestD = bwdJ, bwdD
+			case bwdJ >= 0 && bwdD == fwdD:
+				fwdNamed, bwdNamed := hasOwnName(vlines[fwdJ].text), hasOwnName(vlines[bwdJ].text)
+				if fwdNamed && !bwdNamed {
+					bestJ, bestD = bwdJ, bwdD
+				}
+			}
+			if bestJ >= 0 {
+				assigned[i] = vlines[bestJ].power
+				assignedDist[i] = bestD
+			}
+		}
+
+		for i, vl := range vlines {
+			if assigned[i] == "" {
+				continue
+			}
+			row, ok := rowsByPower[assigned[i]]
+			if !ok {
+				row = &fusedRow{}
+				rowsByPower[assigned[i]] = row
+				powerOrder = append(powerOrder, assigned[i])
+			}
+			line := vl.text
+
+			// Rank candidate: clean R1-R5 badge in this variant's reading.
+			m := rankRe.FindStringIndex(line)
+			if m != nil && (vl.power != "" || assignedDist[i] <= 1) {
+				row.ranks = append(row.ranks, "R"+strings.ToUpper(rankRe.FindStringSubmatch(line)[1]))
+			}
+
+			// Name candidate: text after the badge, or all non-power tokens when
+			// the badge was garbled. Rows without a badge still get their name
+			// through; the parser resolves their rank against known members.
+			namePart := line
+			if m != nil {
+				namePart = strings.TrimSpace(line[m[1]:])
+			}
+			var kept []string
+			for _, f := range strings.Fields(namePart) {
+				if powerTokenRe.MatchString(f) {
+					continue
+				}
+				if m == nil && len(punctRe.ReplaceAllString(f, "")) <= 2 {
+					continue // badge/UI junk: short tokens only appear on garbled lines
+				}
+				kept = append(kept, f)
+			}
+			name := strings.Join(strings.Fields(punctRe.ReplaceAllString(strings.Join(kept, " "), " ")), " ")
+			if name == "" {
+				continue
+			}
+			// Badged readings are pooled longest-wins: a clean badge marks a
+			// trustworthy row split, and the longest reading across variants
+			// usually survives garble best (e.g. "MKJUL" vs the same row read
+			// as "mau"). Only dist-1 attached lines join the pool — farther
+			// attachments tend to belong to a different (often pinned) row.
+			own := vl.power != ""
+			switch {
+			case m != nil && (own || assignedDist[i] == 1) && len(name) > len(row.badged):
+				row.badged = name
+			case own && row.powerName == "":
+				row.powerName = name
+			case !own && row.attached == "":
+				row.attached = name
+			}
+		}
+	}
+
+	// Garbage name fragments like "Tr." or "mau" slip through the length
+	// checks; require at least three letters before accepting a reading.
+	lettersOK := func(s string) bool {
+		n := 0
+		for _, r := range s {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				n++
+			}
+		}
+		return n >= 3
+	}
+	var lines []string
+	for _, power := range powerOrder {
+		row := rowsByPower[power]
+		name := ""
+		for _, cand := range []string{row.badged, row.powerName, row.attached} {
+			if lettersOK(cand) {
+				name = cand
+				break
+			}
+		}
+		if name == "" {
+			log.Printf("Members OCR: skipping fused row (power %s): no readable name in any variant", power)
+			continue
+		}
+		// Majority vote across variants for the rank; empty when unreadable.
+		rank := ""
+		counts := map[string]int{}
+		for _, r := range row.ranks {
+			counts[r]++
+			if rank == "" || counts[r] > counts[rank] {
+				rank = r
+			}
+		}
+		if rank == "" {
+			log.Printf("Members OCR: fused row (power %s) name=%q has no readable rank badge", power, name)
+			lines = append(lines, " "+name)
+			continue
+		}
+		lines = append(lines, rank+" "+name)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ocrGrayImage runs tesseract in the given page-segmentation mode on a grayscale image.
+func ocrGrayImage(client *gosseract.Client, gray *image.Gray, psm gosseract.PageSegMode) string {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, gray); err != nil {
+		return ""
+	}
+	if err := client.SetImageFromBytes(buf.Bytes()); err != nil {
+		return ""
+	}
+	client.SetPageSegMode(psm)
+	text, err := client.Text()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(text)
+}
+
+// binarize thresholds a grayscale image to pure black/white (pixels above
+// threshold stay white, the rest becomes black).
+func binarize(gray *image.Gray, threshold uint8) *image.Gray {
+	out := image.NewGray(gray.Bounds())
+	for y := gray.Rect.Min.Y; y < gray.Rect.Max.Y; y++ {
+		for x := gray.Rect.Min.X; x < gray.Rect.Max.X; x++ {
+			if gray.GrayAt(x, y).Y > threshold {
+				out.SetGray(x, y, color.Gray{Y: 255})
+			}
+		}
+	}
+	return out
+}
+
+// autoContrast stretches the grayscale histogram to the full 0-255 range,
+// clipping the darkest/brightest 1% of pixels. Game UI screenshots are dark
+// and low-contrast; tesseract reads them much better after stretching.
+func autoContrast(gray *image.Gray) *image.Gray {
+	bounds := gray.Bounds()
+	total := bounds.Dx() * bounds.Dy()
+	if total == 0 {
+		return gray
+	}
+
+	hist := make([]int, 256)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			hist[gray.GrayAt(x, y).Y]++
+		}
+	}
+
+	clip := total / 100
+	lo, hi := 0, 255
+	sum := 0
+	for v := 0; v < 256; v++ {
+		sum += hist[v]
+		if sum > clip {
+			lo = v
+			break
+		}
+	}
+	sum = 0
+	for v := 255; v >= 0; v-- {
+		sum += hist[v]
+		if sum > clip {
+			hi = v
+			break
+		}
+	}
+	if hi <= lo {
+		return gray
+	}
+
+	lut := make([]uint8, 256)
+	for v := range lut {
+		nv := (v - lo) * 255 / (hi - lo)
+		if nv < 0 {
+			nv = 0
+		} else if nv > 255 {
+			nv = 255
+		}
+		lut[v] = uint8(nv)
+	}
+
+	out := image.NewGray(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			out.SetGray(x, y, color.Gray{Y: lut[gray.GrayAt(x, y).Y]})
+		}
+	}
+	return out
 }
 
 // Auto-register a list of player names as R1 members (for unmatched OCR results)
@@ -7548,8 +7966,9 @@ func preprocessImageForOCR(imageData []byte) ([]byte, error) {
 	// Convert to grayscale
 	grayImg := convertToGrayscale(scaledImg)
 
-	// For small images, skip contrast enhancement (can make things worse)
-	processedImg := grayImg
+	// Stretch the histogram — game UI screenshots are dark and low-contrast,
+	// tesseract reads them much better after auto-contrast.
+	processedImg := autoContrast(grayImg)
 
 	// Encode back to bytes
 	var buf bytes.Buffer
@@ -7557,7 +7976,7 @@ func preprocessImageForOCR(imageData []byte) ([]byte, error) {
 		return nil, fmt.Errorf("failed to encode processed image: %v", err)
 	}
 
-	log.Printf("Image preprocessed: %dx%d -> %dx%d (2x scaled grayscale)",
+	log.Printf("Image preprocessed: %dx%d -> %dx%d (2x scaled grayscale + auto-contrast)",
 		img.Bounds().Dx(), img.Bounds().Dy(),
 		processedImg.Bounds().Dx(), processedImg.Bounds().Dy())
 
