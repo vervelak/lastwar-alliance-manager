@@ -1,0 +1,19 @@
+# Development: builds the image from the local source tree so code changes
+# can be tested with: docker compose -f docker-compose.dev.yml up -d --build
+services:
+  lastwar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lastwar-alliance:dev
+    container_name: lastwar-alliance-dev
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data-dev:/data
+    environment:
+      DATABASE_PATH: /data/alliance.db
+      SESSION_KEY: "${SESSION_KEY}"
+      # Writes Marshal Guard OCR debug crops into the data volume
+      MG_DEBUG_DIR: "/data/mg-debug"
+    restart: unless-stopped
