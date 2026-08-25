@@ -12673,9 +12673,9 @@ func getZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 // POST /api/zombie-siege — create event manually (no OCR)
 func createZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EventDate   string             `json:"event_date"`
-		TotalWaves  int64              `json:"total_waves"`
-		Notes       string             `json:"notes"`
+		EventDate    string             `json:"event_date"`
+		TotalWaves   int64              `json:"total_waves"`
+		Notes        string             `json:"notes"`
 		Participants []ZSOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -12718,9 +12718,9 @@ func createZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 func updateZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(mux.Vars(r)["id"])
 	var req struct {
-		EventDate   string             `json:"event_date"`
-		TotalWaves  int64              `json:"total_waves"`
-		Notes       string             `json:"notes"`
+		EventDate    string             `json:"event_date"`
+		TotalWaves   int64              `json:"total_waves"`
+		Notes        string             `json:"notes"`
 		Participants []ZSOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -17692,8 +17692,8 @@ func main() {
 
 	log.Printf("Server starting on http://localhost:%s", port) // #nosec G706 — port validated as numeric above
 	srv := &http.Server{
-		Addr:         ":" + port,
-		Handler:      requestLoggingMiddleware(router),
+		Addr:    ":" + port,
+		Handler: requestLoggingMiddleware(router),
 		// Generous timeouts: OCR screenshot imports process many images and can
 		// take well over a minute on large batches. ReadTimeout covers slow uploads
 		// (request body), WriteTimeout covers the OCR work before the response.
