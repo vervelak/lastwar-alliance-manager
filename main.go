@@ -14725,8 +14725,9 @@ func loadAllMembers() ([]Member, error) {
 }
 
 // parsePlayerTag extracts the alliance tag and plain player name from strings like
-// "[RSRP]Gargoland" or "[RSRPlJazzyopolis" (where ] was OCR'd as l, 1, | or I).
-// knownTag (from settings) is used for fuzzy bracket matching before standard parsing.
+// "[RSRP]Gargoland" or "[RSRPlJazzyopolis" (where ] was OCR'd as l, 1, |, I, i, L,
+// J or 7). knownTag (from settings) is used for fuzzy bracket matching before
+// standard parsing.
 // getAllianceShortName returns the uppercase alliance short name from settings,
 // used as the known tag hint for player-tag parsing.
 func getAllianceShortName() string {
@@ -14746,7 +14747,14 @@ func parsePlayerTag(name, knownTag string) (tag, nameOnly string) {
 		prefix := "[" + strings.ToUpper(knownTag)
 		if idx := strings.Index(upper, prefix); idx >= 0 {
 			after := name[idx+len(prefix):]
-			if len(after) > 0 && strings.ContainsRune("]l1|I", rune(after[0])) {
+			// The closing bracket is commonly misread. Accept the usual lookalikes
+			// (lowercase "i" is the most frequent at this font size) and strip exactly
+			// one, so "[bszkinas68" → "nas68" and "[bszkiCHADOM" → "CHADOM". Names
+			// that legitimately start with one of these (e.g. "iMorocco", "Ludo 45")
+			// are still recovered: a correct "]" reads via standard parsing below, and
+			// a bracket misread to the same letter yields two letters so stripping one
+			// leaves the name's own letter intact.
+			if len(after) > 0 && strings.ContainsRune("]l1|IiLJ7", rune(after[0])) {
 				return knownTag, strings.TrimSpace(after[1:])
 			}
 		}
