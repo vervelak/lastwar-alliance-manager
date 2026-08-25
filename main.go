@@ -7938,6 +7938,80 @@ func scaleImage(img image.Image, factor int) image.Image {
 	return scaled
 }
 
+// scaleImageBilinear upscales by factor using bilinear interpolation, producing
+// smooth anti-aliased edges. Nearest-neighbour upscaling (scaleImage) leaves
+// jagged edges that Tesseract frequently rejects on thin, light game digits.
+func scaleImageBilinear(img image.Image, factor int) image.Image {
+	bounds := img.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+	if srcW <= 0 || srcH <= 0 {
+		return img
+	}
+	newW := srcW * factor
+	newH := srcH * factor
+	out := image.NewRGBA(image.Rect(0, 0, newW, newH))
+
+	lerp := func(a, b float64, w float64) float64 {
+		return a + (b-a)*w
+	}
+
+	for y := 0; y < newH; y++ {
+		sy := float64(y)/float64(factor) - 0.5
+		y0 := int(math.Floor(sy))
+		if y0 < 0 {
+			y0 = 0
+		}
+		y1 := y0 + 1
+		if y1 >= srcH {
+			y1 = srcH - 1
+		}
+		wy := sy - float64(y0)
+		if wy < 0 {
+			wy = 0
+		}
+		for x := 0; x < newW; x++ {
+			sx := float64(x)/float64(factor) - 0.5
+			x0 := int(math.Floor(sx))
+			if x0 < 0 {
+				x0 = 0
+			}
+			x1 := x0 + 1
+			if x1 >= srcW {
+				x1 = srcW - 1
+			}
+			wx := sx - float64(x0)
+			if wx < 0 {
+				wx = 0
+			}
+
+			c00 := img.At(bounds.Min.X+x0, bounds.Min.Y+y0)
+			c10 := img.At(bounds.Min.X+x1, bounds.Min.Y+y0)
+			c01 := img.At(bounds.Min.X+x0, bounds.Min.Y+y1)
+			c11 := img.At(bounds.Min.X+x1, bounds.Min.Y+y1)
+
+			r00, g00, b00, a00 := c00.RGBA()
+			r10, g10, b10, a10 := c10.RGBA()
+			r01, g01, b01, a01 := c01.RGBA()
+			r11, g11, b11, a11 := c11.RGBA()
+
+			r := lerp(lerp(float64(r00), float64(r10), wx), lerp(float64(r01), float64(r11), wx), wy)
+			g := lerp(lerp(float64(g00), float64(g10), wx), lerp(float64(g01), float64(g11), wx), wy)
+			b := lerp(lerp(float64(b00), float64(b10), wx), lerp(float64(b01), float64(b11), wx), wy)
+			a := lerp(lerp(float64(a00), float64(a10), wx), lerp(float64(a01), float64(a11), wx), wy)
+
+			out.SetRGBA(x, y, color.RGBA{
+				R: uint8(uint32(r+0.5) >> 8),
+				G: uint8(uint32(g+0.5) >> 8),
+				B: uint8(uint32(b+0.5) >> 8),
+				A: uint8(uint32(a+0.5) >> 8),
+			})
+		}
+	}
+
+	return out
+}
+
 // Preprocess image for better OCR
 func preprocessImageForOCR(imageData []byte) ([]byte, error) {
 	// Decode image
@@ -16389,6 +16463,40 @@ func binaryThresholdForOCR(img image.Image, threshold uint8) *image.Gray {
 	return out
 }
 
+// binaryThresholdFracForOCR converts to grayscale, optionally inverts
+// (dark→light), then applies a hard binary threshold placed at fracPct% of
+// the observed brightness range (0 = darkest pixel, 100 = brightest).
+// A low fraction keeps more of the anti-aliased digit edges, which helps
+// Tesseract read the thin, light-coloured donation point digits.
+func binaryThresholdFracForOCR(img image.Image, fracPct int) *image.Gray {
+	gray := adaptiveGrayForOCR(img)
+	bounds := gray.Bounds()
+	min8, max8 := uint8(255), uint8(0)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			v := gray.GrayAt(x, y).Y
+			if v < min8 {
+				min8 = v
+			}
+			if v > max8 {
+				max8 = v
+			}
+		}
+	}
+	threshold := uint8(int(min8) + (int(max8)-int(min8))*fracPct/100)
+	out := image.NewGray(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if gray.GrayAt(x, y).Y > threshold {
+				out.SetGray(x, y, color.Gray{Y: 255})
+			} else {
+				out.SetGray(x, y, color.Gray{Y: 0})
+			}
+		}
+	}
+	return out
+}
+
 // findDonationRows detects row boundaries in a donation leaderboard screenshot
 // by analysing per-row colour variance in the avatar column (x=13–30% of width).
 // Each row contains a colourful circular avatar; the gaps between rows are a
@@ -16528,7 +16636,17 @@ func findDonationRows(img image.Image, dataTop, dataBottom int) [][2]int {
 //   - I/l/i → 1  (uppercase I, lowercase L/i vs one)
 //   - S/s → 5, B → 8  (shape similarity in game fonts)
 //   - Trailing noise like "|" from card borders (discarded)
+//
+// The first run is located in the raw text BEFORE whitespace is stripped, so a
+// stray glyph detected on a second line (e.g. "56950\n2" under PSM_UNIFORM_BLOCK)
+// is not glued onto the value as a spurious trailing digit.
 func ocrNormalisePoints(raw string) int {
+	// First run of digit-like glyphs (including common confusions). Any
+	// non-digit-like character (space, newline, |, etc.) ends the run.
+	first := regexp.MustCompile(`[0-9OoIliSsB]+`).FindString(raw)
+	if first == "" {
+		return 0
+	}
 	mapped := strings.Map(func(r rune) rune {
 		switch r {
 		case 'O', 'o':
@@ -16540,18 +16658,10 @@ func ocrNormalisePoints(raw string) int {
 		case 'B':
 			return '8'
 		default:
-			if r >= '0' && r <= '9' {
-				return r
-			}
-			return -1 // discard spaces, |, punctuation, etc.
+			return r
 		}
-	}, strings.TrimSpace(raw))
-	// Take only the first contiguous digit run (guards against trailing noise).
-	first := regexp.MustCompile(`\d+`).FindString(mapped)
-	if first == "" {
-		return 0
-	}
-	v, _ := strconv.Atoi(first)
+	}, first)
+	v, _ := strconv.Atoi(mapped)
 	return v
 }
 
@@ -16657,24 +16767,56 @@ func extractDonationsByRows(imageData []byte, imgIdx int) []DonationOCREntry {
 		// ── Points ────────────────────────────────────────────────────────
 		ptCrop := image.NewRGBA(image.Rect(0, 0, ptX2-ptX1, rowH))
 		draw.Draw(ptCrop, ptCrop.Bounds(), img, image.Point{ptX1, rowTop}, draw.Src)
-		var ptBuf bytes.Buffer
-		png.Encode(&ptBuf, binaryThresholdForOCR(scaleImage(ptCrop, 3), 0))
-		// Write to a temp file so gosseract can load it via file path (avoids
-		// in-memory PNG decoding differences between leptonica and Go's image/png).
-		ptTmpPath := fmt.Sprintf("/tmp/don_pts_%d_%d.png", imgIdx, i)
-		_ = os.WriteFile(ptTmpPath, ptBuf.Bytes(), 0o600)
-		ptClient := gosseract.NewClient()
-		ptClient.SetImage(ptTmpPath)
-		// PSM must be set as a variable (not SetPageSegMode) because gosseract's
-		// lazy init re-calls C.Init() which resets PSM to PSM_AUTO (3), losing
-		// any SetPageSegMode call made before Text(). Variables are applied AFTER
-		// C.Init() via setVariablesToInitializedAPI(), so they survive re-init.
-		ptClient.SetVariable("tessedit_pageseg_mode", "13") // PSM_RAW_LINE – bypasses text-detection heuristics that fail on bold game fonts
-		ptClient.SetWhitelist("0123456789")
-		ptText, _ := ptClient.Text()
-		ptClient.Close()
-		os.Remove(ptTmpPath) // clean up temp file
-		points := ocrNormalisePoints(ptText)
+		scaledPt := scaleImageBilinear(ptCrop, 3)
+		// The old PSM_RAW_LINE + mid-point threshold read nothing on most real
+		// screenshots, and nearest-neighbour upscaling left jagged digit edges
+		// Tesseract rejected. Use bilinear upscaling and vote across a set of
+		// threshold/segmentation variants: higher fractions keep only the solid
+		// digit cores, so they read fewer rows but never insert spurious extra
+		// digits. The most common reading wins.
+		ptVariants := []struct {
+			fracPct int
+			psm     string
+		}{
+			{25, "7"}, {50, "7"}, {65, "7"}, {25, "6"}, {50, "6"}, {65, "6"},
+		}
+		points := 0
+		var ptText string
+		votes := map[int]int{}
+		for _, pv := range ptVariants {
+			var ptBuf bytes.Buffer
+			png.Encode(&ptBuf, binaryThresholdFracForOCR(scaledPt, pv.fracPct))
+			// Write to a temp file so gosseract can load it via file path (avoids
+			// in-memory PNG decoding differences between leptonica and Go's image/png).
+			ptTmpPath := fmt.Sprintf("/tmp/don_pts_%d_%d.png", imgIdx, i)
+			_ = os.WriteFile(ptTmpPath, ptBuf.Bytes(), 0o600)
+			ptClient := gosseract.NewClient()
+			ptClient.SetImage(ptTmpPath)
+			// PSM must be set as a variable (not SetPageSegMode) because gosseract's
+			// lazy init re-calls C.Init() which resets PSM to PSM_AUTO (3), losing
+			// any SetPageSegMode call made before Text(). Variables are applied AFTER
+			// C.Init() via setVariablesToInitializedAPI(), so they survive re-init.
+			ptClient.SetVariable("tessedit_pageseg_mode", pv.psm)
+			ptClient.SetWhitelist("0123456789")
+			raw, _ := ptClient.Text()
+			ptClient.Close()
+			os.Remove(ptTmpPath) // clean up temp file
+			if v := ocrNormalisePoints(raw); v > 0 {
+				votes[v]++
+				if ptText == "" {
+					ptText = strings.TrimSpace(raw)
+				}
+			}
+		}
+		best, bestCount := 0, 0
+		for v, n := range votes {
+			if n > bestCount || (n == bestCount && v > best) {
+				best, bestCount = v, n
+			}
+		}
+		if best > 0 {
+			points = best
+		}
 
 		// Capture crops for uncertain OCR results so the user can verify in the
 		// confirm dialog. Clicking a crop opens the full screenshot with the row
@@ -16720,7 +16862,17 @@ func mergeDonationEntries(all []DonationOCREntry) []DonationOCREntry {
 	for _, e := range all {
 		key := mgOcrNormForCompare(e.NameSnapshot)
 		if idx, exists := seen[key]; exists {
-			if e.RankInSnapshot < result[idx].RankInSnapshot {
+			// Rank OCR is unreliable (empty reads fall back to a per-image
+			// counter), so prefer the entry whose points were read; use the
+			// rank only as a tie-breaker.
+			replace := false
+			switch {
+			case result[idx].Points == 0 && e.Points > 0:
+				replace = true
+			case (result[idx].Points > 0) == (e.Points > 0) && e.RankInSnapshot < result[idx].RankInSnapshot:
+				replace = true
+			}
+			if replace {
 				result[idx] = e
 			}
 			continue
