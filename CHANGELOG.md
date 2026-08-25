@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.1](https://github.com/vervelak/lastwar-alliance-manager/compare/v1.0.0...v1.0.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **ocr:** extract MG member rows via line-pair detection ([39cc217](https://github.com/vervelak/lastwar-alliance-manager/commit/39cc217f7214b640f752853aa666033268d8d7ae))
+* **ocr:** extract MG member rows via line-pair detection ([#71](https://github.com/vervelak/lastwar-alliance-manager/issues/71)) ([6a339ff](https://github.com/vervelak/lastwar-alliance-manager/commit/6a339ff62a3e12cc1192da114ffd737c704c7229))
+* **ocr:** extract MG MVP card name and damage via band detection ([a317f13](https://github.com/vervelak/lastwar-alliance-manager/commit/a317f137e18375f61fbc2b93758f9f09187203f0))
+* **ocr:** extract MG MVP card name and damage via band detection ([b26886f](https://github.com/vervelak/lastwar-alliance-manager/commit/b26886f048d563c069599946fc3c10a45980cbfb))
+* **ocr:** extract MG MVP name and damage via line detection ([#70](https://github.com/vervelak/lastwar-alliance-manager/issues/70)) ([55d5ae1](https://github.com/vervelak/lastwar-alliance-manager/commit/55d5ae1ddde75c98834bacf55ddde8653df8321a))
+* **ocr:** parallelize MG/ZS import and add manual participant entry ([#69](https://github.com/vervelak/lastwar-alliance-manager/issues/69)) ([92fa51f](https://github.com/vervelak/lastwar-alliance-manager/commit/92fa51f817255b8936c9d771a719f4c529e7f66d))
+* **ocr:** parse MG member names when closing bracket is misread ([9d9eeef](https://github.com/vervelak/lastwar-alliance-manager/commit/9d9eeef0cf94ce5f6b0d3ab74e6adef9b4f6088f))
+* **ocr:** read donation points reliably via bilinear upscale + voting ([#67](https://github.com/vervelak/lastwar-alliance-manager/issues/67)) ([fbdd3b2](https://github.com/vervelak/lastwar-alliance-manager/commit/fbdd3b2534aac99386f8dc526d8d20159b75fe35))
+
 ## 1.0.0 (2026-08-21)
 
 
