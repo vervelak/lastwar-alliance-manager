@@ -766,6 +766,135 @@ func mgFindColoredRegions(img image.Image, width, height int) []mgRect {
 
 // ─── Main processing function ─────────────────────────────────────────────────
 
+// mgMemberRowRects holds the crop rectangles for one detected member row.
+type mgMemberRowRects struct {
+	rankRect mgRect
+	nameRect mgRect
+	dmgRect  mgRect
+	rowY0    int // cropped y of the name-line top
+	rowY1    int // cropped y of the damage-line bottom
+}
+
+// mgLuma returns the 0-255 luminance of a pixel.
+func mgLuma(img image.Image, x, y int) int {
+	r, g, b, _ := img.At(x, y).RGBA()
+	return (299*int(r>>8) + 587*int(g>>8) + 114*int(b>>8)) / 1000
+}
+
+// mgEdgeLineRuns finds horizontal text lines inside a strip by counting, per
+// row, pixels where the luminance changes sharply over a 3-pixel horizontal
+// window (a text-stroke signature; smooth card backgrounds have none). Counts
+// are box-smoothed and thresholded; contiguous runs at least 6px tall are
+// returned as [y0, y1) intervals. The strip is given as fractions of the image.
+func mgEdgeLineRuns(img image.Image, cropW, cropH int, fx0, fx1, fy0, fy1 float64, threshold int) [][2]int {
+	x0 := int(fx0 * float64(cropW))
+	x1 := int(fx1 * float64(cropW))
+	y0 := int(fy0 * float64(cropH))
+	y1 := int(fy1 * float64(cropH))
+	if x1-x0 < 8 || y1-y0 < 8 {
+		return nil
+	}
+	counts := make([]int, y1-y0)
+	for yi := 0; yi < y1-y0; yi++ {
+		y := y0 + yi
+		c := 0
+		for x := x0; x < x1-3; x++ {
+			d := mgLuma(img, x+3, y) - mgLuma(img, x, y)
+			if d < 0 {
+				d = -d
+			}
+			if d > 40 {
+				c++
+			}
+		}
+		counts[yi] = c
+	}
+	sm := make([]int, y1-y0)
+	for i := range sm {
+		s, n := 0, 0
+		for k := -1; k <= 1; k++ {
+			j := i + k
+			if j >= 0 && j < len(sm) {
+				s += counts[j]
+				n++
+			}
+		}
+		sm[i] = s / n
+	}
+	const minH = 6
+	var runs [][2]int
+	inRun := false
+	runStart := 0
+	for i := 0; i < len(sm); i++ {
+		if sm[i] >= threshold {
+			if !inRun {
+				inRun = true
+				runStart = i
+			}
+		} else if inRun {
+			if i-runStart >= minH {
+				runs = append(runs, [2]int{y0 + runStart, y0 + i})
+			}
+			inRun = false
+		}
+	}
+	if inRun && len(sm)-runStart >= minH {
+		runs = append(runs, [2]int{y0 + runStart, y1})
+	}
+	return runs
+}
+
+// mgFindMemberRows locates the ranked member rows (ranks 2-6 in one shot) in a
+// Marshal Guard dialog crop using horizontal-edge line detection. It replaces
+// the brittle coloured-region vertical segmentation, which over-split names
+// containing spaces (e.g. "Theodore Silas") and dropped member rows.
+//
+// The rank badges and avatars (x < 0.34W) carry edge content across the gap
+// between a card's name and damage lines, so lines are detected on the
+// right-hand strip only (x in [0.34W, 0.72W]). There the name/damage gap is
+// near-zero while the gap between cards is a clear zero valley, cleanly
+// separating every name and damage line. Name/damage crops are then widened to
+// [0.35W, 0.85W] to capture long names and full damage values.
+func mgFindMemberRows(cropped image.Image, cropW, cropH int) []mgMemberRowRects {
+	// Locate the "Damage Ranking" header to anchor the table start.
+	bodyTop := int(0.40 * float64(cropH))
+	for _, ln := range mgEdgeLineRuns(cropped, cropW, cropH, 0.05, 0.95, 0.30, 0.45, 20) {
+		rect := mgRect{x0: int(0.05 * float64(cropW)), y0: ln[0] - 3, x1: int(0.95 * float64(cropW)), y1: ln[1] + 3}
+		if rect.y0 < 0 {
+			rect.y0 = 0
+		}
+		data, err := mgCropAndBinarize(cropped, rect, 0)
+		if err != nil {
+			continue
+		}
+		raw, _ := mgRunOCR(data, gosseract.PSM_SINGLE_LINE, "")
+		if strings.Contains(strings.ToLower(raw), "rank") {
+			bodyTop = ln[1] + 4
+			break
+		}
+	}
+
+	lines := mgEdgeLineRuns(cropped, cropW, cropH, 0.34, 0.72, float64(bodyTop)/float64(cropH), 0.90, 20)
+	var rects []mgMemberRowRects
+	for i := 0; i+1 < len(lines); {
+		nameLn, dmgLn := lines[i], lines[i+1]
+		gap := dmgLn[0] - nameLn[1]
+		if gap >= 0 && gap < 60 {
+			rects = append(rects, mgMemberRowRects{
+				rankRect: mgRect{x0: int(0.08 * float64(cropW)), y0: nameLn[0] - 3, x1: int(0.22 * float64(cropW)), y1: dmgLn[1] + 3},
+				nameRect: mgRect{x0: int(0.35 * float64(cropW)), y0: nameLn[0] - 3, x1: int(0.85 * float64(cropW)), y1: nameLn[1] + 3},
+				dmgRect:  mgRect{x0: int(0.35 * float64(cropW)), y0: dmgLn[0] - 3, x1: int(0.85 * float64(cropW)), y1: dmgLn[1] + 3},
+				rowY0:    nameLn[0],
+				rowY1:    dmgLn[1],
+			})
+			i += 2
+		} else {
+			i++
+		}
+	}
+	return rects
+}
+
 // mgProcessImage decodes one Marshal Guard screenshot from PNG/JPEG bytes and
 // returns the structured OCR results.
 func mgProcessImage(imageData []byte) (*MGImgResult, error) {
@@ -897,46 +1026,6 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 			}
 		}
 
-		// ── Member row: 5 vsegs, hSegs[1]==3, hSegs[3]==4 ──
-		if len(vertSegs) == 5 && len(hSegs[1]) == 3 && len(hSegs[3]) == 4 {
-			rankData, err := mgCropAndBinarize(cropped, hSegs[1][1], 1)
-			if err != nil {
-				continue
-			}
-			nameData, err := mgCropAndBinarize(cropped, hSegs[3][1], 0)
-			if err != nil {
-				continue
-			}
-			dmgData, err := mgCropAndBinarize(cropped, hSegs[3][2], 2)
-			if err != nil {
-				continue
-			}
-
-			rankStr := mgReadRankDigits(rankData)
-			var rankLabel string
-			if mgRankRe.MatchString(rankStr) {
-				rankLabel = fmt.Sprintf("OK %q", rankStr)
-			} else {
-				rankLabel = fmt.Sprintf("FAIL %q", rankStr)
-			}
-
-			name, nameOK := mgOcrSegment(nameData, gosseract.PSM_SINGLE_LINE,
-				"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[] ",
-				mgNameRe, mgNormalizeName)
-			dmg, dmgOK := mgOcrSegment(dmgData, gosseract.PSM_SINGLE_LINE,
-				"TotalDamge :0123456789.,GM", mgDamageRe, mgNormalizeDamage)
-
-			rows = append(rows, mgMemberRow{
-				rankStr: rankLabel,
-				name:    name,
-				nameOK:  nameOK,
-				dmgStr:  dmg,
-				dmgOK:   dmgOK,
-				cropY0:  float64(rect.y0+dialogY0) / float64(height),
-				cropY1:  float64(rect.y1+dialogY0) / float64(height),
-			})
-		}
-
 		// ── Datetime: 1 vseg, hSegs[0]>=2 (originally ==3, some layouts ==2) ──
 		if len(vertSegs) == 1 && len(hSegs[0]) >= 2 && result.EventDate == "" {
 			dateRe := regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
@@ -957,6 +1046,49 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 				}
 			}
 		}
+	}
+
+	// ── Member rows: line-detection (robust to names with spaces) ──
+	for _, r := range mgFindMemberRows(cropped, cropW, cropH) {
+		rankData, err := mgCropAndBinarize(cropped, r.rankRect, 1)
+		if err != nil {
+			continue
+		}
+		nameData, err := mgCropAndBinarize(cropped, r.nameRect, 0)
+		if err != nil {
+			continue
+		}
+		dmgData, err := mgCropAndBinarize(cropped, r.dmgRect, 2)
+		if err != nil {
+			continue
+		}
+
+		rankStr := mgReadRankDigits(rankData)
+		var rankLabel string
+		if mgRankRe.MatchString(rankStr) {
+			rankLabel = fmt.Sprintf("OK %q", rankStr)
+		} else {
+			rankLabel = fmt.Sprintf("FAIL %q", rankStr)
+		}
+
+		name, nameOK := mgOcrSegment(nameData, gosseract.PSM_SINGLE_LINE,
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[] ",
+			mgNameRe, mgNormalizeName)
+		dmg, dmgOK := mgOcrSegment(dmgData, gosseract.PSM_SINGLE_LINE,
+			"TotalDamge :0123456789.,GM", mgDamageRe, mgNormalizeDamage)
+
+		log.Printf("mg_ocr: member row y=[%d,%d] rank=%s name=%q nameOK=%v dmg=%q dmgOK=%v",
+			r.rowY0, r.rowY1, rankLabel, name, nameOK, dmg, dmgOK)
+
+		rows = append(rows, mgMemberRow{
+			rankStr: rankLabel,
+			name:    name,
+			nameOK:  nameOK,
+			dmgStr:  dmg,
+			dmgOK:   dmgOK,
+			cropY0:  float64(r.rowY0+dialogY0) / float64(height),
+			cropY1:  float64(r.rowY1+dialogY0) / float64(height),
+		})
 	}
 
 	// Reconstruct rank sequence.
