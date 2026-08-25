@@ -587,6 +587,21 @@ func mgNormalizeDamage(raw string) string {
 	return raw
 }
 
+// mgParseRawDamageInt parses a raw integer damage string using European "'"
+// thousands separators (e.g. "21'488'577'041") into int64 raw units, dropping
+// any OCR noise. Returns 0 if no digits are present.
+func mgParseRawDamageInt(raw string) int64 {
+	digits := regexp.MustCompile(`[^0-9]`).ReplaceAllString(raw, "")
+	if digits == "" {
+		return 0
+	}
+	v, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
 // mgParseDamageInt converts a "Total Damage: X.XXG/M" string to int64 (raw units).
 func mgParseDamageInt(s string) int64 {
 	m := regexp.MustCompile(`Total Damage:\s*(\d+)(?:\.(\d{1,2}))?([GM])`).FindStringSubmatch(s)
@@ -931,101 +946,6 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 		}
 		log.Printf("mg_ocr: rect %v vsegs=%d hSegs=%v", rect, len(vertSegs), hLens)
 
-		// ── Top player card ──
-		// Layout A (original mg_segment): 3 vsegs, hSegs[2]>=1, hSegs[1]>=2  → name in hSegs[2][0]
-		//   damage comes from a SEPARATE rect: 3 vsegs, hSegs[1]==1, hSegs[2]==1 (handled below).
-		// Layout B (4-vseg): vseg[3] is a combined text block with both name and damage.
-		// Layout C (2-vseg): hSegs[0]>=2, hSegs[1]==1 → text area is hSegs[1][0].
-		var topNameRect, topDmgRect mgRect
-		topLayoutB := false
-		topDetected := false
-		if len(vertSegs) == 3 && len(hSegs[1]) >= 2 && len(hSegs[2]) >= 1 {
-			topNameRect = hSegs[2][0]
-			topDetected = true
-		} else if len(vertSegs) == 4 && len(hSegs) >= 4 && len(hSegs[3]) >= 1 {
-			// vseg[3] is the text area containing name and damage as a block.
-			topNameRect = hSegs[3][0]
-			topDmgRect = hSegs[3][0]
-			topLayoutB = true
-			topDetected = true
-		} else if len(vertSegs) == 2 && len(hSegs) >= 2 && len(hSegs[0]) >= 2 && len(hSegs[1]) == 1 {
-			// Layout C: 2 vsegs — left side is avatar (multi-band), right side is text block.
-			topNameRect = hSegs[1][0]
-			topDmgRect = hSegs[1][0]
-			topLayoutB = true
-			topDetected = true
-		}
-		if topDetected && result.TopPlayerName == "" {
-			data, err := mgCropAndBinarize(cropped, topNameRect, 0)
-			if err != nil {
-				log.Printf("mg_ocr: top card binarize: %v", err)
-			} else {
-				// Use SINGLE_BLOCK with no whitelist so name characters are captured.
-				raw, _ := mgRunOCR(data, gosseract.PSM_SINGLE_BLOCK, "")
-				log.Printf("mg_ocr: top card raw OCR: %q", raw)
-				for _, line := range strings.Split(raw, "\n") {
-					line = strings.TrimSpace(line)
-					if idx := strings.Index(line, "["); idx >= 0 {
-						candidate := strings.TrimSpace(line[idx:])
-						norm := mgNormalizeName(candidate)
-						if mgNameRe.MatchString(norm) {
-							result.TopPlayerName = norm
-							log.Printf("mg_ocr: top player name: %q", norm)
-							break
-						}
-					}
-				}
-				// Layout B: also try to extract damage from the same block.
-				if topLayoutB && result.TopPlayerDmgStr == "" {
-					for _, line := range strings.Split(raw, "\n") {
-						line = strings.TrimSpace(line)
-						norm := mgNormalizeDamage(line)
-						if mgDamageRe.MatchString(norm) {
-							result.TopPlayerDmgStr = mgParseDamageStr(norm)
-							result.TopPlayerDmgInt = mgParseDamageInt(norm)
-							log.Printf("mg_ocr: top damage (layout B from block): %q", norm)
-							break
-						}
-					}
-				}
-			}
-		}
-		// Top player damage from layout B/C: try all three binarise modes and keep the first
-		// non-zero result (mode 2 finds the text but can misread digits; mode 0/1 may do better).
-		if topDetected && topLayoutB && (topDmgRect != mgRect{}) && result.TopPlayerDmgStr == "" {
-			for _, bmode := range []int{2, 0, 1} {
-				data, err := mgCropAndBinarize(cropped, topDmgRect, bmode)
-				if err != nil {
-					continue
-				}
-				dmg, ok := mgOcrSegment(data, gosseract.PSM_SINGLE_LINE, "TotalDamge :0123456789.,GM", mgDamageRe, mgNormalizeDamage)
-				log.Printf("mg_ocr: top damage OCR mode=%d ok=%v %q", bmode, ok, dmg)
-				if ok && mgParseDamageInt(dmg) > 0 {
-					result.TopPlayerDmgStr = mgParseDamageStr(dmg)
-					result.TopPlayerDmgInt = mgParseDamageInt(dmg)
-					break
-				}
-			}
-			if result.TopPlayerDmgStr == "" {
-				log.Printf("mg_ocr: top damage could not be extracted for layout B/C")
-			}
-		}
-
-		// ── Top player damage row (layout A): 3 vsegs, hSegs[1]==1, hSegs[2]==1 ──
-		if len(vertSegs) == 3 && len(hSegs[1]) == 1 && len(hSegs[2]) == 1 {
-			data, err := mgCropAndBinarize(cropped, hSegs[2][0], 2)
-			if err != nil {
-				log.Printf("mg_ocr: top damage binarize: %v", err)
-				continue
-			}
-			dmg, ok := mgOcrSegment(data, gosseract.PSM_SINGLE_LINE, "TotalDamge :0123456789.,GM", mgDamageRe, mgNormalizeDamage)
-			log.Printf("mg_ocr: top damage OCR (layout A) ok=%v %q", ok, dmg)
-			if ok && result.TopPlayerDmgStr == "" {
-				result.TopPlayerDmgStr = mgParseDamageStr(dmg)
-				result.TopPlayerDmgInt = mgParseDamageInt(dmg)
-			}
-		}
-
 		// ── Datetime: 1 vseg, hSegs[0]>=2 (originally ==3, some layouts ==2) ──
 		if len(vertSegs) == 1 && len(hSegs[0]) >= 2 && result.EventDate == "" {
 			dateRe := regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
@@ -1043,6 +963,52 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 					result.EventDate = fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
 					log.Printf("mg_ocr: event date: %q", result.EventDate)
 					break
+				}
+			}
+		}
+	}
+
+	// ── Top player card: band-based detection ──
+	// The MVP (rank 1) card near the top of the dialog shows the player name and
+	// a raw integer damage with European "'" thousands separators (e.g.
+	// 21'488'577'041). Its text band is the tallest horizontal-edge band in the
+	// upper region. Extract both directly from that band — the colour-segmentation
+	// shape matching this replaces was brittle across layouts and dropped the top
+	// card (and thus the top 3 players) entirely.
+	if bands := mgEdgeLineRuns(cropped, cropW, cropH, 0.30, 0.80, 0.16, 0.36, 20); len(bands) > 0 {
+		var topBand [2]int
+		for _, b := range bands {
+			if b[1]-b[0] > topBand[1]-topBand[0] {
+				topBand = b
+			}
+		}
+		if topBand[1]-topBand[0] >= 60 {
+			// Name: full band, contrast-stretch, first line containing the [tag].
+			nameRect := mgRect{x0: int(0.25 * float64(cropW)), y0: topBand[0], x1: int(0.88 * float64(cropW)), y1: topBand[1]}
+			if data, err := mgCropAndBinarize(cropped, nameRect, 0); err == nil {
+				raw, _ := mgRunOCR(data, gosseract.PSM_SINGLE_BLOCK, "")
+				log.Printf("mg_ocr: top card name raw OCR: %q", raw)
+				for _, line := range strings.Split(raw, "\n") {
+					if idx := strings.Index(line, "["); idx >= 0 {
+						norm := mgNormalizeName(strings.TrimSpace(line[idx:]))
+						if mgNameRe.MatchString(norm) {
+							result.TopPlayerName = norm
+							log.Printf("mg_ocr: top player name: %q", norm)
+							break
+						}
+					}
+				}
+			}
+			// Damage: the raw integer sits in a tight strip below the name line.
+			// Contrast-stretch plus a digit/apostrophe whitelist reads it consistently.
+			dmgRect := mgRect{x0: int(0.46 * float64(cropW)), y0: int(0.238 * float64(cropH)), x1: int(0.78 * float64(cropW)), y1: int(0.268 * float64(cropH))}
+			if data, err := mgCropAndBinarize(cropped, dmgRect, 0); err == nil {
+				raw, _ := mgRunOCR(data, gosseract.PSM_SINGLE_LINE, "0123456789'.,")
+				log.Printf("mg_ocr: top card damage raw OCR: %q", raw)
+				if v := mgParseRawDamageInt(raw); v > 0 {
+					result.TopPlayerDmgInt = v
+					result.TopPlayerDmgStr = mgFormatDamageStr(v)
+					log.Printf("mg_ocr: top player damage: %d (%s)", v, result.TopPlayerDmgStr)
 				}
 			}
 		}
@@ -1135,8 +1101,8 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 	mgFixDamageOutliers(result.Members)
 
 	// The MVP (top card) always out-damages every listed member. If the extracted
-	// top damage is below the highest member damage, the top card was misread —
-	// discard it rather than report a wrong value.
+	// top damage is below the highest member damage, the top damage was misread —
+	// discard the damage only; the name is independently extracted and stays valid.
 	if result.TopPlayerDmgInt > 0 {
 		maxMember := int64(0)
 		for _, m := range result.Members {
@@ -1145,8 +1111,7 @@ func mgProcessImage(imageData []byte) (*MGImgResult, error) {
 			}
 		}
 		if maxMember > 0 && result.TopPlayerDmgInt < maxMember {
-			log.Printf("mg_ocr: top card implausible (%d < max member %d), discarding", result.TopPlayerDmgInt, maxMember)
-			result.TopPlayerName = ""
+			log.Printf("mg_ocr: top card damage implausible (%d < max member %d), discarding damage", result.TopPlayerDmgInt, maxMember)
 			result.TopPlayerDmgStr = ""
 			result.TopPlayerDmgInt = 0
 		}
