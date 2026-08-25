@@ -323,7 +323,14 @@ async function loadZSMembers() {
         if (!res.ok) return;
         const data = await res.json();
         zsAllMembers = (data || []).sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+        buildZSMemberDatalist();
     } catch { /* non-critical */ }
+}
+
+function buildZSMemberDatalist() {
+    const dl = document.getElementById('zs-member-names');
+    if (!dl) return;
+    dl.innerHTML = zsAllMembers.map(m => `<option value="${escapeAttr(m.name)}">`).join('');
 }
 
 function buildZSMemberOptions(memberId) {
@@ -500,7 +507,33 @@ async function importEvent() {
 }
 
 // ---- Manual event creation ----
+function addZSManualRow(name = '', waves = '') {
+    const container = document.getElementById('zs-manual-participants');
+    if (!container) return;
+    const row = document.createElement('div');
+    row.className = 'manual-participant-row';
+    row.innerHTML =
+        `<input type="text" class="zs-manual-name" list="zs-member-names" placeholder="Member name" value="${escapeAttr(name)}">` +
+        `<input type="number" class="zs-manual-waves" min="0" placeholder="Waves" value="${escapeAttr(waves)}">` +
+        `<button type="button" class="zs-manual-remove btn btn-secondary">✕</button>`;
+    container.appendChild(row);
+    row.querySelector('.zs-manual-remove').addEventListener('click', () => row.remove());
+}
+
+function collectZSManualParticipants() {
+    const participants = [];
+    document.querySelectorAll('#zs-manual-participants .manual-participant-row').forEach(row => {
+        const name = row.querySelector('.zs-manual-name').value.trim();
+        const waves = parseInt(row.querySelector('.zs-manual-waves').value, 10) || 0;
+        if (name || waves) participants.push({ name_snapshot: name, waves });
+    });
+    return participants;
+}
+
 function initManualForm() {
+    const addBtn = document.getElementById('zs-add-participant-btn');
+    if (addBtn) addBtn.addEventListener('click', () => addZSManualRow());
+
     document.getElementById('event-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const date = document.getElementById('zs-date').value;
@@ -514,12 +547,14 @@ function initManualForm() {
                     event_date: date,
                     total_waves: parseInt(document.getElementById('zs-total-waves').value) || 0,
                     notes: document.getElementById('zs-notes').value,
+                    participants: collectZSManualParticipants(),
                 }),
             });
             if (res.ok) {
                 showToast('Event created', 'success');
                 document.getElementById('event-modal').style.display = 'none';
                 document.getElementById('event-form').reset();
+                document.getElementById('zs-manual-participants').innerHTML = '';
                 loadEvents();
             } else {
                 showToast('Failed to create event', 'error');

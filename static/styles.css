@@ -9220,3 +9220,15 @@ html.theme-dark .ld-note-tag  { background: rgba(56,161,105,.2); color: #68d391;
 html.theme-dark .ld-rank-filter select { background: #2d3748; border-color: #4a5568; color: #f7fafc; }
 html.theme-dark .ld-section h3,
 html.theme-dark .ld-chart-card h4 { color: #f7fafc; }
+
+/* Manual event participant entry rows (Marshal Guard / Zombie Siege) */
+.manual-participant-row {
+    display: flex;
+    gap: .5rem;
+    align-items: center;
+    margin-bottom: .5rem;
+}
+.manual-participant-row input[type="text"] { flex: 2; min-width: 0; }
+.manual-participant-row input[type="number"] { flex: 1; min-width: 0; }
+.manual-participant-row .mg-manual-remove,
+.manual-participant-row .zs-manual-remove { flex: 0 0 auto; }

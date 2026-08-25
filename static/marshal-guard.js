@@ -339,7 +339,14 @@ async function loadMGMembers() {
         if (!res.ok) return;
         const data = await res.json();
         mgAllMembers = (data || []).sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+        buildMGMemberDatalist();
     } catch { /* non-critical, dropdown just stays empty */ }
+}
+
+function buildMGMemberDatalist() {
+    const dl = document.getElementById('mg-member-names');
+    if (!dl) return;
+    dl.innerHTML = mgAllMembers.map(m => `<option value="${escapeAttr(m.name)}">`).join('');
 }
 
 // Build <option> elements for a member select, pre-selecting memberId.
@@ -756,7 +763,33 @@ function parseMGDamageStr(s) {
 
 
 // ---- Manual event creation ----
+function addMGManualRow(name = '', damage = '') {
+    const container = document.getElementById('mg-manual-participants');
+    if (!container) return;
+    const row = document.createElement('div');
+    row.className = 'manual-participant-row';
+    row.innerHTML =
+        `<input type="text" class="mg-manual-name" list="mg-member-names" placeholder="Member name" value="${escapeAttr(name)}">` +
+        `<input type="number" class="mg-manual-damage" min="0" placeholder="Damage" value="${escapeAttr(damage)}">` +
+        `<button type="button" class="mg-manual-remove btn btn-secondary">✕</button>`;
+    container.appendChild(row);
+    row.querySelector('.mg-manual-remove').addEventListener('click', () => row.remove());
+}
+
+function collectMGManualParticipants() {
+    const participants = [];
+    document.querySelectorAll('#mg-manual-participants .manual-participant-row').forEach(row => {
+        const name = row.querySelector('.mg-manual-name').value.trim();
+        const damage = parseInt(row.querySelector('.mg-manual-damage').value, 10) || 0;
+        if (name || damage) participants.push({ name_snapshot: name, damage });
+    });
+    return participants;
+}
+
 function initManualForm() {
+    const addBtn = document.getElementById('mg-add-participant-btn');
+    if (addBtn) addBtn.addEventListener('click', () => addMGManualRow());
+
     document.getElementById('event-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const date = document.getElementById('mg-date').value;
@@ -770,12 +803,14 @@ function initManualForm() {
                     event_date: date,
                     total_alliance_damage: parseInt(document.getElementById('mg-total-damage').value) || 0,
                     notes: document.getElementById('mg-notes').value,
+                    participants: collectMGManualParticipants(),
                 }),
             });
             if (res.ok) {
                 showToast('Event created', 'success');
                 document.getElementById('event-modal').style.display = 'none';
                 document.getElementById('event-form').reset();
+                document.getElementById('mg-manual-participants').innerHTML = '';
                 loadEvents();
             } else {
                 showToast('Failed to create event', 'error');

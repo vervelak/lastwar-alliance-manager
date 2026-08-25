@@ -12673,9 +12673,10 @@ func getZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 // POST /api/zombie-siege — create event manually (no OCR)
 func createZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EventDate  string `json:"event_date"`
-		TotalWaves int64  `json:"total_waves"`
-		Notes      string `json:"notes"`
+		EventDate   string             `json:"event_date"`
+		TotalWaves  int64              `json:"total_waves"`
+		Notes       string             `json:"notes"`
+		Participants []ZSOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -12689,37 +12690,104 @@ func createZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 	session, _ := store.Get(r, "session")
 	userID, _ := session.Values["user_id"].(int)
 
-	result, err := db.Exec(`INSERT INTO zombie_siege_events (event_date, total_waves, notes, created_by_id)
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`INSERT INTO zombie_siege_events (event_date, total_waves, notes, created_by_id)
 		VALUES (?, ?, ?, ?)`, req.EventDate, req.TotalWaves, req.Notes, userID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	id, _ := result.LastInsertId()
+	eventID, _ := result.LastInsertId()
+
+	added := insertZSParticipants(tx, eventID, req.Participants)
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "message": "Event created"})
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": eventID, "added": added, "message": "Event created"})
 }
 
-// PUT /api/zombie-siege/{id} — update event metadata
+// PUT /api/zombie-siege/{id} — update event metadata (and optionally participants)
 func updateZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(mux.Vars(r)["id"])
 	var req struct {
-		EventDate  string `json:"event_date"`
-		TotalWaves int64  `json:"total_waves"`
-		Notes      string `json:"notes"`
+		EventDate   string             `json:"event_date"`
+		TotalWaves  int64              `json:"total_waves"`
+		Notes       string             `json:"notes"`
+		Participants []ZSOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	_, err := db.Exec(`UPDATE zombie_siege_events SET event_date = ?, total_waves = ?, notes = ? WHERE id = ?`,
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`UPDATE zombie_siege_events SET event_date = ?, total_waves = ?, notes = ? WHERE id = ?`,
 		req.EventDate, req.TotalWaves, req.Notes, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Only replace participants when the client actually sent the field.
+	added := 0
+	if req.Participants != nil {
+		tx.Exec("PRAGMA foreign_keys = ON")
+		if _, err := tx.Exec(`DELETE FROM zombie_siege_participants WHERE event_id = ?`, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		added = insertZSParticipants(tx, int64(id), req.Participants)
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Event updated"})
+	json.NewEncoder(w).Encode(map[string]interface{}{"message": "Event updated", "added": added})
+}
+
+// insertZSParticipants inserts manual ZS participants into the event, matching
+// each name to a member when no explicit member_id was supplied.
+func insertZSParticipants(tx *sql.Tx, eventID int64, participants []ZSOCRParticipant) int {
+	if len(participants) == 0 {
+		return 0
+	}
+	members, _ := loadAllMembers()
+	added := 0
+	for i := range participants {
+		p := &participants[i]
+		if p.MemberID == nil && members != nil {
+			matchZSParticipant(p, members)
+		}
+		rank := p.RankInEvent
+		if rank == 0 {
+			rank = i + 1
+		}
+		_, err := tx.Exec(`INSERT INTO zombie_siege_participants (event_id, member_id, name_snapshot, alliance_tag, rank_in_event, waves)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			eventID, p.MemberID, p.NameSnapshot, p.AllianceTag, rank, p.Waves)
+		if err != nil {
+			log.Printf("ZS manual create: failed to insert participant rank %d: %v", rank, err)
+			continue
+		}
+		added++
+	}
+	return added
 }
 
 // DELETE /api/zombie-siege/{id} — delete event + participants (cascade)
@@ -12877,6 +12945,9 @@ func processZombieSiegeScreenshots(w http.ResponseWriter, r *http.Request) {
 	var allParticipants []ZSOCRParticipant
 	var eventDate string
 
+	// Read every image up front (cheap), then OCR them in parallel so a large
+	// batch finishes well inside the HTTP write timeout.
+	images := make([][]byte, 0, len(files))
 	for _, fh := range files {
 		file, err := fh.Open()
 		if err != nil {
@@ -12887,17 +12958,29 @@ func processZombieSiegeScreenshots(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		images = append(images, imageData)
+	}
 
-		records, date, err := extractZombieSiegeDataFromImage(imageData)
-		if err != nil {
-			log.Printf("ZS OCR: %v", err)
+	type zsFileResult struct {
+		records []ZSOCRRecord
+		date    string
+		err     error
+	}
+	results := ocrParallel(images, 4, func(img []byte) zsFileResult {
+		records, date, err := extractZombieSiegeDataFromImage(img)
+		return zsFileResult{records: records, date: date, err: err}
+	})
+
+	for _, res := range results {
+		if res.err != nil {
+			log.Printf("ZS OCR: %v", res.err)
 			continue
 		}
-		if date != "" && eventDate == "" {
-			eventDate = date
+		if res.date != "" && eventDate == "" {
+			eventDate = res.date
 		}
 
-		for _, rec := range records {
+		for _, rec := range res.records {
 			if rec.MemberName == "" {
 				continue
 			}
@@ -13392,9 +13475,10 @@ func getMarshalGuardEvent(w http.ResponseWriter, r *http.Request) {
 // POST /api/marshal-guard — create event manually (no OCR)
 func createMarshalGuardEvent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EventDate           string `json:"event_date"`
-		TotalAllianceDamage int64  `json:"total_alliance_damage"`
-		Notes               string `json:"notes"`
+		EventDate           string             `json:"event_date"`
+		TotalAllianceDamage int64              `json:"total_alliance_damage"`
+		Notes               string             `json:"notes"`
+		Participants        []MGOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -13408,37 +13492,105 @@ func createMarshalGuardEvent(w http.ResponseWriter, r *http.Request) {
 	session, _ := store.Get(r, "session")
 	userID, _ := session.Values["user_id"].(int)
 
-	result, err := db.Exec(`INSERT INTO marshal_guard_events (event_date, total_alliance_damage, notes, created_by_id)
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`INSERT INTO marshal_guard_events (event_date, total_alliance_damage, notes, created_by_id)
 		VALUES (?, ?, ?, ?)`, req.EventDate, req.TotalAllianceDamage, req.Notes, userID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	id, _ := result.LastInsertId()
+	eventID, _ := result.LastInsertId()
+
+	added := insertMGParticipants(tx, eventID, req.Participants)
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "message": "Event created"})
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": eventID, "added": added, "message": "Event created"})
 }
 
-// PUT /api/marshal-guard/{id} — update event metadata
+// PUT /api/marshal-guard/{id} — update event metadata (and optionally participants)
 func updateMarshalGuardEvent(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(mux.Vars(r)["id"])
 	var req struct {
-		EventDate           string `json:"event_date"`
-		TotalAllianceDamage int64  `json:"total_alliance_damage"`
-		Notes               string `json:"notes"`
+		EventDate           string             `json:"event_date"`
+		TotalAllianceDamage int64              `json:"total_alliance_damage"`
+		Notes               string             `json:"notes"`
+		Participants        []MGOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	_, err := db.Exec(`UPDATE marshal_guard_events SET event_date = ?, total_alliance_damage = ?, notes = ? WHERE id = ?`,
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`UPDATE marshal_guard_events SET event_date = ?, total_alliance_damage = ?, notes = ? WHERE id = ?`,
 		req.EventDate, req.TotalAllianceDamage, req.Notes, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Only replace participants when the client actually sent the field
+	// (nil = omitted, non-nil = replace with the provided list).
+	added := 0
+	if req.Participants != nil {
+		tx.Exec("PRAGMA foreign_keys = ON")
+		if _, err := tx.Exec(`DELETE FROM marshal_guard_participants WHERE event_id = ?`, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		added = insertMGParticipants(tx, int64(id), req.Participants)
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Event updated"})
+	json.NewEncoder(w).Encode(map[string]interface{}{"message": "Event updated", "added": added})
+}
+
+// insertMGParticipants inserts manual MG participants into the event, matching
+// each name to a member when no explicit member_id was supplied.
+func insertMGParticipants(tx *sql.Tx, eventID int64, participants []MGOCRParticipant) int {
+	if len(participants) == 0 {
+		return 0
+	}
+	members, _ := loadAllMembers()
+	added := 0
+	for i := range participants {
+		p := &participants[i]
+		if p.MemberID == nil && members != nil {
+			matchMGParticipant(p, members)
+		}
+		rank := p.RankInEvent
+		if rank == 0 {
+			rank = i + 1
+		}
+		_, err := tx.Exec(`INSERT INTO marshal_guard_participants (event_id, member_id, name_snapshot, alliance_tag, rank_in_event, damage, attack_count)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			eventID, p.MemberID, p.NameSnapshot, p.AllianceTag, rank, p.Damage, p.AttackCount)
+		if err != nil {
+			log.Printf("MG manual create: failed to insert participant rank %d: %v", rank, err)
+			continue
+		}
+		added++
+	}
+	return added
 }
 
 // DELETE /api/marshal-guard/{id} — delete event + participants (cascade)
@@ -14113,6 +14265,68 @@ func confirmMarshalGuard(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ocrParallel runs fn over every image using a bounded worker pool, preserving
+// index order in the returned slice. OCR is CPU-bound and thread-safe when each
+// call creates its own gosseract client, so parallelism cuts wall-clock time
+// on large upload batches (which otherwise exceed the HTTP write timeout).
+func ocrParallel[T any](images [][]byte, workers int, fn func([]byte) T) []T {
+	if workers <= 0 {
+		workers = 4
+	}
+	if workers > len(images) {
+		workers = len(images)
+	}
+	if workers <= 0 {
+		return nil
+	}
+	results := make([]T, len(images))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+	for i, img := range images {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, img []byte) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = fn(img)
+		}(i, img)
+	}
+	wg.Wait()
+	return results
+}
+
+// mgFileResult is the per-image OCR output for Marshal Guard screenshots.
+type mgFileResult struct {
+	participants []MGOCRParticipant
+	date         string
+	total        int64
+	rowBased     bool
+}
+
+// extractMGImage runs the full MG per-image pipeline: row-based first, then
+// mask-based (the real path for mail reward screenshots), then raw OCR fallback.
+func extractMGImage(imageData []byte) mgFileResult {
+	rowParticipants, rowDate, rowTotal := extractMGByRows(imageData)
+	if len(rowParticipants) >= 3 {
+		return mgFileResult{participants: rowParticipants, date: rowDate, total: rowTotal, rowBased: true}
+	}
+	maskResult := extractMGByMask(imageData)
+	if maskResult == nil {
+		clientRaw := gosseract.NewClient()
+		clientRaw.SetImageFromBytes(imageData)
+		textRaw, errRaw := clientRaw.Text()
+		clientRaw.Close()
+		if errRaw == nil {
+			fallback := parseMarshalGuardText(textRaw)
+			maskResult = &fallback
+		}
+	}
+	if maskResult == nil {
+		return mgFileResult{}
+	}
+	return mgFileResult{participants: maskResult.Participants, date: maskResult.EventDate, total: maskResult.TotalDamage}
+}
+
 // POST /api/marshal-guard/process-screenshots — OCR parse MG screenshots
 func processMarshalGuardScreenshots(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
@@ -14138,6 +14352,9 @@ func processMarshalGuardScreenshots(w http.ResponseWriter, r *http.Request) {
 	var eventDate string
 	var totalDamage int64
 
+	// Read every image up front (cheap), then OCR them in parallel so a large
+	// batch finishes well inside the HTTP write timeout.
+	images := make([][]byte, 0, len(files))
 	for _, fh := range files {
 		file, err := fh.Open()
 		if err != nil {
@@ -14148,18 +14365,20 @@ func processMarshalGuardScreenshots(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		images = append(images, imageData)
+	}
 
-		// Try row-based extraction first (much more accurate)
-		rowParticipants, rowDate, rowTotal := extractMGByRows(imageData)
-		if len(rowParticipants) >= 3 {
-			log.Printf("MG OCR: row-based extraction found %d participants", len(rowParticipants))
-			if rowDate != "" && eventDate == "" {
-				eventDate = rowDate
+	results := ocrParallel(images, 4, extractMGImage)
+
+	for _, res := range results {
+		if res.rowBased {
+			if res.date != "" && eventDate == "" {
+				eventDate = res.date
 			}
-			if rowTotal > totalDamage {
-				totalDamage = rowTotal
+			if res.total > totalDamage {
+				totalDamage = res.total
 			}
-			for _, p := range rowParticipants {
+			for _, p := range res.participants {
 				merged := false
 				for i, existing := range allParticipants {
 					if strings.EqualFold(existing.NameSnapshot, p.NameSnapshot) {
@@ -14177,35 +14396,15 @@ func processMarshalGuardScreenshots(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Mask-based row extraction: the game mail has a FIXED layout
-		// Use pattern matching to crop each player row's name + damage regions
-		log.Printf("MG OCR: row-based extraction found only %d, using mask-based extraction", len(rowParticipants))
-		maskResult := extractMGByMask(imageData)
-		if maskResult == nil {
-			log.Printf("MG OCR: mask extraction failed, trying raw OCR fallback")
-			clientRaw := gosseract.NewClient()
-			clientRaw.SetImageFromBytes(imageData)
-			textRaw, errRaw := clientRaw.Text()
-			clientRaw.Close()
-			if errRaw != nil {
-				continue
-			}
-			fallback := parseMarshalGuardText(textRaw)
-			maskResult = &fallback
+		if res.date != "" && eventDate == "" {
+			eventDate = res.date
 		}
-
-		result := *maskResult
-		log.Printf("MG OCR mask: found %d participants", len(result.Participants))
-
-		if result.EventDate != "" && eventDate == "" {
-			eventDate = result.EventDate
-		}
-		if result.TotalDamage > totalDamage {
-			totalDamage = result.TotalDamage
+		if res.total > totalDamage {
+			totalDamage = res.total
 		}
 		// Merge participants by name using fuzzy matching
 		// (OCR may garble names slightly between screenshots)
-		for _, p := range result.Participants {
+		for _, p := range res.participants {
 			merged := false
 			for i, existing := range allParticipants {
 				if strings.EqualFold(existing.NameSnapshot, p.NameSnapshot) ||
@@ -17451,8 +17650,11 @@ func main() {
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      requestLoggingMiddleware(router),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		// Generous timeouts: OCR screenshot imports process many images and can
+		// take well over a minute on large batches. ReadTimeout covers slow uploads
+		// (request body), WriteTimeout covers the OCR work before the response.
+		ReadTimeout:  120 * time.Second,
+		WriteTimeout: 600 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 	log.Fatal(srv.ListenAndServe())

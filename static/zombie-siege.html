@@ -104,6 +104,12 @@
                         <label for="zs-notes">Notes (optional)</label>
                         <textarea id="zs-notes" rows="2" placeholder="Any notes about this event..."></textarea>
                     </div>
+                    <div class="form-group">
+                        <label>Participants (optional — add member name + waves)</label>
+                        <div id="zs-manual-participants"></div>
+                        <button type="button" id="zs-add-participant-btn" class="btn btn-secondary" style="margin-top:.5rem;">➕ Add Member</button>
+                    </div>
+                    <datalist id="zs-member-names"></datalist>
                     <button type="submit" class="btn btn-primary">💾 Save Event</button>
                 </div>
             </form>
