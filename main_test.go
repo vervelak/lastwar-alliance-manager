@@ -4,6 +4,29 @@ import (
 	"testing"
 )
 
+func TestParsePlayerTag_FuzzyClosingBracket(t *testing.T) {
+	const knownTag = "bszk"
+	tests := []struct {
+		input    string
+		wantName string
+	}{
+		{"[bszk]Dopet23", "Dopet23"},
+		{"[bszk]iMorocco", "iMorocco"},
+		{"[bszk1TiC TaC", "TiC TaC"},
+		{"[bszklAlexandros 19", "Alexandros 19"},
+		{"[bszkinas68", "nas68"},
+		{"[bszkiCHADOM", "CHADOM"},
+		{"[bszkix DEUTSCHER", "x DEUTSCHER"},
+		{"[bszk]Ludo 45", "Ludo 45"},
+	}
+	for _, tt := range tests {
+		_, got := parsePlayerTag(tt.input, knownTag)
+		if got != tt.wantName {
+			t.Errorf("parsePlayerTag(%q) name = %q, want %q", tt.input, got, tt.wantName)
+		}
+	}
+}
+
 func TestNormalizeName_GermanDiacritics(t *testing.T) {
 	tests := []struct {
 		input string
