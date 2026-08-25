@@ -12673,9 +12673,9 @@ func getZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 // POST /api/zombie-siege — create event manually (no OCR)
 func createZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EventDate   string             `json:"event_date"`
-		TotalWaves  int64              `json:"total_waves"`
-		Notes       string             `json:"notes"`
+		EventDate    string             `json:"event_date"`
+		TotalWaves   int64              `json:"total_waves"`
+		Notes        string             `json:"notes"`
 		Participants []ZSOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -12718,9 +12718,9 @@ func createZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 func updateZombieSiegeEvent(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(mux.Vars(r)["id"])
 	var req struct {
-		EventDate   string             `json:"event_date"`
-		TotalWaves  int64              `json:"total_waves"`
-		Notes       string             `json:"notes"`
+		EventDate    string             `json:"event_date"`
+		TotalWaves   int64              `json:"total_waves"`
+		Notes        string             `json:"notes"`
 		Participants []ZSOCRParticipant `json:"participants"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -14900,14 +14900,14 @@ func extractMGByMask(imageData []byte) *MarshalGuardOCRResult {
 		dmgXStart = 0.55 // skip "Total Damage:" label
 		dmgXEnd   = 0.82
 
-		// MVP section (top of mail, larger card with combat-power number and damage line)
-		mvpNameYStart = 0.298 // line containing "[RSRP]Gargoland"
-		mvpNameYEnd   = 0.327 // tight: avoid the 93,943,806 line below
-		mvpDmgYStart  = 0.385 // "Total Damage: X.XXG" line under "Attacks: N"
-		mvpDmgYEnd    = 0.420
-		mvpXStart     = 0.43 // right of the avatar AND the shield icon
-		mvpXEnd       = 0.85
-		mvpDmgXStart  = 0.46 // skip "Total Damage:" label on MVP line
+		// MVP section (top of mail, larger card with combat-power number and damage line).
+		// The card lines are detected dynamically (see below) because their exact
+		// position shifts with status bars/notifications. These constants only bound
+		// the search region, which is stable.
+		mvpCardYStart = 0.24 // above the avatar / "MVP" badge
+		mvpCardYEnd   = 0.46 // above "Damage Ranking 2-20" header
+		mvpCardXStart = 0.28 // include the alliance-tag bracket
+		mvpCardXEnd   = 0.92
 
 		// Date line ("2026-5-12 20:30:05") near the bottom of mail body
 		dateYStart = 0.88
@@ -14925,18 +14925,59 @@ func extractMGByMask(imageData []byte) *MarshalGuardOCRResult {
 	defer mgDebugSaveOverlay(img)
 
 	// --- MVP ---
-	mvpNameText := ocrCropField(img,
-		pxX(mvpXStart), pxY(mvpNameYStart),
-		pxX(mvpXEnd), pxY(mvpNameYEnd),
-		mgFieldName, "mvp_name")
-	mvpDmgText := ocrCropField(img,
-		pxX(mvpDmgXStart), pxY(mvpDmgYStart),
-		pxX(mvpXEnd), pxY(mvpDmgYEnd),
-		mgFieldDamage, "mvp_dmg")
-	log.Printf("MG mask MVP: name=%q damage=%q", mvpNameText, mvpDmgText)
+	// The MVP card is a larger mail section above the ranked rows. Its exact line
+	// positions shift with status bars/notifications, so we detect text lines with
+	// the same detector used for the player rows and OCR each line, classifying it
+	// by content (name line vs "Total Damage:" line).
+	mvpLines := detectMGTextLines(img,
+		pxX(mvpCardXStart), pxX(mvpCardXEnd),
+		pxY(mvpCardYStart), pxY(mvpCardYEnd))
+	var mvpTextLines [][2]int
+	for _, ln := range mvpLines {
+		h := ln[1] - ln[0]
+		if h >= 18 && h <= 100 { // skip the avatar/icon and oversized merged bands
+			mvpTextLines = append(mvpTextLines, ln)
+		}
+	}
 
-	mvpParsedName, mvpTag := parseMGMaskName(mvpNameText)
-	mvpDamage := parseMGMaskDamage(mvpDmgText)
+	var mvpParsedName, mvpTag string
+	var mvpDamage int64
+	for i, ln := range mvpTextLines {
+		field := fmt.Sprintf("mvp_ln%d", i)
+		nameText := ocrCropField(img,
+			pxX(mvpCardXStart), ln[0], pxX(mvpCardXEnd), ln[1],
+			mgFieldName, field+"_name")
+		dmgText := ocrCropField(img,
+			pxX(dmgXStart), ln[0], pxX(dmgXEnd), ln[1],
+			mgFieldDamage, field+"_dmg")
+		log.Printf("MG mask MVP line %d (y=%d-%d): name=%q damage=%q", i, ln[0], ln[1], nameText, dmgText)
+
+		// The "Damage Ranking 2-20" header marks the end of the MVP card; stop
+		// there so its "2-20" is not misread as a damage value.
+		low := strings.ToLower(nameText)
+		if strings.Contains(low, "ranking") {
+			break
+		}
+
+		// Name line: first line that yields a name and is not a label keyword
+		// ("Total Damage:", "Attacks:").
+		isLabel := strings.Contains(low, "damage") || strings.Contains(low, "attack") ||
+			strings.Contains(low, "total")
+		if mvpParsedName == "" && !isLabel {
+			if n, tg := parseMGMaskName(nameText); n != "" {
+				mvpParsedName, mvpTag = n, tg
+			}
+		}
+		// Damage line: the value crop ("X.XXG") is OCRed separately with the
+		// numeric whitelist and parses to a >0 damage.
+		if mvpDamage == 0 {
+			if d := parseMGMaskDamage(dmgText); d > 0 {
+				mvpDamage = d
+			}
+		}
+	}
+	log.Printf("MG mask MVP: name=%q tag=%q damage=%d", mvpParsedName, mvpTag, mvpDamage)
+
 	if mvpParsedName != "" {
 		participants = append(participants, MGOCRParticipant{
 			RankInEvent:  1,
@@ -15782,18 +15823,18 @@ func parseMGMaskName(text string) (name, tag string) {
 		return strings.TrimSpace(s)
 	}
 
-	// Try [TAG]Name pattern
-	if m := regexp.MustCompile(`\[([A-Z0-9]{2,6})[\]lI1]\s*(.+)`).FindStringSubmatch(line); m != nil {
+	// Try [TAG]Name pattern (tag may OCR in either case; normalise to uppercase)
+	if m := regexp.MustCompile(`\[([A-Za-z0-9]{2,6})[\]lI1]\s*(.+)`).FindStringSubmatch(line); m != nil {
 		n := cleanName(m[2])
 		if len(n) >= 2 {
-			return n, m[1]
+			return n, strings.ToUpper(m[1])
 		}
 	}
 	// Try without opening bracket: "TAG]Name"
-	if m := regexp.MustCompile(`([A-Z]{2,6})[\]lI1]\s*(.+)`).FindStringSubmatch(line); m != nil {
+	if m := regexp.MustCompile(`([A-Za-z]{2,6})[\]lI1]\s*(.+)`).FindStringSubmatch(line); m != nil {
 		n := cleanName(m[2])
 		if len(n) >= 2 {
-			return n, m[1]
+			return n, strings.ToUpper(m[1])
 		}
 	}
 	// No tag — return the cleaned line if it looks like a name
@@ -15820,6 +15861,9 @@ func parseMGMaskDamage(text string) int64 {
 	t := strings.ReplaceAll(text, ",", ".")
 	t = strings.ReplaceAll(t, " ", "")
 	t = strings.ReplaceAll(t, "B", "")
+	// A separator directly before the unit letter is OCR noise ("487,G" for 4.87G);
+	// drop it so the whole-number branch below can reconstruct the decimal.
+	t = regexp.MustCompile(`[.,]([GMK])`).ReplaceAllString(t, "$1")
 
 	// Primary pattern: X.XX[GMK]
 	if m := regexp.MustCompile(`(\d{1,3})\.(\d{1,2})([GMK])`).FindStringSubmatch(t); m != nil {
@@ -17648,8 +17692,8 @@ func main() {
 
 	log.Printf("Server starting on http://localhost:%s", port) // #nosec G706 — port validated as numeric above
 	srv := &http.Server{
-		Addr:         ":" + port,
-		Handler:      requestLoggingMiddleware(router),
+		Addr:    ":" + port,
+		Handler: requestLoggingMiddleware(router),
 		// Generous timeouts: OCR screenshot imports process many images and can
 		// take well over a minute on large batches. ReadTimeout covers slow uploads
 		// (request body), WriteTimeout covers the OCR work before the response.
