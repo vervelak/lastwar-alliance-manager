@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 # Install build dependencies (gcc/g++/musl for CGO; tesseract-ocr-dev for gosseract)
 RUN apk add --no-cache gcc g++ musl-dev tesseract-ocr-dev leptonica-dev
