@@ -5,21 +5,34 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]
 
   - package-ecosystem: npm
     directory: "/playwright-tests"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    groups:
+      npm:
+        patterns: ["*"]
 
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: monthly
     open-pull-requests-limit: 3
+    groups:
+      docker:
+        patterns: ["*"]
