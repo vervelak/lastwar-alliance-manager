@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/vervelak/lastwar-alliance-manager/compare/v1.0.1...v1.0.2) (2026-09-10)
+
+
+### Miscellaneous Chores
+
+* prepare patch release ([605df74](https://github.com/vervelak/lastwar-alliance-manager/commit/605df74d722fd51d47133867463037d5df9fbc68))
+
 ## [1.0.1](https://github.com/vervelak/lastwar-alliance-manager/compare/v1.0.0...v1.0.1) (2026-08-25)
 
 
