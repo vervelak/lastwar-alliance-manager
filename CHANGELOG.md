@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.2](https://github.com/vervelak/lastwar-alliance-manager/compare/v1.0.1...v1.0.2) (2026-09-10)
+
+
+### Miscellaneous Chores
+
+* **deps:** bump Go builder image to 1.27-alpine and align go.mod ([ac0aced](https://github.com/vervelak/lastwar-alliance-manager/commit/ac0aced3326328a7f701c0b4f9d4daf1f3f7d1cc))
+* **deps:** bump modernc.org/sqlite 1.56.0 to 1.58.0 and golang.org/x/crypto 0.55.0 to 0.56.0 ([a0881e0](https://github.com/vervelak/lastwar-alliance-manager/commit/a0881e091f760218f84206ff02cc1fba3206878e), [d5fbe3c](https://github.com/vervelak/lastwar-alliance-manager/commit/d5fbe3c34f434737f2a5d9af998236c68cc7cf55))
+* **deps:** bump docker GitHub Actions (build-push v7, setup-buildx v4, metadata v6, login v4) and download-artifact v8 ([8ac19a8](https://github.com/vervelak/lastwar-alliance-manager/commit/8ac19a8859c470acb87982516bd51aa9653b8ff7), [9111ed5](https://github.com/vervelak/lastwar-alliance-manager/commit/9111ed5b6a334c807b479d3ce86cd58eacd6dc06))
+* **deps-dev:** bump @playwright/test 1.62.1 to 1.63.0 ([b24eabd](https://github.com/vervelak/lastwar-alliance-manager/commit/b24eabdff6e2b35be1d5d438dabd00f6654502cc))
+* **ci:** align Go toolchain with Dockerfile, pin golangci-lint v2.13.2, group dependabot PRs, build Docker image once per run ([dc1710d](https://github.com/vervelak/lastwar-alliance-manager/commit/dc1710d280ae0e9c1856ef8e2a308e09bcd0558b))
+
 ## [1.0.1](https://github.com/vervelak/lastwar-alliance-manager/compare/v1.0.0...v1.0.1) (2026-08-25)
 
 
