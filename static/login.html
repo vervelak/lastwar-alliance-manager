@@ -84,8 +84,11 @@
                         }
                     }, 1000);
                 } else {
-                    const error = await response.text();
-                    errorDiv.textContent = 'Invalid username or password';
+                    // Surface the server's specific reason (e.g. "Account suspended"
+                    // or rate limiting) instead of masking every failure as bad
+                    // credentials. http.Error appends a newline, so trim it.
+                    const serverMessage = (await response.text()).trim();
+                    errorDiv.textContent = serverMessage || 'Invalid username or password';
                     errorDiv.style.display = 'block';
                     loginBtn.disabled = false;
                     loginBtn.textContent = 'Login';
