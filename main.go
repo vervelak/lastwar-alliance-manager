@@ -17511,6 +17511,62 @@ func deleteDonationRecord(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// statusInterceptingWriter wraps an http.ResponseWriter and, when the
+// underlying handler responds with 404, buffers that (short) body so the
+// caller can replace it with a custom page. Non-404 responses stream
+// straight through to the client without buffering.
+type statusInterceptingWriter struct {
+	http.ResponseWriter
+	status         int
+	intercepted404 bool
+	started        bool
+	buf            bytes.Buffer
+}
+
+func (s *statusInterceptingWriter) WriteHeader(code int) {
+	if s.started {
+		return
+	}
+	s.started = true
+	s.status = code
+	if code == http.StatusNotFound {
+		s.intercepted404 = true // buffer the 404 body; don't forward yet
+		return
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusInterceptingWriter) Write(b []byte) (int, error) {
+	if !s.started {
+		s.started = true
+		s.status = http.StatusOK
+		s.ResponseWriter.WriteHeader(http.StatusOK)
+	}
+	if s.intercepted404 {
+		return s.buf.Write(b)
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusInterceptingWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// serveNotFoundPage writes the branded 404 page, falling back to a plain
+// text response if the asset is missing.
+func serveNotFoundPage(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Del("Content-Length")
+	w.WriteHeader(http.StatusNotFound)
+	if data, err := os.ReadFile("static/404.html"); err == nil {
+		_, _ = w.Write(data)
+		return
+	}
+	_, _ = w.Write([]byte("404 Not Found"))
+}
+
 func main() {
 	// Initialize session store first
 	initSessionStore()
@@ -17687,8 +17743,24 @@ func main() {
 		w.Write([]byte(`{"status":"ready"}`))
 	}).Methods("GET")
 
-	// Serve static files
-	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./static")))
+	// Static files with a branded 404 page (JSON 404 for unknown /api routes).
+	// http.FileServer sanitizes request paths itself (no traversal); we only
+	// intercept its 404 responses to swap in the branded page.
+	fileServer := http.FileServer(http.Dir("./static"))
+	serveStaticOr404 := func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"Not found"}`))
+			return
+		}
+		iw := &statusInterceptingWriter{ResponseWriter: w}
+		fileServer.ServeHTTP(iw, r)
+		if iw.intercepted404 {
+			serveNotFoundPage(w)
+		}
+	}
+	router.PathPrefix("/").Handler(http.HandlerFunc(serveStaticOr404))
 
 	port := os.Getenv("PORT")
 	if port == "" {

@@ -45,11 +45,12 @@
                 <div class="modal-content modal-member">
                     <span class="close" id="close-member-modal" role="button" tabindex="0" aria-label="Close dialog">&times;</span>
                     <h3 id="modal-form-title">Enlist Survivor</h3>
-                    <form id="member-form">
+                    <form id="member-form" novalidate>
                         <input type="hidden" id="member-id">
                         <div class="form-group">
                             <label for="member-name">Member Name:</label>
                             <input type="text" id="member-name" required placeholder="Enter member name">
+                            <span class="field-error">Member name is required.</span>
                         </div>
                         <div class="form-group">
                             <label for="member-nickname">Nickname:</label>
@@ -65,6 +66,7 @@
                                 <option value="R2">R2</option>
                                 <option value="R1">R1</option>
                             </select>
+                            <span class="field-error">Please select a rank.</span>
                         </div>
                         <div class="form-group">
                             <label class="checkbox-label">

@@ -149,3 +149,27 @@ function clearButtonLoading(btn) {
     btn.textContent = btn.dataset.originalText || btn.textContent;
     btn.disabled = false;
 }
+
+/**
+ * Escape key closes the topmost open modal.
+ *
+ * Clicks the modal's own close button when present so each page's close
+ * logic (form resets, etc.) runs; falls back to hiding the modal otherwise.
+ * Skips while the confirm dialog or the MG lightbox owns Escape.
+ */
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (document.querySelector('.confirm-overlay')) return;
+    const lightbox = document.getElementById('mg-lightbox');
+    if (lightbox && lightbox.style.display !== 'none') return;
+
+    const modals = Array.from(document.querySelectorAll('.modal')).filter(
+        (m) => m.style.display !== 'none' && getComputedStyle(m).display !== 'none'
+    );
+    const top = modals[modals.length - 1];
+    if (!top) return;
+
+    const closeBtn = top.querySelector('.close');
+    if (closeBtn) closeBtn.click();
+    else top.style.display = 'none';
+});

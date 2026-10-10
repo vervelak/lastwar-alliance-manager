@@ -1,6 +1,6 @@
 module lastwar-alliance
 
-go 1.27.0
+go 1.26.9
 
 require (
 	github.com/gorilla/mux v1.8.1
