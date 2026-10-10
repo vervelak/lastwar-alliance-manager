@@ -3,6 +3,9 @@
 
 // Load and apply alliance branding
 async function loadAllianceBranding() {
+    // The login page is unauthenticated by definition; /api/settings would
+    // 401 and log a console error on every load. Keep default branding there.
+    if (window.location.pathname.endsWith('/login.html')) return;
     try {
         const response = await fetch('/api/settings');
         if (response.ok) {

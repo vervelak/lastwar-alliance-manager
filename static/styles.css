@@ -639,7 +639,9 @@ header .user-info {
     font-size: 1.3em;
     cursor: pointer;
     box-shadow: var(--shadow-md);
-    z-index: 1001;
+    /* Must stay above the header (z-index 1200), which otherwise covers it
+       on mobile and blocks taps; below the user dropdown (1300). */
+    z-index: 1250;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -7872,7 +7874,7 @@ section:last-child {
 }
 
 .app-footer a {
-    color: var(--accent-color);
+    color: var(--accent-primary);
     text-decoration: none;
 }
 
@@ -8957,7 +8959,7 @@ section:last-child {
 .pf-nick { font-size: .95rem; color: var(--text-muted, #718096); font-style: italic; }
 .pf-position { display: flex; align-items: center; gap: .3rem; }
 .pf-pos-badge {
-    background: var(--bg-secondary, #edf2f7);
+    background: var(--bg-subtle);
     color: var(--text-secondary, #4a5568);
     padding: .2rem .55rem;
     border-radius: 10px;
@@ -8978,7 +8980,7 @@ section:last-child {
 @media (max-width: 680px) { .pf-top-row { grid-template-columns: 1fr; } }
 
 .pf-score-card {
-    background: var(--bg-card, #fff);
+    background: var(--card-bg);
     border: 1px solid var(--border-color, #e2e8f0);
     border-radius: 10px;
     padding: 1.1rem 1.3rem;
@@ -8992,7 +8994,7 @@ section:last-child {
 .pf-score-num {
     font-size: 2.2rem;
     font-weight: 800;
-    color: var(--accent-color, #3182ce);
+    color: var(--accent-primary);
     line-height: 1;
 }
 .pf-score-lbl { font-size: .85rem; color: var(--text-muted, #718096); }
@@ -9005,7 +9007,7 @@ section:last-child {
 .pf-neg { color: #e53e3e; }
 
 .pf-radar-wrap {
-    background: var(--bg-card, #fff);
+    background: var(--card-bg);
     border: 1px solid var(--border-color, #e2e8f0);
     border-radius: 10px;
     padding: 1rem;
@@ -9024,7 +9026,7 @@ section:last-child {
 @media (max-width: 680px) { .pf-charts-row { grid-template-columns: 1fr; } }
 
 .pf-chart-card {
-    background: var(--bg-card, #fff);
+    background: var(--card-bg);
     border: 1px solid var(--border-color, #e2e8f0);
     border-radius: 10px;
     padding: 1rem 1.2rem;
@@ -9070,8 +9072,8 @@ section:last-child {
 html.theme-dark .pf-score-card,
 html.theme-dark .pf-radar-wrap,
 html.theme-dark .pf-chart-card {
-    background: var(--bg-card-dark, #2d3748);
-    border-color: var(--border-dark, #4a5568);
+    background: var(--card-bg);
+    border-color: var(--border-color);
 }
 html.theme-dark .pf-name   { color: #f7fafc; }
 html.theme-dark .pf-pos-badge { background: rgba(255,255,255,.08); color: #e2e8f0; }
@@ -9090,13 +9092,13 @@ html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #
     margin-bottom: 1.4rem;
 }
 .ld-card {
-    background: var(--bg-card, #fff);
+    background: var(--card-bg);
     border: 1px solid var(--border-color, #e2e8f0);
     border-radius: 10px;
     padding: 1rem 1.2rem;
     text-align: center;
 }
-.ld-card-num { font-size: 2rem; font-weight: 800; color: var(--accent-color, #3182ce); line-height: 1.1; }
+.ld-card-num { font-size: 2rem; font-weight: 800; color: var(--accent-primary); line-height: 1.1; }
 .ld-card-lbl { font-size: .78rem; color: var(--text-muted, #718096); margin-top: .2rem; }
 .ld-card-promote .ld-card-num { color: #38a169; }
 .ld-card-demote  .ld-card-num { color: #e53e3e; }
@@ -9113,7 +9115,7 @@ html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #
 @media (max-width: 720px) { .ld-charts-row { grid-template-columns: 1fr; } }
 
 .ld-chart-card {
-    background: var(--bg-card, #fff);
+    background: var(--card-bg);
     border: 1px solid var(--border-color, #e2e8f0);
     border-radius: 10px;
     padding: 1rem 1.2rem;
@@ -9129,7 +9131,7 @@ html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #
 
 /* sections */
 .ld-section {
-    background: var(--bg-card, #fff);
+    background: var(--card-bg);
     border: 1px solid var(--border-color, #e2e8f0);
     border-radius: 10px;
     padding: 1.2rem 1.4rem;
@@ -9152,7 +9154,7 @@ html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #
 .ld-table th {
     text-align: left;
     padding: .4rem .6rem;
-    background: var(--bg-secondary, #edf2f7);
+    background: var(--bg-subtle);
     color: var(--text-muted, #718096);
     font-size: .78rem;
     font-weight: 600;
@@ -9162,7 +9164,7 @@ html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #
 .ld-table td { padding: .45rem .6rem; border-bottom: 1px solid var(--border-color, #e2e8f0); vertical-align: middle; }
 .ld-table tr:last-child td { border-bottom: none; }
 .ld-row-warn td { background: rgba(229,62,62,.04); }
-.ld-member-link { color: var(--accent-color, #3182ce); text-decoration: none; font-weight: 500; }
+.ld-member-link { color: var(--accent-primary); text-decoration: none; font-weight: 500; }
 .ld-member-link:hover { text-decoration: underline; }
 
 /* tags */
@@ -9200,7 +9202,7 @@ html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #
     padding: .3rem .5rem;
     border-radius: 6px;
     border: 1px solid var(--border-color, #e2e8f0);
-    background: var(--bg-card, #fff);
+    background: var(--card-bg);
     color: var(--text-primary, #1a202c);
     font-size: .85rem;
 }
@@ -9209,8 +9211,8 @@ html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #
 html.theme-dark .ld-card,
 html.theme-dark .ld-chart-card,
 html.theme-dark .ld-section {
-    background: var(--bg-card-dark, #2d3748);
-    border-color: var(--border-dark, #4a5568);
+    background: var(--card-bg);
+    border-color: var(--border-color);
 }
 html.theme-dark .ld-table th { background: rgba(255,255,255,.05); color: #a0aec0; }
 html.theme-dark .ld-table td { border-color: #4a5568; }

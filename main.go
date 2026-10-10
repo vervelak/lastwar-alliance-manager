@@ -17511,6 +17511,12 @@ func deleteDonationRecord(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// fileExists reports whether path exists and is a regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
 func main() {
 	// Initialize session store first
 	initSessionStore()
@@ -17688,7 +17694,38 @@ func main() {
 	}).Methods("GET")
 
 	// Serve static files
-	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./static")))
+	// Static files with a branded 404 page (JSON 404 for unknown /api routes)
+	fileServer := http.FileServer(http.Dir("./static"))
+	serveStaticOr404 := func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"Not found"}`))
+			return
+		}
+		rel := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+		p := "static"
+		if rel != "" && rel != "." {
+			p = filepath.Join("static", rel)
+		}
+		if info, err := os.Stat(p); err != nil || info.IsDir() {
+			// Directory without index.html is a miss; FileServer serves index
+			// pages for directories that have one (e.g. "/").
+			isDirWithIndex := info != nil && info.IsDir() && fileExists(filepath.Join(p, "index.html"))
+			if !isDirWithIndex {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				if data, err := os.ReadFile(filepath.Join("static", "404.html")); err == nil {
+					_, _ = w.Write(data)
+				} else {
+					http.Error(w, "Not Found", http.StatusNotFound)
+				}
+				return
+			}
+		}
+		fileServer.ServeHTTP(w, r)
+	}
+	router.PathPrefix("/").Handler(http.HandlerFunc(serveStaticOr404))
 
 	port := os.Getenv("PORT")
 	if port == "" {

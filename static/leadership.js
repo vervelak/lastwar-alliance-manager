@@ -49,9 +49,10 @@ async function loadDashboard() {
     });
 
     // Leadership score = total_score without the recent-conductor penalty
-    // (that penalty is a scheduling fairness tool, not a performance indicator)
+    // (that penalty is a scheduling fairness tool, not a performance indicator).
+    // total_score already has the penalty subtracted, so add it back.
     rankings.forEach(row => {
-        row.ld_score = row.ld_score + (row.recent_conductor_penalty || 0);
+        row.ld_score = (row.total_score || 0) + (row.recent_conductor_penalty || 0);
     });
 
     // Alliance-wide score list (for percentile calc)
