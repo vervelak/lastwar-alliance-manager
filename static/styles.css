@@ -8967,7 +8967,7 @@ section:last-child {
     font-weight: 600;
 }
 .pf-pos-sep { color: var(--text-muted, #a0aec0); }
-.pf-pos-tier { background: rgba(99,179,237,.15); color: #3182ce; }
+.pf-pos-tier { background: var(--accent-bg-subtle); color: var(--accent-primary); }
 
 /* top row: score card + radar side-by-side */
 .pf-top-row {
@@ -9065,8 +9065,8 @@ section:last-child {
     font-size: .8rem;
     font-weight: 500;
 }
-.pf-train-conductor { background: rgba(99,179,237,.2); color: #2b6cb0; }
-.pf-train-other     { background: rgba(160,174,192,.18); color: var(--text-secondary, #4a5568); }
+.pf-train-conductor { background: var(--accent-bg-light); color: var(--accent-primary); }
+.pf-train-other     { background: rgba(120, 92, 70, .12); color: var(--text-secondary, #4a5568); }
 
 /* dark-mode adjustments */
 html.theme-dark .pf-score-card,
@@ -9078,7 +9078,7 @@ html.theme-dark .pf-chart-card {
 html.theme-dark .pf-name   { color: #f7fafc; }
 html.theme-dark .pf-pos-badge { background: rgba(255,255,255,.08); color: #e2e8f0; }
 html.theme-dark .pf-score-table td { border-color: #4a5568; }
-html.theme-dark .pf-train-conductor { background: rgba(99,179,237,.25); color: #90cdf4; }
+html.theme-dark .pf-train-conductor { background: rgba(167, 80, 24, 0.3); color: #f6ad55; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    LEADERSHIP DASHBOARD  (.ld-*)

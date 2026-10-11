@@ -467,7 +467,28 @@ function updateScreenshotTypeHint() {
 document.addEventListener('DOMContentLoaded', async () => {
     const auth = await requireAuth();
     if (!auth) return;
-    
+
+    // Member List import requires R4/R5 (or admin); power & VS uploads are open to all.
+    // For lower ranks, surface a read-only notice and disable the restricted option
+    // instead of letting them submit and hit a 403.
+    const canImportMembers = auth.can_manage_ranks || auth.is_admin;
+    if (!canImportMembers) {
+        const section = document.querySelector('.upload-section');
+        if (section) {
+            const banner = document.createElement('div');
+            banner.className = 'permission-notice';
+            banner.style.cssText = 'background: var(--bs-warning-bg); border-left: 4px solid var(--bs-warning); padding: 15px; margin-bottom: 20px; color: var(--bs-warning-text); border-radius: 6px;';
+            banner.innerHTML = '🔒 <strong>Read-only:</strong> Alliance Member List import requires R4/R5. Power Rankings and VS Points uploads are still available.';
+            section.insertBefore(banner, section.firstChild);
+        }
+        const typeSel = document.getElementById('screenshot-type');
+        if (typeSel) {
+            const opt = typeSel.querySelector('option[value="member-list"]');
+            if (opt) { opt.disabled = true; opt.textContent += ' — R4/R5 only'; }
+            if (typeSel.value === 'member-list') typeSel.value = 'power';
+        }
+    }
+
     // Setup screenshot type selector
     const screenshotTypeSelector = document.getElementById('screenshot-type');
     if (screenshotTypeSelector) {

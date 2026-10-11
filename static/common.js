@@ -173,3 +173,70 @@ document.addEventListener('keydown', (e) => {
     if (closeBtn) closeBtn.click();
     else top.style.display = 'none';
 });
+
+/**
+ * Modal focus management (a11y).
+ *
+ * - Traps Tab / Shift+Tab within the topmost open modal.
+ * - Moves focus into a modal when it opens.
+ * - Restores focus to the triggering element when all modals close.
+ *
+ * Complements the Escape handler above; the confirm dialog and MG lightbox
+ * own their own focus/Escape, so they are skipped here.
+ */
+const FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function visibleFocusables(root) {
+    return Array.from(root.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetWidth > 0 || el.offsetHeight > 0 || el === document.activeElement
+    );
+}
+
+function topOpenModal() {
+    const modals = Array.from(document.querySelectorAll('.modal')).filter(
+        (m) => m.style.display !== 'none' && getComputedStyle(m).display !== 'none'
+    );
+    return modals[modals.length - 1] || null;
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    if (document.querySelector('.confirm-overlay')) return; // confirm dialog owns focus
+    const modal = topOpenModal();
+    if (!modal) return;
+
+    const focusables = visibleFocusables(modal);
+    if (focusables.length === 0) { e.preventDefault(); return; }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    const inside = modal.contains(active);
+
+    if (e.shiftKey) {
+        if (!inside || active === first) { e.preventDefault(); last.focus(); }
+    } else if (!inside || active === last) {
+        e.preventDefault();
+        first.focus();
+    }
+}, true);
+
+let lastFocusedBeforeModal = null;
+const modalFocusObserver = new MutationObserver(() => {
+    const modal = topOpenModal();
+    if (modal) {
+        if (!modal.contains(document.activeElement)) {
+            const active = document.activeElement;
+            if (!lastFocusedBeforeModal && active && active !== document.body && !active.closest('.modal')) {
+                lastFocusedBeforeModal = active; // remember trigger (first modal only)
+            }
+            const focusables = visibleFocusables(modal);
+            (focusables[0] || modal.querySelector('.close') || modal).focus();
+        }
+    } else if (lastFocusedBeforeModal) {
+        if (document.contains(lastFocusedBeforeModal)) lastFocusedBeforeModal.focus();
+        lastFocusedBeforeModal = null;
+    }
+});
+document.querySelectorAll('.modal').forEach((m) =>
+    modalFocusObserver.observe(m, { attributes: true, attributeFilter: ['style', 'class'] })
+);
