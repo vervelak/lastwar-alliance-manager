@@ -268,7 +268,7 @@ function buildScoreBar(tiers) {
     const isDark = document.documentElement.classList.contains('theme-dark');
     const labelColor = isDark ? '#ccc' : '#444';
     const gridColor  = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)';
-    const barColor   = isDark ? '#63b3ed' : '#3182ce';
+    const barColor   = isDark ? '#f6ad55' : '#a75018';
     const ranks = RANK_ORDER.filter(r => tiers[r].length);
     const avgs  = ranks.map(r => Math.round(avg(tiers[r].map(x => x.ld_score))));
     const ctx = document.getElementById('ld-rank-score-bar').getContext('2d');
