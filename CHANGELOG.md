@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.3](https://github.com/vervelak/lastwar-alliance-manager/compare/v1.0.2...v1.0.3) (2026-10-11)
+
+
+### Bug Fixes
+
+* **auth:** surface real login error instead of masking as bad credentials ([#86](https://github.com/vervelak/lastwar-alliance-manager/issues/86)) ([82aee4b](https://github.com/vervelak/lastwar-alliance-manager/commit/82aee4b64ea2d9fb6a2829a6e43f07f00d76700f))
+* leadership NaN scores, dark-mode themes, mobile nav, UX fixes ([7b2d01f](https://github.com/vervelak/lastwar-alliance-manager/commit/7b2d01fa70dfdd00d923bf298f4fec6b9c7c6a52))
+* Phase 2 UX polish — read-only banner, brand palette, modal focus trap ([105c001](https://github.com/vervelak/lastwar-alliance-manager/commit/105c001f4734bdc5b5a51e2c51832a60341d6b89))
+* serve 404 via response interception instead of os.Stat ([7d4d7a6](https://github.com/vervelak/lastwar-alliance-manager/commit/7d4d7a68120a1371f75e2df2296e296428709529))
+* set Go directive to 1.26.9 for stdlib CVEs + lint tool compat ([dce9a7a](https://github.com/vervelak/lastwar-alliance-manager/commit/dce9a7a4b6727ccd446b97e50e7e12f9a20eeba5))
+
 ## [1.0.2](https://github.com/vervelak/lastwar-alliance-manager/compare/v1.0.1...v1.0.2) (2026-09-10)
 
 
