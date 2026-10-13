@@ -85,7 +85,12 @@
                         <div class="form-group">
                             <label for="r4r5-rank-boost">Base Bonus Points:</label>
                             <input type="number" id="r4r5-rank-boost" min="0" required>
-                            <span class="help-text">Base points for R4/R5 members, multiplied exponentially by 2^(days_since_last_conductor/7). Doubles every week to guarantee selection within 3 weeks.</span>
+                            <span class="help-text">Base points for R4/R5 members, multiplied by 2^(days_since_last_conductor/7) until it hits the growth cap.</span>
+                        </div>
+                        <div class="form-group">
+                            <label for="rank-boost-max-weeks">Growth Cap (weeks):</label>
+                            <input type="number" id="rank-boost-max-weeks" min="1" max="13" required>
+                            <span class="help-text">The boost stops growing after this many weeks without conducting (max = base × 2^weeks). Prevents the score from growing forever for members who are never selected.</span>
                         </div>
                     </div>
 
