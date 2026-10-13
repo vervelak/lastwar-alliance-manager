@@ -408,7 +408,7 @@ function populateFormulaModal(settings, avgCount) {
             <div class="system-info-item"><span class="info-label">🥈 2nd Award</span><span class="info-value">+${settings.award_second_points} pts</span></div>
             <div class="system-info-item"><span class="info-label">🥉 3rd Award</span><span class="info-value">+${settings.award_third_points} pts</span></div>
             <div class="system-info-item"><span class="info-label">⭐ Recs</span><span class="info-value">5×√n pts / day</span></div>
-            <div class="system-info-item"><span class="info-label">🏅 R4/R5 Boost</span><span class="info-value">${settings.r4r5_rank_boost} × 2^(days/7)</span></div>
+            <div class="system-info-item"><span class="info-label">🏅 R4/R5 Boost</span><span class="info-value">${settings.r4r5_rank_boost} × 2^(days/7), cap ×${Math.pow(2, settings.rank_boost_max_weeks || 5)}</span></div>
             <div class="system-info-item"><span class="info-label">🎯 First Timer</span><span class="info-value">+${settings.first_time_conductor_boost} pts</span></div>
             <div class="system-info-item"><span class="info-label">⏱️ Recent Penalty</span><span class="info-value">−${settings.recent_conductor_penalty_days} pts max</span></div>
             <div class="system-info-item"><span class="info-label">📈 Above Avg Penalty</span><span class="info-value">−${settings.above_average_conductor_penalty} pts</span></div>

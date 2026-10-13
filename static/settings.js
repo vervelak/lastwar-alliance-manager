@@ -22,6 +22,7 @@ async function loadSettings() {
         document.getElementById('recent-conductor-days').value = settings.recent_conductor_penalty_days;
         document.getElementById('above-average-penalty').value = settings.above_average_conductor_penalty;
         document.getElementById('r4r5-rank-boost').value = settings.r4r5_rank_boost;
+        document.getElementById('rank-boost-max-weeks').value = settings.rank_boost_max_weeks || 5;
         document.getElementById('first-time-boost').value = settings.first_time_conductor_boost || 5;
         document.getElementById('schedule-message-template').value = settings.schedule_message_template || 'Train Schedule - Week {WEEK}\n\n{SCHEDULES}\n\nNext in line:\n{NEXT_3}';
         document.getElementById('daily-message-template').value = settings.daily_message_template || 'Daily train reminder for {DAY}, {DATE}:\n🚂 Conductor: {CONDUCTOR_NAME} - Please be online at {CONDUCTOR_TIME}\n🔄 Backup: {BACKUP_NAME} - Please be ready at {BACKUP_TIME}\n\nAsk in alliance chat for the train to be assigned. Thanks for keeping the train golden!';
@@ -97,6 +98,7 @@ document.getElementById('settings-form').addEventListener('submit', async (e) =>
         recent_conductor_penalty_days: parseInt(document.getElementById('recent-conductor-days').value),
         above_average_conductor_penalty: parseInt(document.getElementById('above-average-penalty').value),
         r4r5_rank_boost: parseInt(document.getElementById('r4r5-rank-boost').value),
+        rank_boost_max_weeks: parseInt(document.getElementById('rank-boost-max-weeks').value),
         first_time_conductor_boost: parseInt(document.getElementById('first-time-boost').value),
         schedule_message_template: document.getElementById('schedule-message-template').value,
         daily_message_template: document.getElementById('daily-message-template').value,

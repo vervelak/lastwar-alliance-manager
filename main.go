@@ -231,6 +231,7 @@ type Settings struct {
 	RecentConductorPenaltyDays   int    `json:"recent_conductor_penalty_days"`
 	AboveAverageConductorPenalty int    `json:"above_average_conductor_penalty"`
 	R4R5RankBoost                int    `json:"r4r5_rank_boost"`
+	RankBoostMaxWeeks            int    `json:"rank_boost_max_weeks"`
 	FirstTimeConductorBoost      int    `json:"first_time_conductor_boost"`
 	ScheduleMessageTemplate      string `json:"schedule_message_template"`
 	DailyMessageTemplate         string `json:"daily_message_template"`
@@ -659,15 +660,33 @@ type ConductorStat struct {
 // loadSettings loads the settings from the database
 func loadSettings() (Settings, error) {
 	var settings Settings
-	err := db.QueryRow(`SELECT id, award_first_points, award_second_points, award_third_points, 
+	err := db.QueryRow(`SELECT id,
+		COALESCE(alliance_name, 'Last War: Survival') as alliance_name,
+		COALESCE(alliance_short_name, 'LWS') as alliance_short_name,
+		award_first_points, award_second_points, award_third_points,
 		recommendation_points, recent_conductor_penalty_days, above_average_conductor_penalty, r4r5_rank_boost,
+		COALESCE(rank_boost_max_weeks, 5) as rank_boost_max_weeks,
 		first_time_conductor_boost, schedule_message_template, daily_message_template,
+		COALESCE(power_tracking_enabled, 0) as power_tracking_enabled,
 		COALESCE(server_timezone, 'UTC') as server_timezone,
 		COALESCE(conductor_time, '15:00') as conductor_time,
 		COALESCE(backup_time, '16:30') as backup_time,
-		COALESCE(display_timezones, '["Europe/London"]') as display_timezones
+		COALESCE(display_timezones, '["Europe/London"]') as display_timezones,
+		COALESCE(vs_points_daily_target, 0) as vs_points_daily_target,
+		COALESCE(vs_points_weekly_target, 0) as vs_points_weekly_target,
+		COALESCE(min_power, 0) as min_power,
+		COALESCE(min_hq_level, 0) as min_hq_level,
+		COALESCE(vip_seat_enabled, 1) as vip_seat_enabled,
+		COALESCE(marshal_guard_enabled, 1) as marshal_guard_enabled,
+		COALESCE(desert_storm_enabled, 1) as desert_storm_enabled,
+		COALESCE(zombie_siege_enabled, 1) as zombie_siege_enabled,
+		COALESCE(donation_weekly_target, 0) as donation_weekly_target,
+		COALESCE(conductor_donation_threshold, 60000) as conductor_donation_threshold,
+		COALESCE(vip_donation_threshold, 40000) as vip_donation_threshold
 		FROM settings WHERE id = 1`).Scan(
 		&settings.ID,
+		&settings.AllianceName,
+		&settings.AllianceShortName,
 		&settings.AwardFirstPoints,
 		&settings.AwardSecondPoints,
 		&settings.AwardThirdPoints,
@@ -675,13 +694,26 @@ func loadSettings() (Settings, error) {
 		&settings.RecentConductorPenaltyDays,
 		&settings.AboveAverageConductorPenalty,
 		&settings.R4R5RankBoost,
+		&settings.RankBoostMaxWeeks,
 		&settings.FirstTimeConductorBoost,
 		&settings.ScheduleMessageTemplate,
 		&settings.DailyMessageTemplate,
+		&settings.PowerTrackingEnabled,
 		&settings.ServerTimezone,
 		&settings.ConductorTime,
 		&settings.BackupTime,
 		&settings.DisplayTimezones,
+		&settings.VSPointsDailyTarget,
+		&settings.VSPointsWeeklyTarget,
+		&settings.MinPower,
+		&settings.MinHQLevel,
+		&settings.VipSeatEnabled,
+		&settings.MarshalGuardEnabled,
+		&settings.DesertStormEnabled,
+		&settings.ZombieSiegeEnabled,
+		&settings.DonationWeeklyTarget,
+		&settings.ConductorDonationThreshold,
+		&settings.VipDonationThreshold,
 	)
 	return settings, err
 }
@@ -904,6 +936,23 @@ func buildRankingContext(referenceDate time.Time) (*RankingContext, error) {
 	}, nil
 }
 
+// defaultRankBoostWeeks is the fallback cap (in weeks) for the R4/R5 rank-boost
+// escalation when no value is configured in settings. The boost doubles every week
+// a member goes without conducting, but plateaus after the configured number of
+// weeks so it cannot grow without bound if a member is never selected.
+const defaultRankBoostWeeks = 5
+
+// rankBoostMultiplier returns the R4/R5 rank-boost multiplier 2^(weeks), capped at
+// 2^maxWeeks so the boost plateaus instead of growing forever. maxWeeks comes from
+// settings (RankBoostMaxWeeks); if unset (<= 0) we fall back to the default.
+func rankBoostMultiplier(daysSinceLastDuty, maxWeeks int) float64 {
+	if maxWeeks < 1 {
+		maxWeeks = defaultRankBoostWeeks
+	}
+	weeks := math.Min(float64(daysSinceLastDuty)/7.0, float64(maxWeeks))
+	return math.Pow(2, weeks)
+}
+
 // calculateMemberScore calculates the ranking score for a member
 func calculateMemberScore(member Member, ctx *RankingContext) int {
 	score := 0
@@ -949,9 +998,8 @@ func calculateMemberScore(member Member, ctx *RankingContext) int {
 			}
 		}
 
-		// Exponential formula: base_boost * 2^(days/7)
-		// Doubles every week, guarantees selection within 3 weeks
-		multiplier := math.Pow(2, float64(daysSinceLastDuty)/7.0)
+		// Exponential formula: base_boost * 2^(days/7), capped after the configured max weeks
+		multiplier := rankBoostMultiplier(daysSinceLastDuty, ctx.Settings.RankBoostMaxWeeks)
 		score += int(math.Round(baseBoost * multiplier))
 	}
 
@@ -1959,6 +2007,20 @@ Ask in alliance chat for the train to be assigned. Thanks for keeping the train 
 			}
 			log.Println("Database migration: Added " + col.display + " column to settings table")
 		}
+	}
+
+	// Migrate settings table to add rank_boost_max_weeks column if missing
+	var rankBoostMaxWeeksColumnExists bool
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name='rank_boost_max_weeks'`).Scan(&rankBoostMaxWeeksColumnExists)
+	if err != nil {
+		return err
+	}
+	if !rankBoostMaxWeeksColumnExists {
+		_, err = db.Exec(`ALTER TABLE settings ADD COLUMN rank_boost_max_weeks INTEGER NOT NULL DEFAULT 5`)
+		if err != nil {
+			return err
+		}
+		log.Println("Database migration: Added rank_boost_max_weeks column to settings table")
 	}
 
 	// Create marshal_guard_events table
@@ -4893,60 +4955,7 @@ func deleteConductReport(w http.ResponseWriter, r *http.Request) {
 
 // Get settings
 func getSettings(w http.ResponseWriter, r *http.Request) {
-	var settings Settings
-	err := db.QueryRow(`SELECT id, 
-		COALESCE(alliance_name, 'Last War: Survival') as alliance_name,
-		COALESCE(alliance_short_name, 'LWS') as alliance_short_name,
-		award_first_points, award_second_points, award_third_points, 
-		recommendation_points, recent_conductor_penalty_days, above_average_conductor_penalty, r4r5_rank_boost,
-		first_time_conductor_boost, schedule_message_template, daily_message_template, 
-		COALESCE(power_tracking_enabled, 0) as power_tracking_enabled,
-		COALESCE(server_timezone, 'UTC') as server_timezone,
-		COALESCE(conductor_time, '15:00') as conductor_time,
-		COALESCE(backup_time, '16:30') as backup_time,
-		COALESCE(display_timezones, '["Europe/London"]') as display_timezones,
-		COALESCE(vs_points_daily_target, 0) as vs_points_daily_target,
-		COALESCE(vs_points_weekly_target, 0) as vs_points_weekly_target,
-		COALESCE(min_power, 0) as min_power,
-		COALESCE(min_hq_level, 0) as min_hq_level,
-		COALESCE(vip_seat_enabled, 1) as vip_seat_enabled,
-		COALESCE(marshal_guard_enabled, 1) as marshal_guard_enabled,
-		COALESCE(desert_storm_enabled, 1) as desert_storm_enabled,
-		COALESCE(zombie_siege_enabled, 1) as zombie_siege_enabled,
-		COALESCE(donation_weekly_target, 0) as donation_weekly_target,
-		COALESCE(conductor_donation_threshold, 60000) as conductor_donation_threshold,
-		COALESCE(vip_donation_threshold, 40000) as vip_donation_threshold
-		FROM settings WHERE id = 1`).Scan(
-		&settings.ID,
-		&settings.AllianceName,
-		&settings.AllianceShortName,
-		&settings.AwardFirstPoints,
-		&settings.AwardSecondPoints,
-		&settings.AwardThirdPoints,
-		&settings.RecommendationPoints,
-		&settings.RecentConductorPenaltyDays,
-		&settings.AboveAverageConductorPenalty,
-		&settings.R4R5RankBoost,
-		&settings.FirstTimeConductorBoost,
-		&settings.ScheduleMessageTemplate,
-		&settings.DailyMessageTemplate,
-		&settings.PowerTrackingEnabled,
-		&settings.ServerTimezone,
-		&settings.ConductorTime,
-		&settings.BackupTime,
-		&settings.DisplayTimezones,
-		&settings.VSPointsDailyTarget,
-		&settings.VSPointsWeeklyTarget,
-		&settings.MinPower,
-		&settings.MinHQLevel,
-		&settings.VipSeatEnabled,
-		&settings.MarshalGuardEnabled,
-		&settings.DesertStormEnabled,
-		&settings.ZombieSiegeEnabled,
-		&settings.DonationWeeklyTarget,
-		&settings.ConductorDonationThreshold,
-		&settings.VipDonationThreshold,
-	)
+	settings, err := loadSettings()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -4974,6 +4983,13 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		settings.ServerTimezone = "UTC"
 	}
 
+	// Validate the rank-boost cap: keep it finite so the boost plateaus rather than
+	// growing without bound. 1 week (2x) to 13 weeks (8192x).
+	if settings.RankBoostMaxWeeks < 1 || settings.RankBoostMaxWeeks > 13 {
+		http.Error(w, "rank_boost_max_weeks must be between 1 and 13", http.StatusBadRequest)
+		return
+	}
+
 	_, err := db.Exec(`UPDATE settings SET
 		alliance_name = ?,
 		alliance_short_name = ?,
@@ -4984,6 +5000,7 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		recent_conductor_penalty_days = ?,
 		above_average_conductor_penalty = ?,
 		r4r5_rank_boost = ?,
+		rank_boost_max_weeks = ?,
 		first_time_conductor_boost = ?,
 		schedule_message_template = ?,
 		daily_message_template = ?,
@@ -5013,6 +5030,7 @@ func updateSettings(w http.ResponseWriter, r *http.Request) {
 		settings.RecentConductorPenaltyDays,
 		settings.AboveAverageConductorPenalty,
 		settings.R4R5RankBoost,
+		settings.RankBoostMaxWeeks,
 		settings.FirstTimeConductorBoost,
 		settings.ScheduleMessageTemplate,
 		settings.DailyMessageTemplate,
@@ -5683,8 +5701,8 @@ func getMemberRankings(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Exponential formula: base_boost * 2^(days/7)
-			multiplier := math.Pow(2, float64(daysSinceLastDuty)/7.0)
+			// Exponential formula: base_boost * 2^(days/7), capped after the configured max weeks
+			multiplier := rankBoostMultiplier(daysSinceLastDuty, ctx.Settings.RankBoostMaxWeeks)
 			ranking.RankBoost = int(math.Round(baseBoost * multiplier))
 		}
 
@@ -5818,12 +5836,12 @@ func getMemberTimelines(w http.ResponseWriter, r *http.Request) {
 	// Get settings for point calculations
 	var settings Settings
 	err = db.QueryRow(`SELECT award_first_points, award_second_points, award_third_points, 
-		recommendation_points, r4r5_rank_boost, first_time_conductor_boost,
+		recommendation_points, r4r5_rank_boost, rank_boost_max_weeks, first_time_conductor_boost,
 		recent_conductor_penalty_days, above_average_conductor_penalty 
 		FROM settings WHERE id = 1`).Scan(
 		&settings.AwardFirstPoints, &settings.AwardSecondPoints,
 		&settings.AwardThirdPoints, &settings.RecommendationPoints,
-		&settings.R4R5RankBoost, &settings.FirstTimeConductorBoost,
+		&settings.R4R5RankBoost, &settings.RankBoostMaxWeeks, &settings.FirstTimeConductorBoost,
 		&settings.RecentConductorPenaltyDays, &settings.AboveAverageConductorPenalty)
 	if err != nil {
 		http.Error(w, "Failed to load settings: "+err.Error(), http.StatusInternalServerError)
@@ -6093,7 +6111,7 @@ func getMemberTimelines(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
-				multiplier := math.Pow(2, float64(daysSinceLastDuty)/7.0)
+				multiplier := rankBoostMultiplier(daysSinceLastDuty, settings.RankBoostMaxWeeks)
 				weekRankBoost = int(math.Round(baseBoost * multiplier))
 			}
 			currentRankBoost += weekRankBoost
@@ -13822,7 +13840,7 @@ func getMemberProfile(w http.ResponseWriter, r *http.Request) {
 		if sb.DaysSinceLastConductor != nil {
 			days = *sb.DaysSinceLastConductor
 		}
-		sb.RankBoost = int(math.Round(baseBoost * math.Pow(2, float64(days)/7.0)))
+		sb.RankBoost = int(math.Round(baseBoost * rankBoostMultiplier(days, ctx.Settings.RankBoostMaxWeeks)))
 	}
 	if sb.ConductorCount == 0 && sb.AwardPoints+sb.RecommendationPoints > 0 {
 		sb.FirstTimerBoost = ctx.Settings.FirstTimeConductorBoost
