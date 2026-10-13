@@ -2431,6 +2431,20 @@ button {
     border-radius: 5px;
 }
 
+/* Dark theme: the boxes above are a light translucent overlay, which leaves the
+   (light) dark-mode text low-contrast. Use a dark inset instead. */
+html.theme-dark .schedule-info .conductor,
+html.theme-dark .schedule-info .backup {
+    background: rgba(0, 0, 0, 0.25);
+}
+
+@media (prefers-color-scheme: dark) {
+    html.theme-auto .schedule-info .conductor,
+    html.theme-auto .schedule-info .backup {
+        background: rgba(0, 0, 0, 0.25);
+    }
+}
+
 .schedule-info .notes {
     margin-top: 10px;
     padding: 8px;
